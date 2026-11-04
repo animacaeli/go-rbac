@@ -62,6 +62,9 @@ func New(defs ...Definition) *Module {
 // Name 返回模块名。
 func (m *Module) Name() string { return "template" }
 
+// Dependencies 声明依赖的模块名（当前无模块间依赖）。
+func (m *Module) Dependencies() []string { return nil }
+
 // Register 校验模板引用的权限码均已在 Registry 注册（fail fast，§3.3），
 // 并捕获 Core 角色服务。不做数据库操作。
 func (m *Module) Register(app *rbac.App) error {

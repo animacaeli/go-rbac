@@ -77,6 +77,9 @@ func New() *Module { return &Module{} }
 // Name 返回模块名。
 func (m *Module) Name() string { return "tenant" }
 
+// Dependencies 声明依赖的模块名（当前无模块间依赖）。
+func (m *Module) Dependencies() []string { return nil }
+
 // Register 以租户隔离仓储替换内部仓储并启用租户校验策略。
 // 只做装配，不触库（迁移由业务显式触发，§3.3/§4.1）。
 func (m *Module) Register(app *rbac.App) error {
@@ -101,6 +104,10 @@ func (m *Module) Migrations() []rbac.Migration {
 
 // SeedSuperAdminInTenant 在指定租户内创建内置超管角色（幂等）并绑定主体。
 // 租户级超管仅在本域生效（§2.9 平台/租户边界）。
+//
+// Security：本方法不鉴权调用者，且直接绕过"内置角色不可经管理接口授予"
+// 的保护——它只能用于可信的初始化流程（部署脚本、初始化 Job），
+// 绝不可暴露给普通业务请求或管理 HTTP 接口。
 func (m *Module) SeedSuperAdminInTenant(ctx context.Context, tenantID, subjectID string) error {
 	if tenantID == "" || len(tenantID) > TenantIDMaxLength {
 		return fmt.Errorf("rbac/modules/tenant: invalid tenant id %q", tenantID)

@@ -92,6 +92,15 @@ app.Grants().Revoke(ctx, operator, "10001", "order:export")
 `SeedSuperAdmin` 种子初始化；`HasPermission` 对超管恒真，`GetPermissions` 返回空集合，
 前端应以 `IsSuperAdministrator` 单独判断。
 
+## 运行模式
+
+| 模式 | 实现 | 默认 | 适用 |
+|---|---|---|---|
+| **Simple** | NoopCache，每次鉴权回源数据库 | **是** | 小型项目、默认接入：零缓存一致性面，行为最直观 |
+| **Cached** | 注入 Redis 等缓存后自动进入 | 否 | 有性能要求的生产环境：版本号 + epoch 两级失效等完整机制 |
+
+默认 `rbac.New(rbac.WithDB(db), ...)` 即 Simple；`rbac.WithCache(rediscache.New(cli))` 后自动切换为 Cached——两种模式语义等价（§6 一致性边界除外），可随时升级。
+
 ## 权限缓存（§6）
 
 不注入缓存时默认 NoopCache（每次回源数据库，行为正确只是慢）。注入 Redis 后获得
@@ -123,6 +132,16 @@ app, err := rbac.New(
 
 一致性边界（§6.7）：正常运行下授权撤销在"事务提交 + 版本递增完成"后即时生效；
 不提供跨缓存层的严格线性一致。
+
+**Redis 淘汰策略要求（Cached 模式）**：版本号/epoch 计数器是库内唯一无 TTL 的
+键族，必须不被淘汰——Redis 需配置 `noeviction` 或任意 `volatile-*` 策略
+（只淘汰带 TTL 的权限条目）。若误用 `allkeys-*`：代码侧有基线恢复协议兜底
+（计数器丢失→旁路缓存+重建时清洗全域条目，见 §6.2 实现），但重建窗口
+（毫秒级）内存在理论上的陈旧读取，不应依赖。
+
+**缓存诊断**：`app.CacheDiagnostics(ctx, ac)` 返回运行模式、epoch/版本计数器
+状态、当前生成键与权限条目存在性、本进程失效递增尝试/失败计数——排障
+"为什么权限没失效"的第一现场。命中率/耗时经 `core.CountingMetrics` 注入采集。
 
 大小写语义：MySQL 排序规则（utf8mb4_0900_ai_ci）下 `subject_id` 不区分大小写，
 缓存 key 区分——同一身份的不同拼写会得到一致的授权结果，但缓存条目各自独立
@@ -217,6 +236,24 @@ _ = tenantMod.SeedSuperAdminInTenant(ctx, "acme", "acme-admin")
   `rbac_role_permissions` / `rbac_user_grants`（v1 冻结稿，见设计文档 §5.2）
 - 表前缀固定 `rbac_`；v1 无 tenant_id（多租户为 Phase 3 可选模块，核心已预留授权域）
 - `app.Migrate(ctx)` 执行 Core → 扩展模块注册顺序的版本化迁移；生产环境建议在发布流程统一执行
+
+## 管理接口安全责任边界
+
+`app.Roles() / UserRoles() / Grants() / Permissions()` 的服务方法**不鉴权
+operator**——不检查调用者是否持有 `rbac:*` 管理权限（服务只执行业务规则：
+授权者持权约束、内置保护等）。所有调用方（HTTP 接口、内部 Job、CLI）必须
+先自行完成调用者授权，例如：
+
+```go
+api.POST("/admin/roles", guard.Require("rbac:role:create"), roleHandler.Create)
+```
+
+`SeedSuperAdmin` / `tenant.SeedSuperAdminInTenant` 同样不鉴权，只能用于可信
+初始化流程（部署脚本/初始化 Job），绝不可暴露给业务请求。
+
+**发布门禁**：`cache/redis` 的失效矩阵套件（12 行场景：角色/权限/用户禁用、
+计数器淘汰与损坏、递增失败与恢复、临时授权到期、并发编辑、租户隔离、
+超管边界）在真实 MySQL + 真实 Redis 上运行，CI 与 release 流水线均以此为门禁。
 
 ## 路线图
 

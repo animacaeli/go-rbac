@@ -11,6 +11,11 @@ import (
 
 // GrantService 用户额外授权管理（§2.5），完整生命周期：
 // 过期/撤销记录保留不删除；重新授权 = 撤销旧活跃行 + 插入新行。
+//
+// Security：本服务不鉴权 operator——不检查调用者是否持有 rbac:* 管理权限。
+// HTTP 管理接口、内部 Job、CLI 等所有调用方必须先自行完成调用者授权
+// （如经 guard.Require("rbac:role:create") 保护），Service 只执行业务规则
+// （授权者持权约束等）而非入口鉴权。
 type GrantService struct {
 	deps ServiceDeps
 }
@@ -59,7 +64,7 @@ func (s *GrantService) Grant(ctx context.Context, operator AuthorizationContext,
 	if err := s.deps.Grants.Grant(ctx, g, now); err != nil {
 		return err
 	}
-	if err := s.deps.Authorizer.IncrSubjectVersion(ctx, SubjectID(subjectID)); err != nil {
+	if err := s.deps.invalidateSubject(ctx, SubjectID(subjectID)); err != nil {
 		return err
 	}
 	detail := map[string]string{"permission": permissionCode, "reason": reason}
@@ -89,7 +94,7 @@ func (s *GrantService) Revoke(ctx context.Context, operator AuthorizationContext
 	if rows == 0 {
 		return fmt.Errorf("%w: subject=%s permission=%s", ErrGrantNotFound, subjectID, permissionCode)
 	}
-	if err := s.deps.Authorizer.IncrSubjectVersion(ctx, SubjectID(subjectID)); err != nil {
+	if err := s.deps.invalidateSubject(ctx, SubjectID(subjectID)); err != nil {
 		return err
 	}
 	return s.deps.record(ctx, NewEvent(EventGrantRevoked, operator, subjectID, map[string]string{

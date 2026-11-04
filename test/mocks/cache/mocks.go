@@ -104,6 +104,63 @@ func (_c *MockPermissionCache_Delete_Call) RunAndReturn(run func(ctx context.Con
 	return _c
 }
 
+// DeleteByPattern provides a mock function for the type MockPermissionCache
+func (_mock *MockPermissionCache) DeleteByPattern(ctx context.Context, pattern string) error {
+	ret := _mock.Called(ctx, pattern)
+
+	if len(ret) == 0 {
+		panic("no return value specified for DeleteByPattern")
+	}
+
+	var r0 error
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string) error); ok {
+		r0 = returnFunc(ctx, pattern)
+	} else {
+		r0 = ret.Error(0)
+	}
+	return r0
+}
+
+// MockPermissionCache_DeleteByPattern_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'DeleteByPattern'
+type MockPermissionCache_DeleteByPattern_Call struct {
+	*mock.Call
+}
+
+// DeleteByPattern is a helper method to define mock.On call
+//   - ctx context.Context
+//   - pattern string
+func (_e *MockPermissionCache_Expecter) DeleteByPattern(ctx any, pattern any) *MockPermissionCache_DeleteByPattern_Call {
+	return &MockPermissionCache_DeleteByPattern_Call{Call: _e.mock.On("DeleteByPattern", ctx, pattern)}
+}
+
+func (_c *MockPermissionCache_DeleteByPattern_Call) Run(run func(ctx context.Context, pattern string)) *MockPermissionCache_DeleteByPattern_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 context.Context
+		if args[0] != nil {
+			arg0 = args[0].(context.Context)
+		}
+		var arg1 string
+		if args[1] != nil {
+			arg1 = args[1].(string)
+		}
+		run(
+			arg0,
+			arg1,
+		)
+	})
+	return _c
+}
+
+func (_c *MockPermissionCache_DeleteByPattern_Call) Return(err error) *MockPermissionCache_DeleteByPattern_Call {
+	_c.Call.Return(err)
+	return _c
+}
+
+func (_c *MockPermissionCache_DeleteByPattern_Call) RunAndReturn(run func(ctx context.Context, pattern string) error) *MockPermissionCache_DeleteByPattern_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // Get provides a mock function for the type MockPermissionCache
 func (_mock *MockPermissionCache) Get(ctx context.Context, key string) ([]string, bool, error) {
 	ret := _mock.Called(ctx, key)
@@ -312,6 +369,72 @@ func (_c *MockPermissionCache_Incr_Call) Return(n int64, err error) *MockPermiss
 }
 
 func (_c *MockPermissionCache_Incr_Call) RunAndReturn(run func(ctx context.Context, key string) (int64, error)) *MockPermissionCache_Incr_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// InitCounter provides a mock function for the type MockPermissionCache
+func (_mock *MockPermissionCache) InitCounter(ctx context.Context, key string) (bool, error) {
+	ret := _mock.Called(ctx, key)
+
+	if len(ret) == 0 {
+		panic("no return value specified for InitCounter")
+	}
+
+	var r0 bool
+	var r1 error
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string) (bool, error)); ok {
+		return returnFunc(ctx, key)
+	}
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string) bool); ok {
+		r0 = returnFunc(ctx, key)
+	} else {
+		r0 = ret.Get(0).(bool)
+	}
+	if returnFunc, ok := ret.Get(1).(func(context.Context, string) error); ok {
+		r1 = returnFunc(ctx, key)
+	} else {
+		r1 = ret.Error(1)
+	}
+	return r0, r1
+}
+
+// MockPermissionCache_InitCounter_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'InitCounter'
+type MockPermissionCache_InitCounter_Call struct {
+	*mock.Call
+}
+
+// InitCounter is a helper method to define mock.On call
+//   - ctx context.Context
+//   - key string
+func (_e *MockPermissionCache_Expecter) InitCounter(ctx any, key any) *MockPermissionCache_InitCounter_Call {
+	return &MockPermissionCache_InitCounter_Call{Call: _e.mock.On("InitCounter", ctx, key)}
+}
+
+func (_c *MockPermissionCache_InitCounter_Call) Run(run func(ctx context.Context, key string)) *MockPermissionCache_InitCounter_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 context.Context
+		if args[0] != nil {
+			arg0 = args[0].(context.Context)
+		}
+		var arg1 string
+		if args[1] != nil {
+			arg1 = args[1].(string)
+		}
+		run(
+			arg0,
+			arg1,
+		)
+	})
+	return _c
+}
+
+func (_c *MockPermissionCache_InitCounter_Call) Return(created bool, err error) *MockPermissionCache_InitCounter_Call {
+	_c.Call.Return(created, err)
+	return _c
+}
+
+func (_c *MockPermissionCache_InitCounter_Call) RunAndReturn(run func(ctx context.Context, key string) (bool, error)) *MockPermissionCache_InitCounter_Call {
 	_c.Call.Return(run)
 	return _c
 }

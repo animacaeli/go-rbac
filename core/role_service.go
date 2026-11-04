@@ -52,16 +52,49 @@ func (d ServiceDeps) grantorAllowed(ctx context.Context, operator AuthorizationC
 	return nil
 }
 
-// record 分发授权变更事件（事件失败向上传播，§2.10/§6.7）。
+// record 分发授权变更事件（事件失败向上传播并标记"提交后失败"哨兵，§2.10/§6.7）。
 func (d ServiceDeps) record(ctx context.Context, e Event) error {
 	if d.Events == nil {
 		return nil
 	}
-	return d.Events.Record(ctx, e)
+	if err := d.Events.Record(ctx, e); err != nil {
+		return fmt.Errorf("%w: %v", ErrAuditFailedAfterCommit, err)
+	}
+	return nil
+}
+
+// invalidateSubject / invalidateSubjects / invalidateEpoch：失效包装。
+// 数据库已提交、递增失败时返回 ErrInvalidationFailedAfterCommit（重试同一操作安全）。
+func (d ServiceDeps) invalidateSubject(ctx context.Context, subjectID SubjectID) error {
+	if err := d.Authorizer.IncrSubjectVersion(ctx, subjectID); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidationFailedAfterCommit, err)
+	}
+	return nil
+}
+
+func (d ServiceDeps) invalidateSubjects(ctx context.Context, subjectIDs []string) error {
+	for _, id := range subjectIDs {
+		if err := d.invalidateSubject(ctx, SubjectID(id)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d ServiceDeps) invalidateEpoch(ctx context.Context) error {
+	if err := d.Authorizer.IncrEpoch(ctx); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidationFailedAfterCommit, err)
+	}
+	return nil
 }
 
 // RoleService 角色管理（§2.4）。方法首个参数 operator 为操作者授权上下文，
 // 用于授权者约束与审计事件。
+//
+// Security：本服务不鉴权 operator——不检查调用者是否持有 rbac:* 管理权限。
+// HTTP 管理接口、内部 Job、CLI 等所有调用方必须先自行完成调用者授权
+// （如经 guard.Require("rbac:role:create") 保护），Service 只执行业务规则
+// （授权者持权约束等）而非入口鉴权。
 type RoleService struct {
 	deps ServiceDeps
 }
@@ -321,5 +354,5 @@ func (s *RoleService) incrRoleSubjectVersions(ctx context.Context, roleID uint64
 	if err != nil {
 		return fmt.Errorf("rbac: load role subjects for invalidation: %w", err)
 	}
-	return s.deps.Authorizer.IncrSubjectVersions(ctx, subjects)
+	return s.deps.invalidateSubjects(ctx, subjects)
 }

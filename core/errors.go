@@ -28,15 +28,21 @@ var (
 
 // 管理服务错误。
 var (
-	ErrRoleNotFound            = errors.New("rbac: role not found")
-	ErrInvalidRoleCode         = errors.New("rbac: invalid role code")
-	ErrRoleCodeExists          = errors.New("rbac: role code already exists")
-	ErrRoleInUse               = errors.New("rbac: role is assigned to subjects and cannot be deleted")
-	ErrBuiltinRoleProtected    = errors.New("rbac: builtin role is protected from management operations")
-	ErrPermissionNotFound      = errors.New("rbac: permission not found")
-	ErrPermissionDisabled      = errors.New("rbac: permission disabled or deprecated")
-	ErrGrantNotFound           = errors.New("rbac: active grant not found")
-	ErrInvalidGrantExpiry      = errors.New("rbac: grant expiry must be in the future")
+	ErrRoleNotFound                  = errors.New("rbac: role not found")
+	ErrInvalidRoleCode               = errors.New("rbac: invalid role code")
+	ErrRoleCodeExists                = errors.New("rbac: role code already exists")
+	ErrRoleInUse                     = errors.New("rbac: role is assigned to subjects and cannot be deleted")
+	ErrBuiltinRoleProtected          = errors.New("rbac: builtin role is protected from management operations")
+	ErrPermissionNotFound            = errors.New("rbac: permission not found")
+	ErrPermissionDisabled            = errors.New("rbac: permission disabled or deprecated")
+	ErrGrantNotFound                 = errors.New("rbac: active grant not found")
+	ErrInvalidGrantExpiry            = errors.New("rbac: grant expiry must be in the future")
+	ErrInvalidationFailedAfterCommit = errors.New("rbac: invalidation failed after commit (safe to retry the same operation)")
+
+	// ErrAuditFailedAfterCommit 表示数据库变更已提交、但审计事件写入失败
+	// （Strict 策略，§2.10/§6.7）。重试同一操作是安全的。
+	ErrAuditFailedAfterCommit = errors.New("rbac: audit record failed after commit (safe to retry the same operation)")
+
 	ErrGrantorPermissionDenied = errors.New("rbac: grantor does not hold the permission being granted")
 
 	// ErrInvalidPermissionDef 复用注册中心的定义校验错误（展示元数据非法）。

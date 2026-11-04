@@ -84,11 +84,19 @@ func mustReg(t *testing.T, defs ...registry.PermissionDef) *registry.Registry {
 type stubModule struct {
 	name        string
 	registerErr error
+	registerFn  func()
 }
 
 func (m stubModule) Name() string { return m.name }
 
-func (m stubModule) Register(_ *rbac.App) error { return m.registerErr }
+func (m stubModule) Dependencies() []string { return nil }
+
+func (m stubModule) Register(_ *rbac.App) error {
+	if m.registerFn != nil {
+		m.registerFn()
+	}
+	return m.registerErr
+}
 
 func (m stubModule) Migrations() []rbac.Migration {
 	return []rbac.Migration{{Module: m.name, Version: "0001", Name: "stub"}}

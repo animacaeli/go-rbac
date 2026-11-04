@@ -82,8 +82,10 @@ func (c *Cache) GetInt(ctx context.Context, key string) (int64, bool, error) {
 	}
 	v, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {
-		// 值损坏视同不存在：调用方以默认生成键继续，行为安全。
-		return 0, false, nil
+		// 值损坏 = 缓存状态不可信：必须返回错误，让调用方旁路缓存并
+		// 跳过写回。当作"不存在"处理会使生成键回退到 0，可能命中
+		// 旧生成键下已撤销的权限集合（§6.2 不变性被键损坏打破）。
+		return 0, false, fmt.Errorf("rbac/cache/redis: corrupt integer at %s: %w", key, err)
 	}
 	return v, true, nil
 }
@@ -95,4 +97,35 @@ func (c *Cache) Incr(ctx context.Context, key string) (int64, error) {
 		return 0, fmt.Errorf("rbac/cache/redis: incr %s: %w", key, err)
 	}
 	return v, nil
+}
+
+// InitCounter SETNX 0：建立生成键基线（§6.2）。返回是否本次新建——
+// 新建意味着该计数器曾丢失，重建值可能与历史生成键碰撞（复活旧权限），
+// 调用方必须先清洗受影响的权限条目。
+func (c *Cache) InitCounter(ctx context.Context, key string) (bool, error) {
+	created, err := c.cli.SetNX(ctx, key, 0, 0).Result()
+	if err != nil {
+		return false, fmt.Errorf("rbac/cache/redis: initnx %s: %w", key, err)
+	}
+	return created, nil
+}
+
+// DeleteByPattern SCAN + 批量 DEL。
+func (c *Cache) DeleteByPattern(ctx context.Context, pattern string) error {
+	var cursor uint64
+	for {
+		keys, next, err := c.cli.Scan(ctx, cursor, pattern, 500).Result()
+		if err != nil {
+			return fmt.Errorf("rbac/cache/redis: scan %s: %w", pattern, err)
+		}
+		if len(keys) > 0 {
+			if err := c.cli.Del(ctx, keys...).Err(); err != nil {
+				return fmt.Errorf("rbac/cache/redis: del %s: %w", pattern, err)
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			return nil
+		}
+	}
 }

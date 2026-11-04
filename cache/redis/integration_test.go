@@ -340,3 +340,30 @@ func (s *ConsistencySuite) TestConcurrentAuthorizationChanges() {
 	}
 	s.True(converged, "撤销后必须收敛到 false")
 }
+
+// P0 回归（外部审核问题 1）：allkeys-* 淘汰策略下单独淘汰版本计数器、
+// 而旧生成键仍存活时，读路径必须旁路缓存、以数据库为准——已撤销权限不得复活。
+func (s *ConsistencySuite) TestCounterEviction_StaleEntryMustNotResurrect() {
+	// Arrange：正常授权 + 预热缓存（perm:v{g} 含 order:export）。
+	s.Require().NoError(s.app.Grants().Grant(s.ctx, admin, "95001", "order:export", nil, "预热"))
+	ok, err := s.app.Authorizer().HasPermission(s.ctx, core.AuthorizationContext{SubjectID: "95001"}, "order:export")
+	s.Require().NoError(err)
+	s.True(ok)
+	keysBefore := s.rdb.Keys(s.ctx, "rbac:default:subject:95001:*").Val()
+	s.Require().NotEmpty(keysBefore, "预热后应存在该主体的缓存键")
+
+	// Act-1：模拟 allkeys-lru 单独淘汰 epoch 计数器（全局键，旧协议下 gen 回退到
+	// (0, version)，恰好命中此前写入的 perm:v1 —— 旧代码在此复活已撤销权限）。
+	s.Require().NoError(s.rdb.Del(s.ctx, "rbac:default:epoch").Err())
+	// 绕过服务层失效（那会重建计数器）：直接在数据库撤销授权。
+	s.Require().NoError(s.db.Exec(
+		"UPDATE rbac_user_grants SET revoked_at = UTC_TIMESTAMP(3) WHERE subject_id = '95001' AND revoked_at IS NULL",
+	).Error)
+
+	// Act-2：读取——旧 perm:v{g} 仍存活且含有 order:export。
+	ok, err = s.app.Authorizer().HasPermission(s.ctx, core.AuthorizationContext{SubjectID: "95001"}, "order:export")
+
+	// Assert：必须反映数据库真相（旁路了陈旧条目），而不是旧缓存复活。
+	s.Require().NoError(err)
+	s.False(ok, "计数器被淘汰后，旧生成键下的已撤销权限不得复活")
+}

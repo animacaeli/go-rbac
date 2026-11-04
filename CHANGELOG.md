@@ -7,6 +7,39 @@
 
 ## [Unreleased]
 
+### Security（外部审核问题 1，P0）
+
+- **Redis 计数器丢失/损坏不再导致旧权限复活**：三层修复——
+  1. `GetInt` 值损坏改为返回错误（缓存状态不可信），不再静默当作 0
+  2. 基线协议：计数器缺失（首写或被 allkeys-* 淘汰）→ 旁路缓存读写；
+     flight 内 `InitCounter`（SETNX 0）重建基线，**若为新建（键曾丢失）
+     先以 `DeleteByPattern` 清洗全域/该主体权限条目**，使重建值不可能
+     命中历史生成键（重建到任何固定值都与历史碰撞——清洗后命名空间从零开始）
+  3. 失效自愈：`IncrSubjectVersion` 递增后删除新生成键旧条目
+- 已知残余窗口：SETNX 与清洗完成之间（毫秒级）的理论陈旧读；运维第一道
+  防线为 `noeviction`/`volatile-*` 淘汰策略（计数器是唯一无 TTL 键族），README 已文档化
+- 端到端回归：epoch 键淘汰 + 陈旧条目存活 → 必须读库真相（真实 Redis 验证）
+
+### Added（外部审核问题 2/3/四/五）
+
+- `ErrInvalidationFailedAfterCommit` / `ErrAuditFailedAfterCommit` 哨兵：
+  数据库已提交、缓存失效/审计写入失败时明确标记；各管理操作幂等，
+  **重试同一操作安全**（重试成功即补做失效）——半成功状态从"含糊报错"
+  变为"可操作恢复"
+- **缓存诊断**：`app.CacheDiagnostics(ctx, ac)`——运行模式（simple/cached）、
+  epoch/版本计数器状态、当前生成键与权限条目存在性、失效递增尝试/失败计数；
+  README 新增"运行模式"（Simple 默认 / Cached 可选）与排障指引
+- **失效矩阵发布门禁**（12 行）：角色/权限/用户禁用、计数器淘汰与损坏、
+  递增失败哨兵与重试、Redis 恢复收敛、临时授权到期、并发角色编辑一致性、
+  租户隔离与超管边界——真实 MySQL + 真实 Redis，CI 与 release 均运行
+- 模块依赖解析：`Module.Dependencies()` + 拓扑排序（存在性/循环/重名/nil
+  检查），注册顺序不再需要人工保证
+- 配置校验：`ErrInvalidOption`（nil 注册中心 / 负 TTL / 非法模块），配置错误
+  转为明确错误而非运行时 panic
+- 租户专项：管理面（List/SetPermissions/Grants）按域过滤的直传 ID 越域测试
+- 安全文档：全部管理服务 godoc 增加 Security 注（不鉴权 operator）；
+  种子入口标注"仅限可信初始化流程"
+
 ### Changed（Breaking，pre-1.0 收口）
 
 - `repository/` 迁移至 `internal/repository/`：以 Go 语言机制强制 §3.4

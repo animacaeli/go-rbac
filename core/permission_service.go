@@ -10,6 +10,11 @@ import (
 )
 
 // PermissionService 权限资源管理（§2.3）：状态控制与查询。
+//
+// Security：本服务不鉴权 operator——不检查调用者是否持有 rbac:* 管理权限。
+// HTTP 管理接口、内部 Job、CLI 等所有调用方必须先自行完成调用者授权
+// （如经 guard.Require("rbac:role:create") 保护），Service 只执行业务规则
+// （授权者持权约束等）而非入口鉴权。
 // 新增/元数据/废弃由 Registry 同步机制负责（registry.Sync），不经此服务。
 type PermissionService struct {
 	deps ServiceDeps
@@ -45,7 +50,7 @@ func (s *PermissionService) SetStatus(ctx context.Context, operator Authorizatio
 	if err := s.deps.Permissions.SetStatus(ctx, perm.ID, status); err != nil {
 		return err
 	}
-	if err := s.deps.Authorizer.IncrEpoch(ctx); err != nil {
+	if err := s.deps.invalidateEpoch(ctx); err != nil {
 		return err
 	}
 	return s.deps.record(ctx, NewEvent(EventPermissionStatusSet, operator, code, map[string]string{

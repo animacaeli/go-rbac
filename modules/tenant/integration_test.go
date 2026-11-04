@@ -372,3 +372,28 @@ func keysWithPrefix(mr *miniredis.Miniredis, prefix string) []string {
 	}
 	return out
 }
+
+// P1-4 专项：管理接口按租户过滤——跨租户不可见、不可操作（含直传 ID 路径）。
+func (s *IsolationSuite) TestManagementSurface_TenantFiltered() {
+	betaAdmin := s.ac("beta", "beta-admin")
+	acmeAdmin := s.ac("acme", "acme-admin")
+
+	// beta 建角色；acme 的 List 不可见。
+	_, err := s.app.Roles().Create(s.tenantCtx("beta"), betaAdmin, "vis_role", "V", "")
+	s.Require().NoError(err)
+	acmeRoles, err := s.app.Roles().List(s.tenantCtx("acme"), rbac.RoleFilter{})
+	s.Require().NoError(err)
+	for _, r := range acmeRoles {
+		s.NotEqual("vis_role", r.Code, "acme 角色列表不得泄漏 beta 角色")
+	}
+
+	// 直传 beta 角色 ID 到 acme 域操作（SetPermissions）→ 不可见即拒绝。
+	betaRole, err := s.app.Roles().FindByCode(s.tenantCtx("beta"), "vis_role")
+	s.Require().NoError(err)
+	err = s.app.Roles().SetPermissions(s.tenantCtx("acme"), acmeAdmin, betaRole.ID, []string{"user:list"})
+	s.Require().ErrorIs(err, core.ErrRoleNotFound)
+
+	// Grant/Revoke 同样以域过滤（acme 域内查无 beta 主体授权可撤销）。
+	err = s.app.Grants().Revoke(s.tenantCtx("acme"), acmeAdmin, "10001", "user:list")
+	s.ErrorIs(err, core.ErrGrantNotFound, "acme 域内的撤销不得影响 beta 域数据")
+}

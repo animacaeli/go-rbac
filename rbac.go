@@ -26,6 +26,10 @@ import (
 // ErrDBRequired 表示未注入数据库句柄。
 var ErrDBRequired = errors.New("rbac: WithDB is required")
 
+// ErrInvalidOption 表示配置项非法（nil 注册中心 / 负 TTL / nil 模块等，
+// 在 New 期转为明确错误而非运行时 panic）。
+var ErrInvalidOption = errors.New("rbac: invalid option")
+
 // 公开错误面：库内哨兵错误的别名（§3.4：公开 API 面最小化，
 // Repository 接口保持内部）。
 var (
@@ -58,4 +62,7 @@ var (
 type (
 	// RoleFilter 是角色列表过滤条件（App.Roles().List 的入参形状）。
 	RoleFilter = repository.RoleFilter
+
+	// CacheDiagnostics 是缓存一致性诊断快照（App.CacheDiagnostics 返回）。
+	CacheDiagnostics = core.CacheDiagnostics
 )

@@ -36,6 +36,17 @@ func New(opts ...Option) (*App, error) {
 	if cfg.logger == nil {
 		cfg.logger = slog.Default()
 	}
+	// 配置校验（公共库把配置错误转为明确错误而非运行时 panic）。
+	if cfg.reg == nil {
+		return nil, fmt.Errorf("%w: permission registry is nil", ErrInvalidOption)
+	}
+	if cfg.cacheTTL < 0 {
+		return nil, fmt.Errorf("%w: negative cache TTL %s", ErrInvalidOption, cfg.cacheTTL)
+	}
+	mods, err := resolveModules(cfg.modules)
+	if err != nil {
+		return nil, err
+	}
 
 	// 内置 rbac:* 管理权限码自动并入注册中心（§4.7）。
 	if err := cfg.reg.Register(registry.BuiltinPermissions()...); err != nil {
@@ -52,11 +63,8 @@ func New(opts ...Option) (*App, error) {
 	app := &App{cfg: cfg, repos: repos, events: events}
 	app.rebuildServices()
 
-	// Module Registry：注册（无数据库副作用）+ 迁移收集（§3.3）。
-	for _, mod := range cfg.modules {
-		if mod.Name() == migrations.CoreModule {
-			return nil, fmt.Errorf("rbac: module name %q is reserved", migrations.CoreModule)
-		}
+	// Module Registry：依赖拓扑序注册（无数据库副作用）+ 迁移收集（§3.3）。
+	for _, mod := range mods {
 		if err := mod.Register(app); err != nil {
 			return nil, fmt.Errorf("rbac: module %s register: %w", mod.Name(), err)
 		}
@@ -141,6 +149,12 @@ func (a *App) ReplaceRepositories(repos repository.Repos) {
 	a.rebuildServices()
 }
 
+// CacheDiagnostics 探测缓存一致性状态（运行模式 / 计数器 / 生成键 / 失效计数）。
+// Simple 模式（NoopCache）同样可用（返回 mode=simple 与零值计数器）。
+func (a *App) CacheDiagnostics(ctx context.Context, ac core.AuthorizationContext) (core.CacheDiagnostics, error) {
+	return a.authorizer.DiagnoseCache(ctx, ac)
+}
+
 // SetEventSink 注入授权变更事件实现（Audit 模块在 Register 时调用，
 // 业务项目也可经 WithEventSink 在组装期注入）。
 func (a *App) SetEventSink(sink core.EventSink) { a.events.SetSink(sink) }
@@ -173,7 +187,7 @@ func (a *App) SyncPermissions(ctx context.Context) (registry.SyncResult, error) 
 			return result, fmt.Errorf("rbac: sync apply: %w", err)
 		}
 		if err := a.authorizer.IncrEpoch(ctx); err != nil {
-			return result, err
+			return result, fmt.Errorf("%w: %v", core.ErrInvalidationFailedAfterCommit, err)
 		}
 		_ = a.events.Record(ctx, core.NewEvent(core.EventPermissionsSynced,
 			core.AuthorizationContext{}, "registry", map[string]string{
@@ -206,6 +220,9 @@ func (a *App) ValidatePermissionCodes(codes ...string) error {
 // 并将给定主体绑定到该角色。这是唯一的超管授予入口——管理接口不可授予。
 // 幂等：重复执行无害。主体绑定绕过管理服务的内置角色保护，属刻意设计。
 //
+// Security：本方法不鉴权调用者——只能用于可信的初始化流程（部署脚本、
+// 初始化 Job），绝不可暴露给普通业务请求。
+//
 // 注意：§11 将"超管种子初始化与配置细节"列为待细化项；v1 提供此最小契约。
 func (a *App) SeedSuperAdmin(ctx context.Context, subjectID string) error {
 	if subjectID == "" || len(subjectID) > model.SubjectIDMaxLength {
@@ -232,5 +249,8 @@ func (a *App) SeedSuperAdmin(ctx context.Context, subjectID string) error {
 	if err := a.repos.UserRoles.Assign(ctx, subjectID, role.ID); err != nil {
 		return fmt.Errorf("rbac: seed super admin subject: %w", err)
 	}
-	return a.authorizer.IncrSubjectVersion(ctx, core.SubjectID(subjectID))
+	if err := a.authorizer.IncrSubjectVersion(ctx, core.SubjectID(subjectID)); err != nil {
+		return fmt.Errorf("%w: %v", core.ErrInvalidationFailedAfterCommit, err)
+	}
+	return nil
 }

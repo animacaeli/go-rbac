@@ -109,6 +109,9 @@ func New() *Module { return &Module{} }
 // Name 返回模块名。
 func (m *Module) Name() string { return "menu" }
 
+// Dependencies 声明依赖的模块名（当前无模块间依赖）。
+func (m *Module) Dependencies() []string { return nil }
+
 // Register 捕获 App 引用（只做注册，不触库，§3.3）。
 func (m *Module) Register(app *rbac.App) error {
 	m.app = app

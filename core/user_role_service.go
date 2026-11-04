@@ -11,6 +11,11 @@ import (
 )
 
 // UserRoleService 用户角色关联管理（§2.2）。
+//
+// Security：本服务不鉴权 operator——不检查调用者是否持有 rbac:* 管理权限。
+// HTTP 管理接口、内部 Job、CLI 等所有调用方必须先自行完成调用者授权
+// （如经 guard.Require("rbac:role:create") 保护），Service 只执行业务规则
+// （授权者持权约束等）而非入口鉴权。
 type UserRoleService struct {
 	deps ServiceDeps
 }
@@ -64,7 +69,7 @@ func (s *UserRoleService) Assign(ctx context.Context, operator AuthorizationCont
 	if err := s.deps.UserRoles.Assign(ctx, subjectID, roleID); err != nil {
 		return err
 	}
-	if err := s.deps.Authorizer.IncrSubjectVersion(ctx, SubjectID(subjectID)); err != nil {
+	if err := s.deps.invalidateSubject(ctx, SubjectID(subjectID)); err != nil {
 		return err
 	}
 	return s.deps.record(ctx, NewEvent(EventUserRoleAssigned, operator, subjectID, map[string]string{
@@ -128,7 +133,7 @@ func (s *UserRoleService) AssignBatch(ctx context.Context, operator Authorizatio
 			return err
 		}
 	}
-	if err := s.deps.Authorizer.IncrSubjectVersion(ctx, SubjectID(subjectID)); err != nil {
+	if err := s.deps.invalidateSubject(ctx, SubjectID(subjectID)); err != nil {
 		return err
 	}
 	return s.deps.record(ctx, NewEvent(EventUserRoleAssigned, operator, subjectID, map[string]string{
@@ -174,7 +179,7 @@ func (s *UserRoleService) AssignRoleToSubjects(ctx context.Context, operator Aut
 			return err
 		}
 	}
-	if err := s.deps.Authorizer.IncrSubjectVersions(ctx, subjectIDs); err != nil {
+	if err := s.deps.invalidateSubjects(ctx, subjectIDs); err != nil {
 		return err
 	}
 	return s.deps.record(ctx, NewEvent(EventUserRoleAssigned, operator, role.Code, map[string]string{
@@ -194,7 +199,7 @@ func (s *UserRoleService) Revoke(ctx context.Context, operator AuthorizationCont
 	if err := s.deps.UserRoles.Revoke(ctx, subjectID, roleID); err != nil {
 		return err
 	}
-	if err := s.deps.Authorizer.IncrSubjectVersion(ctx, SubjectID(subjectID)); err != nil {
+	if err := s.deps.invalidateSubject(ctx, SubjectID(subjectID)); err != nil {
 		return err
 	}
 	return s.deps.record(ctx, NewEvent(EventUserRoleRevoked, operator, subjectID, map[string]string{
