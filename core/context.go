@@ -1,5 +1,24 @@
 package core
 
+import "context"
+
+// tenantCtxKey 是请求上下文中的租户槽位（§2.9 预留点）：授权与写路径将
+// AuthorizationContext 的授权域注入 ctx，租户隔离仓储据此过滤。
+type tenantCtxKey struct{}
+
+// ContextWithTenant 将租户标识写入 ctx（空串 = default 域 / 平台域）。
+// 多租户部署的读路径应在请求入口用 TenantResolver 解析后注入；
+// 写路径由服务层从 operator AuthorizationContext 自动注入。
+func ContextWithTenant(ctx context.Context, tenantID string) context.Context {
+	return context.WithValue(ctx, tenantCtxKey{}, tenantID)
+}
+
+// TenantFromContext 读取 ctx 中的租户标识。
+func TenantFromContext(ctx context.Context) (tenantID string, ok bool) {
+	v, ok := ctx.Value(tenantCtxKey{}).(string)
+	return v, ok
+}
+
 // SubjectID 是外部用户标识（§4.2）。RBAC 不管理业务用户表，
 // 用户身份必须来自业务项目已完成认证的可信上下文。
 type SubjectID string

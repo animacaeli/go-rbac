@@ -44,37 +44,13 @@ func New(opts ...Option) (*App, error) {
 
 	repos := gormrepo.New(cfg.db).Assemble()
 
-	authorizer := core.NewAuthorizationService(
-		repos.Authorization, cfg.cch, cfg.statusChecker, cfg.metrics, cfg.cacheTTL,
-	)
-
 	events := core.NewEventBus()
 	if cfg.eventSink != nil {
 		events.SetSink(cfg.eventSink)
 	}
 
-	deps := core.ServiceDeps{
-		Roles:           repos.Roles,
-		Permissions:     repos.Permissions,
-		UserRoles:       repos.UserRoles,
-		RolePermissions: repos.RolePermissions,
-		Grants:          repos.Grants,
-		Registry:        cfg.reg,
-		Authorizer:      authorizer,
-		Events:          events,
-		GrantorMustHold: cfg.grantorMustHold,
-	}
-
-	app := &App{
-		cfg:         cfg,
-		repos:       repos,
-		authorizer:  authorizer,
-		events:      events,
-		roles:       core.NewRoleService(deps),
-		userRoles:   core.NewUserRoleService(deps),
-		grants:      core.NewGrantService(deps),
-		permissions: core.NewPermissionService(deps),
-	}
+	app := &App{cfg: cfg, repos: repos, events: events}
+	app.rebuildServices()
 
 	// Module Registry：注册（无数据库副作用）+ 迁移收集（§3.3）。
 	for _, mod := range cfg.modules {
@@ -90,12 +66,39 @@ func New(opts ...Option) (*App, error) {
 	return app, nil
 }
 
+// rebuildServices 以当前 repos 与配置重建授权服务与管理服务。
+// 模块（如 tenant）在 Register 期替换仓储后调用。
+func (a *App) rebuildServices() {
+	authorizer := core.NewAuthorizationService(
+		a.repos.Authorization, a.cfg.cch, a.cfg.statusChecker, a.cfg.metrics, a.cfg.cacheTTL,
+	)
+	authorizer.SetTenantScopeRequired(a.tenantScope)
+	a.authorizer = authorizer
+
+	deps := core.ServiceDeps{
+		Roles:           a.repos.Roles,
+		Permissions:     a.repos.Permissions,
+		UserRoles:       a.repos.UserRoles,
+		RolePermissions: a.repos.RolePermissions,
+		Grants:          a.repos.Grants,
+		Registry:        a.cfg.reg,
+		Authorizer:      authorizer,
+		Events:          a.events,
+		GrantorMustHold: a.cfg.grantorMustHold,
+	}
+	a.roles = core.NewRoleService(deps)
+	a.userRoles = core.NewUserRoleService(deps)
+	a.grants = core.NewGrantService(deps)
+	a.permissions = core.NewPermissionService(deps)
+}
+
 // App 是 RBAC 应用的组装根：服务获取、迁移执行、权限同步。
 type App struct {
 	cfg         config
 	repos       repository.Repos
 	authorizer  *core.AuthorizationService
 	events      *core.EventBus
+	tenantScope bool
 	roles       *core.RoleService
 	userRoles   *core.UserRoleService
 	grants      *core.GrantService
@@ -115,8 +118,28 @@ func (a *App) UserRoles() *core.UserRoleService { return a.userRoles }
 // Grants 返回用户额外授权管理服务。
 func (a *App) Grants() *core.GrantService { return a.grants }
 
+// PermissionsRepository 暴露内部权限仓储（扩展模块装配用；§3.4：内部 API，
+// 不承诺跨版本兼容）。
+func (a *App) PermissionsRepository() repository.PermissionRepo { return a.repos.Permissions }
+
 // Permissions 返回权限资源管理服务（状态控制与查询）。
 func (a *App) Permissions() *core.PermissionService { return a.permissions }
+
+// EnableTenantScope 启用多租户校验策略：AuthorizationContext.TenantID 从
+// "必须为空"变为"必须提供"（缺失即 fail closed，§2.9）。由 tenant 模块在
+// Register 期调用；亦可由业务项目在组装后、服务使用前手动调用。
+func (a *App) EnableTenantScope() {
+	a.tenantScope = true
+	a.authorizer.SetTenantScopeRequired(true)
+}
+
+// ReplaceRepositories 以租户隔离仓储替换内部仓储并重建服务。
+// 仅供扩展模块（tenant）在 Register 期使用（§3.4：内部 API，不承诺兼容）。
+// 调用后 App 的 Authorizer 与管理服务全部切换到新仓储；缓存与事件配置保留。
+func (a *App) ReplaceRepositories(repos repository.Repos) {
+	a.repos = repos
+	a.rebuildServices()
+}
 
 // SetEventSink 注入授权变更事件实现（Audit 模块在 Register 时调用，
 // 业务项目也可经 WithEventSink 在组装期注入）。
@@ -183,6 +206,9 @@ func (a *App) SeedSuperAdmin(ctx context.Context, subjectID string) error {
 	if subjectID == "" || len(subjectID) > model.SubjectIDMaxLength {
 		return fmt.Errorf("%w: %q", core.ErrInvalidSubjectID, subjectID)
 	}
+	// 超管种子固定写入平台域（tenant_id=''，§2.9 default 域），
+	// 与租户模块的租户超管种子（SeedSuperAdminInTenant）区分。
+	ctx = core.ContextWithTenant(ctx, "")
 	role, err := a.repos.Roles.FindByCode(ctx, model.BuiltinSuperAdminRoleCode)
 	if repository.IsNotFound(err) {
 		role = &model.Role{

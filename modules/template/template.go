@@ -26,14 +26,13 @@ import (
 	"github.com/animacaeli/go-rbac"
 	"github.com/animacaeli/go-rbac/core"
 	"github.com/animacaeli/go-rbac/model"
-	"github.com/animacaeli/go-rbac/registry"
 )
 
 // Module 是角色模板模块（实现 rbac.Module）。
+// 服务经 app 惰性获取：tenant 等模块可能在 Register 期替换仓储与服务。
 type Module struct {
 	templates map[string]Definition
-	roles     *core.RoleService
-	reg       *registry.Registry
+	app       *rbac.App
 }
 
 var _ rbac.Module = (*Module)(nil)
@@ -66,14 +65,14 @@ func (m *Module) Name() string { return "template" }
 // Register 校验模板引用的权限码均已在 Registry 注册（fail fast，§3.3），
 // 并捕获 Core 角色服务。不做数据库操作。
 func (m *Module) Register(app *rbac.App) error {
-	m.roles = app.Roles()
-	m.reg = app.Registry()
+	m.app = app
+	reg := app.Registry()
 	for code, def := range m.templates {
 		if strings.TrimSpace(def.Name) == "" {
 			return fmt.Errorf("rbac/modules/template: template %s missing name", code)
 		}
 		for _, perm := range def.PermissionCodes {
-			if !m.reg.Has(perm) {
+			if !reg.Has(perm) {
 				return fmt.Errorf("rbac/modules/template: template %s references unregistered permission %s", code, perm)
 			}
 		}
@@ -94,18 +93,18 @@ func (m *Module) CreateFromTemplate(ctx context.Context, operator core.Authoriza
 		return nil, fmt.Errorf("rbac/modules/template: unknown template %s", templateCode)
 	}
 	// 幂等：角色已存在时仅刷新权限快照（便于按模板重建/对齐）。
-	role, err := m.roles.Create(ctx, operator, roleCode, roleName, tpl.Description)
+	role, err := m.app.Roles().Create(ctx, operator, roleCode, roleName, tpl.Description)
 	if err != nil {
 		if !isRoleCodeExists(err) {
 			return nil, err
 		}
-		role, err = m.roles.FindByCode(ctx, roleCode)
+		role, err = m.app.Roles().FindByCode(ctx, roleCode)
 		if err != nil {
 			return nil, err
 		}
 	}
 	codes := sortedCopy(tpl.PermissionCodes)
-	if err := m.roles.SetPermissions(ctx, operator, role.ID, codes); err != nil {
+	if err := m.app.Roles().SetPermissions(ctx, operator, role.ID, codes); err != nil {
 		return nil, err
 	}
 	return role, nil

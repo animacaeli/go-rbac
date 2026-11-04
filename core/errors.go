@@ -18,6 +18,10 @@ var (
 	// ErrTenantNotSupported 表示 v1 未启用多租户但携带了 TenantID（fail closed，§2.9）。
 	ErrTenantNotSupported = errors.New("rbac: tenant not supported in v1, TenantID must be empty (default scope)")
 
+	// ErrTenantRequired 表示已启用多租户（tenant 模块）但 TenantID 缺失——
+	// fail closed，不得回退到 default 域（§2.9）。
+	ErrTenantRequired = errors.New("rbac: tenant id required (multi-tenant enabled, missing means fail closed)")
+
 	// ErrNoPermissionDeclared 表示权限码参数为空（fail closed，视为调用方编程错误）。
 	ErrNoPermissionDeclared = errors.New("rbac: no permission declared")
 )

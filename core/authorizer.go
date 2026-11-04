@@ -48,6 +48,31 @@ type AuthorizationService struct {
 	metrics Metrics
 	ttl     time.Duration
 	sf      singleflight.Group
+
+	// tenantRequired 由 tenant 模块经 rbac.App.EnableTenantScope 打开：
+	// AuthorizationContext.TenantID 从"必须为空"变为"必须提供"（§2.9）。
+	tenantRequired bool
+}
+
+// SetTenantScopeRequired 切换多租户校验策略（tenant 模块装配期调用）。
+func (s *AuthorizationService) SetTenantScopeRequired(required bool) {
+	s.tenantRequired = required
+}
+
+// validateAC 按当前租户策略校验授权上下文。
+// v1（未启用租户）：TenantID 必须为空串；启用租户：必须非空（§2.9 fail closed）。
+func (s *AuthorizationService) validateAC(ac AuthorizationContext) error {
+	if ac.SubjectID.IsEmpty() || len(ac.SubjectID) > model.SubjectIDMaxLength {
+		return ErrInvalidSubjectID
+	}
+	if s.tenantRequired {
+		if ac.TenantID == "" {
+			return ErrTenantRequired
+		}
+	} else if ac.TenantID != "" {
+		return ErrTenantNotSupported
+	}
+	return nil
 }
 
 var _ Authorizer = (*AuthorizationService)(nil)
@@ -107,9 +132,11 @@ func (s *AuthorizationService) load(ctx context.Context, ac AuthorizationContext
 		s.metrics.AuthorizeObserved(cacheHit, time.Since(start))
 	}()
 
-	if err := ac.Validate(model.SubjectIDMaxLength); err != nil {
+	if err := s.validateAC(ac); err != nil {
 		return loaded{}, err
 	}
+	// 授权域注入 ctx：租户隔离仓储据此过滤；缓存 key 由 ac.Scope() 构造（§6.1）。
+	ctx = ContextWithTenant(ctx, ac.TenantID)
 
 	if s.checker != nil {
 		active, err := s.checker.IsSubjectActive(ctx, ac.SubjectID)
@@ -378,9 +405,10 @@ func (s *AuthorizationService) GetPermissions(ctx context.Context, ac Authorizat
 // IsSuperAdministrator 判定主体是否为超级管理员（§7.3）。
 // 仍受账号状态约束（checker）；此处独立判定，不经过缓存。
 func (s *AuthorizationService) IsSuperAdministrator(ctx context.Context, ac AuthorizationContext) (bool, error) {
-	if err := ac.Validate(model.SubjectIDMaxLength); err != nil {
+	if err := s.validateAC(ac); err != nil {
 		return false, err
 	}
+	ctx = ContextWithTenant(ctx, ac.TenantID)
 	if s.checker != nil {
 		active, err := s.checker.IsSubjectActive(ctx, ac.SubjectID)
 		if err != nil {
@@ -397,14 +425,24 @@ func (s *AuthorizationService) IsSuperAdministrator(ctx context.Context, ac Auth
 	return ok, nil
 }
 
-// ---- 失效操作（§6.3 失效矩阵；v1 恒为 default 授权域） ----
+// ---- 失效操作（§6.3 失效矩阵） ----
+// 授权域取自 ctx 租户槽位（服务层写路径已注入 operator 的授权域；
+// 缺槽位时回落 default 域）。缓存 key 与读取路径的 ac.Scope() 保持同域。
+
+// scopeOf 从 ctx 推导授权域（§6.1 scope 槽位）。
+func scopeOf(ctx context.Context) string {
+	if tenant, ok := TenantFromContext(ctx); ok && tenant != "" {
+		return tenant
+	}
+	return DefaultScope
+}
 
 // IncrSubjectVersion 递增主体权限版本号（精确级失效）。
 // 适用：用户角色变更、用户额外授权 / 撤销 / 到期。
 // 调用时机：数据库事务提交成功之后（§6.2 不变性）。
 // 失败时管理接口应报错而非静默吞掉（§6.6）。
 func (s *AuthorizationService) IncrSubjectVersion(ctx context.Context, subjectID SubjectID) error {
-	_, err := s.cch.Incr(ctx, subjectVersionKey(DefaultScope, subjectID.String()))
+	_, err := s.cch.Incr(ctx, subjectVersionKey(scopeOf(ctx), subjectID.String()))
 	return err
 }
 
@@ -419,10 +457,10 @@ func (s *AuthorizationService) IncrSubjectVersions(ctx context.Context, subjectI
 	return nil
 }
 
-// IncrEpoch 递增全局 epoch（粗糙级失效）。
-// 适用：权限禁用等低频全局事件——一次性使所有旧生成键不可达，
+// IncrEpoch 递增当前授权域的全局 epoch（粗糙级失效）。
+// 适用：权限禁用等低频全局事件——一次性使该域全部旧生成键不可达，
 // 代价是全员冷启动一次（§6.3）。
 func (s *AuthorizationService) IncrEpoch(ctx context.Context) error {
-	_, err := s.cch.Incr(ctx, epochKey(DefaultScope))
+	_, err := s.cch.Incr(ctx, epochKey(scopeOf(ctx)))
 	return err
 }

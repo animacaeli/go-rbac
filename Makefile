@@ -28,7 +28,7 @@ test-race: ## 单元测试（含竞态检测）
 
 test-integration: compose-up ## 集成测试（需要 Docker，自动拉起 MySQL 8 + Redis 7）
 	RBAC_TEST_MYSQL_DSN='$(MYSQL_DSN)' RBAC_TEST_REDIS_ADDR='$(REDIS_ADDR)' \
-		$(GO) test -race -v ./repository/gormrepo/ ./cache/redis/
+		$(GO) test -race -v ./repository/gormrepo/ ./cache/redis/ ./modules/tenant/
 
 bench-integration: compose-up ## §9.4 性能基线（真实 MySQL + Redis）
 	RBAC_TEST_MYSQL_DSN='$(MYSQL_DSN)' RBAC_TEST_REDIS_ADDR='$(REDIS_ADDR)' \

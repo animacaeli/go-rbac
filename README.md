@@ -10,7 +10,9 @@
 - 版本化 SQL 迁移（`io/fs` embed + `schema_migrations`），幂等可重复执行
 - **权限缓存（§6）**：版本号 + 全局 epoch 两级失效、写前复核、singleflight 击穿防护；
   不使用 Redis 也可正常运行（默认 NoopCache），Redis 适配器开箱即用
-- 授权变更审计（Audit 模块）与角色模板（Template 模块）按需启用
+- 授权变更审计（Audit 模块）、角色模板（Template 模块）、菜单（Menu 模块）、
+  数据权限（DataScope 模块）、多租户隔离（Tenant 模块）按需启用
+- 适配器：Gin 与 net/http（标准库零依赖），核心不绑定任何框架
 - 设计文档：[docs/go-rbac-design.md](docs/go-rbac-design.md)（v0.3.0-design 定稿）
 
 ## 快速开始（Gin）
@@ -150,6 +152,48 @@ logs, err := audit.NewQuery(auditModule).List(ctx, audit.Filter{Operator: "10001
 Audit 默认 Strict 策略（审计写入失败 → 授权变更操作整体报错）；
 `audit.New(audit.WithLogOnly())` 降级为仅记日志。
 
+### Menu（§2.7）/ DataScope（§2.8）
+
+```go
+menuM := menu.New()
+ds := datascope.New()
+app, _ := rbac.New(..., rbac.WithModules(audit.New(), menuM, ds))
+
+// 声明菜单（幂等）：目录无权限关联=所有人可见；页面关联权限后需持有（OR 语义）
+_ = menuM.Declare(ctx,
+    menu.Item{Code: "biz", Name: "业务", Type: menu.TypeDirectory},
+    menu.Item{Code: "biz_users", Parent: "biz", Name: "用户", Type: menu.TypePage,
+        Path: "/users", Component: "UserList", Permissions: []string{"user:list"}},
+)
+tree, _ := menuM.ResolveVisibleMenus(ctx, ac) // 主体可见菜单树
+
+// 数据范围：多角色取最宽；未配置默认 SELF（deny-by-default）；超管恒 ALL
+_ = ds.SetRoleScope(ctx, operator, roleID, "order", datascope.ScopeDepartmentAndChildren)
+scope, _ := ds.ResolveDataScope(ctx, ac, "order") // 业务自行应用到查询
+```
+
+前端隐藏菜单只是体验优化，后端必须独立鉴权（§2.7）。
+
+### Multi-Tenant（§2.9）
+
+```go
+tenantMod := tenant.New()
+app, _ := rbac.New(..., rbac.WithModules(tenantMod)) // 必须注册在首个
+_ = app.Migrate(ctx)   // §5.5 迁移契约：加列 tenant_id → 回填 → 重建三唯一键（集成测试验收）
+
+// 请求入口：从可信上下文解析租户（TenantResolver）并注入
+ctx = core.ContextWithTenant(ctx, tenantID)
+
+// 种子：平台超管（default 域，全租户生效）/ 租户超管（仅本域）
+_ = app.SeedSuperAdmin(ctx, "platform-admin")
+_ = tenantMod.SeedSuperAdminInTenant(ctx, "acme", "acme-admin")
+```
+
+启用后语义：`AuthorizationContext.TenantID` 必须提供（缺失即 fail closed）；
+三张租户归属表（roles / user_roles / user_grants）读写按租户隔离；
+跨租户角色引用被结构性拒绝；缓存 key 按授权域隔离；
+平台超管以任意租户上下文恒真，租户超管仅本域。
+
 ## 错误语义（§2.6）
 
 | 情况 | HTTP 状态 |
@@ -178,7 +222,11 @@ Audit 默认 Strict 策略（审计写入失败 → 授权变更操作整体报�
       Audit 模块（事件总线 + Strict/LogOnly 策略）、CountingMetrics、§9.4 性能基线
       （命中路径 P99 < 1ms、冷聚合 P99 < 50ms、1k 用户批量失效 < 100ms、
       500 权限幂等同步 < 2s，实测见 CI / `make bench`）
-- [ ] Phase 3 高级模块：Menu / DataScope / Multi-Tenant（第一验收项 = §5.5 迁移契约测试）
+- [x] **Phase 3 高级模块**：Menu（OR 语义 + 可见树解析）、DataScope（四枚举取最宽、
+      默认 SELF）、Multi-Tenant（§5.5 迁移契约测试 = 第一验收项：升级/全新双路径 +
+      双租户隔离/跨租户拒绝/平台与租户超管边界/缓存域隔离）、net/http 适配器、
+      CUSTOM 数据范围与 Outbox 评估（结论见 [docs/phase3-evaluation.md](docs/phase3-evaluation.md)，
+      均维持延后并有明确触发条件）
 - [ ] Phase 4 稳定性与生态：文档、兼容性测试、发布规范
 
 ## 开发

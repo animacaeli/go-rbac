@@ -77,11 +77,11 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Run integration tests (MySQL + Redis consistency suites)
+      - name: Run integration tests (MySQL + Redis consistency + tenant suites)
         env:
           RBAC_TEST_MYSQL_DSN: root:rootpass@tcp(127.0.0.1:3306)/go_rbac_test?parseTime=true&loc=UTC&charset=utf8mb4
           RBAC_TEST_REDIS_ADDR: 127.0.0.1:6380
-        run: go test -race -v ./repository/gormrepo/ ./cache/redis/
+        run: go test -race -v ./repository/gormrepo/ ./cache/redis/ ./modules/tenant/
 
   vuln:
     name: Vulnerabilities (govulncheck)

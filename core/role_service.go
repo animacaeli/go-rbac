@@ -71,6 +71,8 @@ func NewRoleService(deps ServiceDeps) *RoleService { return &RoleService{deps: d
 
 // Create 创建角色（启用状态，非内置）。
 func (s *RoleService) Create(ctx context.Context, operator AuthorizationContext, code, name, description string) (*model.Role, error) {
+	ctx = ContextWithTenant(ctx, operator.TenantID)
+
 	code = strings.TrimSpace(code)
 	if code == "" || len(code) > model.RoleCodeMaxLength {
 		return nil, fmt.Errorf("%w: %q", ErrInvalidRoleCode, code)
@@ -131,6 +133,8 @@ func (s *RoleService) List(ctx context.Context, f repository.RoleFilter) ([]mode
 // Update 修改角色展示元数据（name/description）。code 与 status 不可经此修改。
 // 内置角色允许更新展示信息，但不可删除/禁用（§2.4）。
 func (s *RoleService) Update(ctx context.Context, operator AuthorizationContext, id uint64, name, description string) error {
+	ctx = ContextWithTenant(ctx, operator.TenantID)
+
 	role, err := s.Get(ctx, id)
 	if err != nil {
 		return err
@@ -153,6 +157,8 @@ func (s *RoleService) Update(ctx context.Context, operator AuthorizationContext,
 // SetStatus 启用/禁用角色。内置角色受保护（§7.3）。
 // 状态变化后批量递增关联用户版本号（§6.3 失效矩阵）。
 func (s *RoleService) SetStatus(ctx context.Context, operator AuthorizationContext, id uint64, status uint8) error {
+	ctx = ContextWithTenant(ctx, operator.TenantID)
+
 	role, err := s.Get(ctx, id)
 	if err != nil {
 		return err
@@ -182,6 +188,8 @@ func (s *RoleService) SetStatus(ctx context.Context, operator AuthorizationConte
 // Delete 删除角色：内置角色受保护；正在被分配给用户的角色拒绝删除（§2.4）。
 // 删除时在同一事务清理关联行（§5.3）。
 func (s *RoleService) Delete(ctx context.Context, operator AuthorizationContext, id uint64) error {
+	ctx = ContextWithTenant(ctx, operator.TenantID)
+
 	role, err := s.Get(ctx, id)
 	if err != nil {
 		return err
@@ -214,6 +222,8 @@ func (s *RoleService) Delete(ctx context.Context, operator AuthorizationContext,
 //
 // 提交成功后批量递增拥有该角色的用户版本号（§6.3）。
 func (s *RoleService) SetPermissions(ctx context.Context, operator AuthorizationContext, roleID uint64, permissionCodes []string) error {
+	ctx = ContextWithTenant(ctx, operator.TenantID)
+
 	role, err := s.Get(ctx, roleID)
 	if err != nil {
 		return err

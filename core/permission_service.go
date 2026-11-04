@@ -27,6 +27,8 @@ func NewPermissionService(deps ServiceDeps) *PermissionService {
 // 恢复的读者拿到新状态）。内置 rbac:* 权限允许禁用（运营决策），
 // 禁用后相关管理接口将拒绝持权约束检查中依赖它的操作。
 func (s *PermissionService) SetStatus(ctx context.Context, operator AuthorizationContext, code string, status uint8) error {
+	ctx = ContextWithTenant(ctx, operator.TenantID)
+
 	if status != model.PermissionStatusEnabled && status != model.PermissionStatusDisabled {
 		return fmt.Errorf("rbac: invalid permission status %d", status)
 	}

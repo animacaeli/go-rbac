@@ -37,6 +37,8 @@ func validateSubject(subjectID string) error {
 //
 // 提交成功后递增该用户版本号（§6.3）。
 func (s *UserRoleService) Assign(ctx context.Context, operator AuthorizationContext, subjectID string, roleID uint64) error {
+	ctx = ContextWithTenant(ctx, operator.TenantID)
+
 	if err := validateSubject(subjectID); err != nil {
 		return err
 	}
@@ -74,6 +76,8 @@ func (s *UserRoleService) Assign(ctx context.Context, operator AuthorizationCont
 // AssignBatch 为一个用户批量分配多个角色：逐个校验内置保护，
 // 授权者约束按全部角色的启用权限并集校验一次；提交后递增一次版本号。
 func (s *UserRoleService) AssignBatch(ctx context.Context, operator AuthorizationContext, subjectID string, roleIDs []uint64) error {
+	ctx = ContextWithTenant(ctx, operator.TenantID)
+
 	if len(roleIDs) == 0 {
 		return nil
 	}
@@ -136,6 +140,8 @@ func (s *UserRoleService) AssignBatch(ctx context.Context, operator Authorizatio
 // AssignRoleToSubjects 将一个角色批量分配给多个用户。
 // 授权者约束按该角色校验一次；提交后递增每个用户版本号。
 func (s *UserRoleService) AssignRoleToSubjects(ctx context.Context, operator AuthorizationContext, roleID uint64, subjectIDs []string) error {
+	ctx = ContextWithTenant(ctx, operator.TenantID)
+
 	if len(subjectIDs) == 0 {
 		return nil
 	}
@@ -180,6 +186,8 @@ func (s *UserRoleService) AssignRoleToSubjects(ctx context.Context, operator Aut
 
 // Revoke 回收用户角色（幂等：未分配时无操作）。
 func (s *UserRoleService) Revoke(ctx context.Context, operator AuthorizationContext, subjectID string, roleID uint64) error {
+	ctx = ContextWithTenant(ctx, operator.TenantID)
+
 	if err := validateSubject(subjectID); err != nil {
 		return err
 	}

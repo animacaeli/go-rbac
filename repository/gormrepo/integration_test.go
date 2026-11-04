@@ -17,6 +17,8 @@ import (
 	"github.com/animacaeli/go-rbac/core"
 	"github.com/animacaeli/go-rbac/model"
 	"github.com/animacaeli/go-rbac/modules/audit"
+	"github.com/animacaeli/go-rbac/modules/datascope"
+	"github.com/animacaeli/go-rbac/modules/menu"
 	"github.com/animacaeli/go-rbac/modules/template"
 	"github.com/animacaeli/go-rbac/registry"
 	"github.com/animacaeli/go-rbac/repository"
@@ -39,6 +41,8 @@ type IntegrationSuite struct {
 	permIDs map[string]uint64
 	audit   *audit.Module
 	tpl     *template.Module
+	menuM   *menu.Module
+	ds      *datascope.Module
 }
 
 func TestIntegrationSuite(t *testing.T) {
@@ -73,10 +77,12 @@ func (s *IntegrationSuite) SetupSuite() {
 		"ops_tpl", "运营模板", "模板复制演示",
 		"user:list", "user:delete",
 	))
+	s.menuM = menu.New()
+	s.ds = datascope.New()
 	app, err := rbac.New(
 		rbac.WithDB(db),
 		rbac.WithPermissionRegistry(s.reg),
-		rbac.WithModules(s.audit, s.tpl),
+		rbac.WithModules(s.audit, s.tpl, s.menuM, s.ds),
 	)
 	require.NoError(s.T(), err)
 	s.app = app
@@ -105,7 +111,7 @@ func (s *IntegrationSuite) loadPermIDs() map[string]uint64 {
 func (s *IntegrationSuite) resetSchema() {
 	tables := []string{
 		"schema_migrations",
-		"rbac_audit_logs",
+		"rbac_audit_logs", "rbac_menu_permissions", "rbac_menus", "rbac_role_data_scopes",
 		"rbac_user_grants", "rbac_role_permissions", "rbac_user_roles",
 		"rbac_permissions", "rbac_roles",
 	}
@@ -122,8 +128,9 @@ func (s *IntegrationSuite) TestMigrate_IdempotentRerun() {
 	s.Require().NoError(err)
 	var count int64
 	s.Require().NoError(s.db.Table("schema_migrations").Count(&count).Error)
-	// Core 0001 + audit 模块 0001；同一版本只记录一次。
-	s.Equal(int64(2), count, "重跑不产生新的版本记录")
+	// Core 0001 + audit/menu/datascope 各 0001（template 为代码声明形态，无迁移）；
+	// 同一版本只记录一次。
+	s.Equal(int64(4), count, "重跑不产生新的版本记录")
 }
 
 func (s *IntegrationSuite) TestSyncPermissions_IdempotentRerun() {
@@ -393,4 +400,90 @@ func (s *IntegrationSuite) TestPermissionService_DisableIncrementsEpoch() {
 	ok, err = s.app.Authorizer().HasPermission(ctx, user, "user:delete")
 	s.Require().NoError(err)
 	s.True(ok)
+}
+
+func (s *IntegrationSuite) TestMenuModule_DeclareAndResolveVisible() {
+	ctx := s.ctx
+	admin := core.AuthorizationContext{SubjectID: "root-admin"}
+	user := core.AuthorizationContext{SubjectID: "80001"}
+
+	// Arrange：目录（无权限关联=所有人可见）+ 页面（关联 user:list）+ 外链（关联 order:export）。
+	s.Require().NoError(s.menuM.Declare(ctx,
+		menu.Item{Code: "biz", Name: "业务", Type: menu.TypeDirectory},
+		menu.Item{Code: "biz_users", Parent: "biz", Name: "用户", Type: menu.TypePage,
+			Path: "/users", Component: "UserList", Permissions: []string{"user:list"}},
+		menu.Item{Code: "doc", Name: "文档", Type: menu.TypeLink, Path: "https://example.com",
+			Permissions: []string{"order:export"}},
+	))
+
+	// 普通用户持有 user:list（经角色）。
+	role, err := s.app.Roles().Create(ctx, admin, "menu_role", "M", "")
+	s.Require().NoError(err)
+	s.Require().NoError(s.app.Roles().SetPermissions(ctx, admin, role.ID, []string{"user:list"}))
+	s.Require().NoError(s.app.UserRoles().Assign(ctx, admin, "80001", role.ID))
+
+	// Act
+	tree, err := s.menuM.ResolveVisibleMenus(ctx, user)
+	s.Require().NoError(err)
+
+	// Assert：可见 = 目录（无关联）+ 用户页面（持有 user:list）；文档外链不可见。
+	codes := flattenMenu(tree)
+	s.ElementsMatch([]string{"biz", "biz_users"}, codes)
+
+	// 超管可见全部（含 doc）。
+	superTree, err := s.menuM.ResolveVisibleMenus(ctx, admin)
+	s.Require().NoError(err)
+	s.ElementsMatch([]string{"biz", "biz_users", "doc"}, flattenMenu(superTree))
+
+	// 树形结构：biz_users 挂在 biz 下。
+	s.Require().Len(tree, 1)
+	s.Equal("biz", tree[0].Code)
+	s.Require().Len(tree[0].Children, 1)
+	s.Equal("biz_users", tree[0].Children[0].Code)
+}
+
+func flattenMenu(nodes []*menu.Node) []string {
+	var out []string
+	for _, n := range nodes {
+		out = append(out, n.Code)
+		out = append(out, flattenMenu(n.Children)...)
+	}
+	return out
+}
+
+func (s *IntegrationSuite) TestDataScopeModule_WidestMergeAndDefaults() {
+	ctx := s.ctx
+	admin := core.AuthorizationContext{SubjectID: "root-admin"}
+	user := core.AuthorizationContext{SubjectID: "81001"}
+
+	// Arrange：两个角色（都分配给用户），分别配 SELF 与 DEPARTMENT_AND_CHILDREN。
+	roleA, err := s.app.Roles().Create(ctx, admin, "ds_a", "A", "")
+	s.Require().NoError(err)
+	roleB, err := s.app.Roles().Create(ctx, admin, "ds_b", "B", "")
+	s.Require().NoError(err)
+	s.Require().NoError(s.app.UserRoles().Assign(ctx, admin, "81001", roleA.ID))
+	s.Require().NoError(s.app.UserRoles().Assign(ctx, admin, "81001", roleB.ID))
+	s.Require().NoError(s.ds.SetRoleScope(ctx, admin, roleA.ID, "order", datascope.ScopeSelf))
+	s.Require().NoError(s.ds.SetRoleScope(ctx, admin, roleB.ID, "order", datascope.ScopeDepartmentAndChildren))
+
+	// Act + Assert：多角色取最宽（§2.8）。
+	scope, err := s.ds.ResolveDataScope(ctx, user, "order")
+	s.Require().NoError(err)
+	s.Equal(datascope.ScopeDepartmentAndChildren, scope)
+
+	// 未配置的资源 → 默认 SELF（deny-by-default）。
+	scope, err = s.ds.ResolveDataScope(ctx, user, "invoice")
+	s.Require().NoError(err)
+	s.Equal(datascope.ScopeSelf, scope)
+
+	// 超管 → ALL。
+	scope, err = s.ds.ResolveDataScope(ctx, admin, "order")
+	s.Require().NoError(err)
+	s.Equal(datascope.ScopeAll, scope)
+
+	// 替换式更新：调窄立即生效。
+	s.Require().NoError(s.ds.SetRoleScope(ctx, admin, roleB.ID, "order", datascope.ScopeSelf))
+	scope, err = s.ds.ResolveDataScope(ctx, user, "order")
+	s.Require().NoError(err)
+	s.Equal(datascope.ScopeSelf, scope)
 }
