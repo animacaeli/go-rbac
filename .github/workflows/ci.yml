@@ -33,7 +33,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go: ["1.23", "stable"]
+        # go.mod 的 go 指令由依赖决定（当前 1.26）；矩阵验证最低支持版 + 最新稳定版
+        go: ["1.26.x", "stable"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

@@ -137,7 +137,7 @@ Git hooks（`make hooks` 安装）：
   `go test -race`；未安装的工具自动跳过（CI 中强制执行）
 
 CI（`.github/workflows/ci.yml`）：lint（golangci-lint）、单元测试矩阵
-（Go 1.23 + stable，含竞态检测与覆盖率）、MySQL 8 集成测试、govulncheck
+（最低支持版 + stable，含竞态检测与覆盖率）、MySQL 8 集成测试、govulncheck
 漏洞检测，push / PR 自动触发。
 
 > 注：设计文档 §4.7 的内置权限码 `rbac:user:assign-role` 含连字符，与 §2.2/§2.3
