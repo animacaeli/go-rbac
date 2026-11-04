@@ -45,12 +45,18 @@ type AuthorizationContext struct {
 	TenantID string
 }
 
-// Validate 校验上下文。v1 语义：SubjectID 非空且不超长；TenantID 必须为空串。
+// Validate 校验上下文主体标识（非空且不超长）。
+//
+// 注意租户语义：本方法不感知租户策略。未启用 tenant 模块时（v1），
+// AuthorizationService 会拒绝非空 TenantID（ErrTenantNotSupported）；
+// 启用后改为要求非空（ErrTenantRequired）。需要按策略校验时，
+// 请使用 Authorizer 的方法（其内部按当前策略校验）。
 func (ac AuthorizationContext) Validate(maxSubjectIDLen int) error {
 	if ac.SubjectID.IsEmpty() || len(ac.SubjectID) > maxSubjectIDLen {
 		return ErrInvalidSubjectID
 	}
 	if ac.TenantID != "" {
+		// 保持向后兼容的 v1 严格语义；租户部署下请勿依赖本方法判定租户。
 		return ErrTenantNotSupported
 	}
 	return nil

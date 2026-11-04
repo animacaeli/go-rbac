@@ -47,11 +47,16 @@ jobs:
         run: go tool cover -func=coverage.out | tail -1
 
   integration:
-    name: Integration (MySQL 8 + Redis 7)
+    name: Integration (MySQL ${{ matrix.mysql }} + Redis 7)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 基准 8.0（设计冻结）+ 8.4 LTS（docs/db-compatibility.md）
+        mysql: ["8.0", "8.4"]
     services:
       mysql:
-        image: mysql:8.0
+        image: mysql:${{ matrix.mysql }}
         env:
           MYSQL_ROOT_PASSWORD: rootpass
           MYSQL_DATABASE: go_rbac_test

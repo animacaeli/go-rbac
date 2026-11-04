@@ -14,6 +14,7 @@
 package ginadapter
 
 import (
+	"context"
 	"errors"
 	"sort"
 	"sync"
@@ -27,15 +28,23 @@ const SubjectContextKey = "rbac.subject_id"
 
 // Guard 是 Gin 鉴权中间件构造器。
 type Guard struct {
-	authz        core.Authorizer
-	resolver     core.SubjectResolver
-	unauthorized func(c *gin.Context, err error)
-	forbidden    func(c *gin.Context)
-	unavailable  func(c *gin.Context, err error)
-	metrics      core.Metrics
+	authz         core.Authorizer
+	resolver      core.SubjectResolver
+	tenantResolve TenantResolver // 可选：多租户部署注入
+	unauthorized  func(c *gin.Context, err error)
+	forbidden     func(c *gin.Context)
+	unavailable   func(c *gin.Context, err error)
+	metrics       core.Metrics
 
 	mu       sync.Mutex
 	declared map[string]struct{}
+}
+
+// TenantResolver 由业务项目实现：从已完成认证的可信上下文解析租户标识
+// （§2.9）。启用多租户部署时经 WithTenantResolver 注入；解析失败按
+// fail closed 拒绝。与 modules/tenant.TenantResolver 形状一致（结构化匹配）。
+type TenantResolver = interface {
+	ResolveTenant(ctx context.Context) (string, error)
 }
 
 // Option 定制 Guard 行为。
@@ -54,6 +63,16 @@ func WithForbiddenHandler(h func(c *gin.Context)) Option {
 // WithUnavailableHandler 定制鉴权服务异常响应（默认 503）。
 func WithUnavailableHandler(h func(c *gin.Context, err error)) Option {
 	return func(g *Guard) { g.unavailable = h }
+}
+
+// WithTenantResolver 注入租户解析器（多租户部署）：每个受保护请求先解析
+// 租户并填入 AuthorizationContext.TenantID；解析失败按 fail closed 拒绝（403）。
+func WithTenantResolver(r TenantResolver) Option {
+	return func(g *Guard) {
+		if r != nil {
+			g.tenantResolve = r
+		}
+	}
 }
 
 // WithMetrics 注入观测实现（DenialsInc 记录 401/403/不可用拒绝计数）。
@@ -103,11 +122,10 @@ func (g *Guard) guard(codes ...string) gin.HandlerFunc {
 	}
 	g.declare(codes)
 	return func(c *gin.Context) {
-		subjectID, fail := g.resolve(c)
+		ac, fail := g.resolve(c)
 		if fail {
 			return
 		}
-		ac := core.AuthorizationContext{SubjectID: subjectID}
 
 		var ok bool
 		var err error
@@ -127,11 +145,10 @@ func (g *Guard) guardAll(codes ...string) gin.HandlerFunc {
 	}
 	g.declare(codes)
 	return func(c *gin.Context) {
-		subjectID, fail := g.resolve(c)
+		ac, fail := g.resolve(c)
 		if fail {
 			return
 		}
-		ac := core.AuthorizationContext{SubjectID: subjectID}
 
 		var ok bool
 		var err error
@@ -144,16 +161,27 @@ func (g *Guard) guardAll(codes ...string) gin.HandlerFunc {
 	}
 }
 
-// resolve 执行身份解析：失败即 401，绝不得视为匿名授权通过（§2.6）。
-func (g *Guard) resolve(c *gin.Context) (core.SubjectID, bool) {
+// resolve 执行身份与租户解析：身份失败即 401（绝不得视为匿名授权通过，
+// §2.6）；多租户部署下租户缺失按 fail closed 拒绝（§2.9）。
+func (g *Guard) resolve(c *gin.Context) (core.AuthorizationContext, bool) {
 	subjectID, err := g.resolver.Resolve(c.Request.Context())
 	if err != nil {
 		g.metrics.DenialsInc("unauthenticated")
 		g.unauthorized(c, err)
-		return "", true
+		return core.AuthorizationContext{}, true
 	}
 	c.Set(SubjectContextKey, subjectID.String())
-	return subjectID, false
+	ac := core.AuthorizationContext{SubjectID: subjectID}
+	if g.tenantResolve != nil {
+		tenantID, err := g.tenantResolve.ResolveTenant(c.Request.Context())
+		if err != nil {
+			g.metrics.DenialsInc("forbidden")
+			g.forbidden(c)
+			return core.AuthorizationContext{}, true
+		}
+		ac.TenantID = tenantID
+	}
+	return ac, false
 }
 
 // finish 映射授权结果：非活跃（确定拒绝）→ 403；基础设施错误 → 503（fail closed）。

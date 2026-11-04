@@ -25,15 +25,32 @@ type SubjectContextKey struct{}
 
 // Guard 是 net/http 鉴权中间件构造器。
 type Guard struct {
-	authz        core.Authorizer
-	resolver     core.SubjectResolver
-	unauthorized func(w http.ResponseWriter, r *http.Request, err error)
-	forbidden    func(w http.ResponseWriter, r *http.Request)
-	unavailable  func(w http.ResponseWriter, r *http.Request, err error)
+	authz         core.Authorizer
+	resolver      core.SubjectResolver
+	tenantResolve TenantResolver // 可选：多租户部署注入
+	unauthorized  func(w http.ResponseWriter, r *http.Request, err error)
+	forbidden     func(w http.ResponseWriter, r *http.Request)
+	unavailable   func(w http.ResponseWriter, r *http.Request, err error)
+}
+
+// TenantResolver 由业务项目实现：从已完成认证的可信上下文解析租户标识
+// （§2.9）。与 modules/tenant.TenantResolver 形状一致（结构化匹配）。
+type TenantResolver = interface {
+	ResolveTenant(ctx context.Context) (string, error)
 }
 
 // Option 定制 Guard 行为。
 type Option func(*Guard)
+
+// WithTenantResolver 注入租户解析器（多租户部署）：请求先解析租户并填入
+// AuthorizationContext.TenantID；解析失败按 fail closed 拒绝（403）。
+func WithTenantResolver(r TenantResolver) Option {
+	return func(g *Guard) {
+		if r != nil {
+			g.tenantResolve = r
+		}
+	}
+}
 
 // WithUnauthorizedHandler 定制 401 响应。
 func WithUnauthorizedHandler(h func(w http.ResponseWriter, r *http.Request, err error)) Option {
@@ -95,13 +112,22 @@ func (g *Guard) RequireAll(codes ...string) func(http.Handler) http.Handler {
 func (g *Guard) guard(eval func(ctx context.Context, ac core.AuthorizationContext) (bool, error)) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// 身份解析失败即 401，绝不得视为匿名授权通过（§2.6）。
+			// 身份解析失败即 401，绝不得视为匿名授权通过（§2.6）；
+			// 多租户部署下租户缺失按 fail closed 拒绝（§2.9）。
 			subjectID, err := g.resolver.Resolve(r.Context())
 			if err != nil {
 				g.unauthorized(w, r, err)
 				return
 			}
 			ac := core.AuthorizationContext{SubjectID: subjectID}
+			if g.tenantResolve != nil {
+				tenantID, err := g.tenantResolve.ResolveTenant(r.Context())
+				if err != nil {
+					g.forbidden(w, r)
+					return
+				}
+				ac.TenantID = tenantID
+			}
 			ctx := context.WithValue(r.Context(), SubjectContextKey{}, subjectID.String())
 
 			ok, err := eval(ctx, ac)

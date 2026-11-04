@@ -227,7 +227,21 @@ _ = tenantMod.SeedSuperAdminInTenant(ctx, "acme", "acme-admin")
       双租户隔离/跨租户拒绝/平台与租户超管边界/缓存域隔离）、net/http 适配器、
       CUSTOM 数据范围与 Outbox 评估（结论见 [docs/phase3-evaluation.md](docs/phase3-evaluation.md)，
       均维持延后并有明确触发条件）
-- [ ] Phase 4 稳定性与生态：文档、兼容性测试、发布规范
+- [x] **Phase 4 稳定性与生态**：godoc 文档与示例、接入示例（basic / redis /
+      tenant）、MySQL 8.0 + 8.4 LTS 兼容矩阵（[5.7 评估：不支持]
+      (docs/db-compatibility.md)）、并发授权与主从延迟边界测试、§9.3 安全
+      套件（含 Redis 故障矩阵）、pkg.go.dev 定名查重（保留 go-rbac）、
+      CHANGELOG 与 tag 触发的发布流水线
+
+### 发布流程
+
+版本记录在 [CHANGELOG.md](CHANGELOG.md)（Keep a Changelog 格式）。
+发布 = 在 CHANGELOG 落定版本区段后打 tag：
+
+```bash
+git tag v0.x.0 && git push origin v0.x.0   # 触发 .github/workflows/release.yml：
+                                            # 全量测试 → 从 CHANGELOG 提取区段 → GitHub Release
+```
 
 ## 开发
 
@@ -250,8 +264,8 @@ Git hooks（`make hooks` 安装）：
   `go test -race`；未安装的工具自动跳过（CI 中强制执行）
 
 CI（`.github/workflows/ci.yml`）：lint（golangci-lint）、单元测试矩阵
-（最低支持版 + stable，含竞态检测与覆盖率）、MySQL 8 集成测试、govulncheck
-漏洞检测，push / PR 自动触发。
+（最低支持版 + stable，含竞态检测与覆盖率）、集成测试矩阵（MySQL 8.0 +
+8.4 LTS × Redis 7）、govulncheck 漏洞检测，push / PR 自动触发。
 
 > 注：设计文档 §4.7 的内置权限码 `rbac:user:assign-role` 含连字符，与 §2.2/§2.3
 > 冻结的权限码字符集（小写字母/数字/下划线/冒号）冲突，实现规范化为

@@ -218,8 +218,10 @@ func (m *Module) ResolveDataScope(ctx context.Context, ac core.AuthorizationCont
 	if m.app == nil {
 		return 0, fmt.Errorf("rbac/modules/datascope: module not registered")
 	}
-	if err := ac.Validate(model.SubjectIDMaxLength); err != nil {
-		return 0, err
+	// 仅校验主体标识；租户合法性由租户策略（authorizer.validateAC）管辖，
+	// 本模块按 ac 的授权域解析并注入 ctx。
+	if ac.SubjectID.IsEmpty() || len(ac.SubjectID) > model.SubjectIDMaxLength {
+		return 0, core.ErrInvalidSubjectID
 	}
 	ctx = core.ContextWithTenant(ctx, ac.TenantID)
 

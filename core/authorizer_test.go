@@ -375,3 +375,39 @@ func makeLongString(n int) string {
 	}
 	return string(b)
 }
+
+// §6.4 主从延迟边界（文档化测试）：若回填报源读到的是延迟从库的旧数据，
+// 且期间无新的版本递增，旧数据会被写进当前生成键——这正是"缓存回填路径
+// 必须读主库"规则存在的原因（v1 以单一主库句柄 + 文档声明兜底，§9.2）。
+// 本测试固定该边界行为：规则被破坏时的失效模式可观测、可解释。
+func (s *AuthorizationServiceSuite) TestStaleReplicaRead_DocumentedLimitation() {
+	// Arrange：聚合#1（主库）返回真实数据；聚合#2（模拟延迟从库）返回旧数据。
+	// 缓存 Get 恒 miss → 第二次读取触发第二次聚合与写回。
+	sid := "10001"
+	s.cch.On("GetInt", mock.Anything, "rbac:default:epoch").Return(int64(0), true, nil)
+	s.cch.On("GetInt", mock.Anything, versionKey(sid)).Return(int64(0), true, nil)
+	s.cch.On("Get", mock.Anything, mock.Anything).Return(nil, false, nil)
+	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, sid).Return(false, nil)
+	s.authzRepo.On("EffectiveRolePermissions", mock.Anything, sid).
+		Return([]string{"user:list"}, nil).Once() // #1 主库：真实
+	s.authzRepo.On("EffectiveRolePermissions", mock.Anything, sid).
+		Return(nil, nil).Once() // #2 从库：过期
+	s.authzRepo.On("EffectiveGrantPermissions", mock.Anything, sid, mock.AnythingOfType("time.Time")).Return(nil, nil).Twice()
+	s.authzRepo.On("NearestGrantExpiry", mock.Anything, sid, mock.AnythingOfType("time.Time")).Return(nil, nil).Twice()
+	var cached []string
+	s.cch.On("Set", mock.Anything, permKey(sid, 0), mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) { cached = args.Get(2).([]string) }).
+		Return(nil).Twice()
+
+	// Act：两次读取（第二次命中被污染的缓存）。
+	first, err := s.sut.GetPermissions(s.ctx, subject1)
+	s.Require().NoError(err)
+	second, err := s.sut.GetPermissions(s.ctx, subject1)
+	s.Require().NoError(err)
+
+	// Assert：第二次读到的是"从库旧数据"——§6.4 已知边界。
+	// 部署约束（README/设计文档）：回填路径读主库即可避免本场景。
+	s.Equal([]string{"user:list"}, first)
+	s.Empty(second)
+	s.Empty(cached, "被污染写回的内容为旧集合（该键在 TTL 内持续返回旧数据）")
+}

@@ -1,6 +1,7 @@
 package ginadapter_test
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -243,4 +244,52 @@ func TestGuard_RequireWithoutCodes_Panics(t *testing.T) {
 	// Act + Assert
 	require.Panics(t, func() { guard.RequireAny() })
 	require.Panics(t, func() { guard.RequireAll() })
+}
+
+func (s *GuardSuite) TestTenantResolver_MissingTenant_FailClosed() {
+	// Arrange
+	gin.SetMode(gin.TestMode)
+	guard := ginadapter.New(s.authzMock, s.resolverMock,
+		ginadapter.WithTenantResolver(fakeTenantResolver{err: errors.New("tenant missing")}))
+	s.router = gin.New()
+	s.router.GET("/p", guard.Require("user:list"), func(c *gin.Context) { c.JSON(200, nil) })
+	s.resolverMock.On("Resolve", mock.Anything).Return(core.SubjectID("10001"), nil)
+	// authz 无任何期望：不得触达授权判断。
+
+	// Act
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/p", nil))
+
+	// Assert：租户缺失 → fail closed（403），不是 503 也不是放行。
+	s.Require().Equal(http.StatusForbidden, w.Code)
+}
+
+func (s *GuardSuite) TestTenantResolver_TenantFlowsIntoContext() {
+	// Arrange
+	guard := ginadapter.New(s.authzMock, s.resolverMock,
+		ginadapter.WithTenantResolver(fakeTenantResolver{tenant: "acme"}))
+	s.router = gin.New()
+	s.router.GET("/p", guard.Require("user:list"), func(c *gin.Context) { c.JSON(200, nil) })
+	s.resolverMock.On("Resolve", mock.Anything).Return(core.SubjectID("10001"), nil)
+	// 授权上下文必须携带租户 acme。
+	s.authzMock.On("HasPermission", mock.Anything,
+		core.AuthorizationContext{SubjectID: "10001", TenantID: "acme"}, "user:list").
+		Return(true, nil)
+
+	// Act
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/p", nil))
+
+	// Assert
+	s.Require().Equal(http.StatusOK, w.Code)
+}
+
+// fakeTenantResolver 是租户解析器的测试替身（§2.9 fail closed 语义验证）。
+type fakeTenantResolver struct {
+	tenant string
+	err    error
+}
+
+func (f fakeTenantResolver) ResolveTenant(context.Context) (string, error) {
+	return f.tenant, f.err
 }

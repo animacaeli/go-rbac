@@ -26,3 +26,8 @@ go.work.sum
 .vscode/
 *.swp
 .DS_Store
+
+# go build 单包产物
+gin-basic
+gin-redis
+gin-tenant

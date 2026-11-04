@@ -268,3 +268,68 @@ func percentile(sorted []time.Duration, p float64) time.Duration {
 	idx := int(float64(len(sorted)-1) * p)
 	return sorted[idx]
 }
+
+// §9.1/§9.2 并发授权变更：写者反复授予/撤销，读者持续校验；
+// 不变量——读者只见合法状态（true/false），无错误、无 panic；
+// 终态收敛（撤销后最终为 false）。-race 由 make test-integration 开启。
+func (s *ConsistencySuite) TestConcurrentAuthorizationChanges() {
+	role := s.roleWithPerms("cache_conc", "user:list")
+	s.Require().NoError(s.app.UserRoles().Assign(s.ctx, admin, "91001", role.ID))
+
+	// 各写者操作独立主体（同一 (subject, permission) 的并发撤销会正确地
+	// 报 ErrGrantNotFound——那是产品行为，不是竞态），读者轮询其一。
+	const writers = 2
+	const iterations = 25
+	subjects := []string{"91001", "91002"}
+	done := make(chan error, writers)
+	for w := 0; w < writers; w++ {
+		subject := subjects[w]
+		go func() {
+			for i := 0; i < iterations; i++ {
+				if err := s.app.Grants().Grant(s.ctx, admin, subject, "order:export", nil, "并发"); err != nil {
+					done <- err
+					return
+				}
+				if err := s.app.Grants().Revoke(s.ctx, admin, subject, "order:export"); err != nil {
+					done <- err
+					return
+				}
+			}
+			done <- nil
+		}()
+	}
+
+	reader := core.AuthorizationContext{SubjectID: "91001"}
+	readerErr := make(chan error, 1)
+	go func() {
+		for i := 0; i < 600; i++ {
+			_, err := s.app.Authorizer().HasPermission(s.ctx, reader, "order:export")
+			if err != nil {
+				readerErr <- err
+				return
+			}
+			// 过渡期 true/false 均合法；错误即失败。
+		}
+		readerErr <- nil
+	}()
+
+	for w := 0; w < writers; w++ {
+		s.Require().NoError(<-done)
+	}
+	s.Require().NoError(<-readerErr)
+
+	// 终态：撤销完成后，短暂窗口内必然收敛到 false（版本递增即时失效）。
+	s.Require().NoError(s.app.Grants().Grant(s.ctx, admin, "91001", "order:export", nil, "终态"))
+	s.Require().NoError(s.app.Grants().Revoke(s.ctx, admin, "91001", "order:export"))
+	var converged bool
+	for i := 0; i < 50; i++ {
+		ok, err := s.app.Authorizer().HasPermission(s.ctx, reader, "order:export")
+		s.Require().NoError(err)
+		if !ok {
+			converged = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	s.True(converged, "撤销后必须收敛到 false")
+}
