@@ -2,12 +2,14 @@ package tenant
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/animacaeli/go-rbac/core"
 	"github.com/animacaeli/go-rbac/model"
 	"github.com/animacaeli/go-rbac/repository"
+	mysqlDriver "github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 )
 
@@ -47,6 +49,27 @@ func (r *Repos) writer(ctx context.Context) (*gorm.DB, string, error) {
 }
 
 func nowUTC() time.Time { return time.Now().UTC() }
+
+// runWithDeadlockRetry：MySQL 1213（RR 间隙锁死锁）有界重试；事务幂等。
+const (
+	deadlockRetryAttempts = 3
+	deadlockBaseBackoff   = 5 * time.Millisecond
+)
+
+func runWithDeadlockRetry(fn func() error) error {
+	var err error
+	for attempt := 0; attempt < deadlockRetryAttempts; attempt++ {
+		if err = fn(); err == nil {
+			return nil
+		}
+		var me *mysqlDriver.MySQLError
+		if !errors.As(err, &me) || me.Number != 1213 {
+			return err
+		}
+		time.Sleep(deadlockBaseBackoff * time.Duration(attempt+1))
+	}
+	return err
+}
 
 // ---- RoleRepo ----
 
@@ -303,21 +326,24 @@ func (x grantRepo) Grant(ctx context.Context, g model.UserGrant, now time.Time) 
 	if err != nil {
 		return err
 	}
-	return db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Table("rbac_user_grants").
-			Where("tenant_id = ? AND subject_id = ? AND permission_id = ? AND revoked_at IS NULL", t, g.SubjectID, g.PermissionID).
-			Updates(map[string]any{"revoked_at": now, "revoked_by": g.CreatedBy}).Error; err != nil {
-			return err
-		}
-		return tx.Table("rbac_user_grants").Create(map[string]any{
-			"tenant_id":     t,
-			"subject_id":    g.SubjectID,
-			"permission_id": g.PermissionID,
-			"expires_at":    g.ExpiresAt,
-			"reason":        g.Reason,
-			"created_by":    g.CreatedBy,
-			"created_at":    now,
-		}).Error
+	// 相邻 subject_id 的并发授权可能触发 RR 间隙锁死锁（1213）——事务幂等，有界重试。
+	return runWithDeadlockRetry(func() error {
+		return db.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Table("rbac_user_grants").
+				Where("tenant_id = ? AND subject_id = ? AND permission_id = ? AND revoked_at IS NULL", t, g.SubjectID, g.PermissionID).
+				Updates(map[string]any{"revoked_at": now, "revoked_by": g.CreatedBy}).Error; err != nil {
+				return err
+			}
+			return tx.Table("rbac_user_grants").Create(map[string]any{
+				"tenant_id":     t,
+				"subject_id":    g.SubjectID,
+				"permission_id": g.PermissionID,
+				"expires_at":    g.ExpiresAt,
+				"reason":        g.Reason,
+				"created_by":    g.CreatedBy,
+				"created_at":    now,
+			}).Error
+		})
 	})
 }
 

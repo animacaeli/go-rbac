@@ -344,17 +344,20 @@ type userGrantRepo struct{ r *Repos }
 // Grant 实现 §2.5 生命周期主防线：事务内先撤销冲突的未撤销行（含已过期），
 // 再插入新授权。数据库生成列 + 唯一约束兜底并发漏网（§5.2/§5.3）。
 func (x userGrantRepo) Grant(ctx context.Context, g model.UserGrant, now time.Time) error {
-	return x.r.writer(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&model.UserGrant{}).
-			Where("subject_id = ? AND permission_id = ? AND revoked_at IS NULL", g.SubjectID, g.PermissionID).
-			Updates(map[string]any{
-				"revoked_at": now,
-				"revoked_by": g.CreatedBy,
-			}).Error; err != nil {
-			return err
-		}
-		g.CreatedAt = now
-		return tx.Create(&g).Error
+	// 相邻 subject_id 的并发授权可能触发 RR 间隙锁死锁（1213）——事务幂等，有界重试。
+	return runWithDeadlockRetry(func() error {
+		return x.r.writer(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := tx.Model(&model.UserGrant{}).
+				Where("subject_id = ? AND permission_id = ? AND revoked_at IS NULL", g.SubjectID, g.PermissionID).
+				Updates(map[string]any{
+					"revoked_at": now,
+					"revoked_by": g.CreatedBy,
+				}).Error; err != nil {
+				return err
+			}
+			g.CreatedAt = now
+			return tx.Create(&g).Error
+		})
 	})
 }
 

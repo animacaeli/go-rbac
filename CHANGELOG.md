@@ -7,6 +7,15 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- 并发授权在 REPEATABLE READ 下因唯一索引间隙锁死锁（MySQL 1213）：
+  Grant 事务增加有界重试（base/tenant 双实现；并发压力测试在 CI 捕获）
+- CI 共享 runner 上性能基线偶发超时：命中路径阈值按环境放宽
+  （本地 / RBAC_TEST_PERF_STRICT=1 保持 1ms，CI 放宽到 10ms 捕获数量级回归）
+- release workflow 的发布正文经 shell 变量展开吞掉反引号代码段：
+  改用 --notes-file 传递
+
 ## [0.4.0] - 2026-11-05
 
 Phase 4：稳定性与生态（设计文档 §8）。
