@@ -58,10 +58,11 @@ jobs:
           # 取全量历史以便提取 CHANGELOG 区段
           fetch-depth: 0
       - name: Extract changelog section
-        id: changelog
         run: |
           TAG="${GITHUB_REF_NAME#v}"
-          # 提取 "## [<tag>] ..." 到下一个 "## " 之间的正文
+          # 提取 "## [<tag>] ..." 到下一个 "## " 之间的正文。
+          # 注意：必须用 --notes-file 传递正文——CHANGELOG 含反引号，
+          # 经 shell 双引号展开会被当作命令替换吞掉。
           awk -v tag="$TAG" '
             $0 ~ "^## \\[" tag "\\]" {found=1; next}
             found && /^## \[/ {exit}
@@ -70,16 +71,11 @@ jobs:
           if [ ! -s /tmp/release_notes.md ]; then
             echo "（$TAG 无对应 CHANGELOG 区段）" > /tmp/release_notes.md
           fi
-          {
-            echo "notes<<RELEASE_NOTES_EOF"
-            cat /tmp/release_notes.md
-            echo "RELEASE_NOTES_EOF"
-          } >> "$GITHUB_OUTPUT"
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
             --title "${GITHUB_REF_NAME}" \
-            --notes "${{ steps.changelog.outputs.notes }}" \
+            --notes-file /tmp/release_notes.md \
             --verify-tag
