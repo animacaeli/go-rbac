@@ -5,9 +5,9 @@ import (
 	"time"
 
 	"github.com/animacaeli/go-rbac/core"
+	"github.com/animacaeli/go-rbac/internal/repository"
 	"github.com/animacaeli/go-rbac/model"
 	"github.com/animacaeli/go-rbac/registry"
-	"github.com/animacaeli/go-rbac/repository"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 )

@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/animacaeli/go-rbac/cache"
+	"github.com/animacaeli/go-rbac/internal/repository"
 	"github.com/animacaeli/go-rbac/model"
-	"github.com/animacaeli/go-rbac/repository"
 	"golang.org/x/sync/singleflight"
 )
 

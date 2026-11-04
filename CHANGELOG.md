@@ -7,7 +7,31 @@
 
 ## [Unreleased]
 
+### Changed（Breaking，pre-1.0 收口）
+
+- `repository/` 迁移至 `internal/repository/`：以 Go 语言机制强制 §3.4
+  "Repository 接口 v1 保持内部"的冻结决策（外部无法导入实现）；
+  `App.PermissionsRepository` / `App.ReplaceRepositories` 保留导出，
+  仅供库内模块（modules/*）装配使用
+- `registry.Sync` 重构为 `registry.Diff`（纯函数，返回 `SyncPlan` 差量计划）+
+  仓储 `ApplySync` 应用：registry 不再依赖存储接口，依赖方向修正为
+  repository → registry；Diff 可纯函数表驱动测试
+- 删除 `middleware/` 骨架包：适配器自包含规则（§3.3 逃生舱）使其永远没有
+  库内使用方；自定义集成（如 gRPC）出现真实需求时再随用例编写
+
+### Added
+
+- `make cover-integration`：单元 + 集成合并覆盖率（库代码口径，当前 70.4%，
+  消除"集成不计入"导致的覆盖率失真）；CI 增加 `make mocks-check`
+  （生成代码与接口定义一致性校验）；App 装配级单测
+
 ### Fixed
+
+- 并发创建同 code 角色的"先查后插"竞态：唯一键冲突现在映射为
+  `ErrRoleCodeExists`（base/tenant 双仓储翻译 1062 → 内部哨兵）
+- `SetPermissions` 差量事务增加死锁有界重试（与 Grant 同语义）
+- 租户超管种子并发幂等（INSERT IGNORE）
+- subject 大小写语义文档化（README 缓存章节）
 
 - §6.5 审计发现（两层修复）：
   1. 仓储层 `NearestGrantExpiry` 用 `*time.Time` 扫描 `MIN(expires_at)`，

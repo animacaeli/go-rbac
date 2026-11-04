@@ -1,8 +1,9 @@
 // Package repository 定义数据访问抽象。
 //
-// §3.4 冻结决策：Repository 接口 v1 保持内部——公开面只保留
-// Authorizer / PermissionCache / SubjectResolver / Module 等业务真正需要
-// 实现的接口。本包公开仅为库内组装与测试所用，不承诺跨版本兼容。
+// §3.4 冻结决策：Repository 接口 v1 保持内部（本包位于 internal/ 下，
+// Go 语言机制强制外部不可导入实现）——公开面只保留 Authorizer /
+// PermissionCache / SubjectResolver / Module 等业务真正需要实现的接口。
+// App 上个别暴露本包类型的方法仅为库内模块（modules/*）装配使用。
 //
 // 错误约定：找不到记录时实现返回本包的 ErrRecordNotFound（而非具体 ORM 错误），
 // 服务层据此映射为领域哨兵错误。
@@ -14,10 +15,18 @@ import (
 	"time"
 
 	"github.com/animacaeli/go-rbac/model"
+	"github.com/animacaeli/go-rbac/registry"
 )
 
 // ErrRecordNotFound 表示目标记录不存在（由各实现统一翻译）。
 var ErrRecordNotFound = errors.New("rbac: record not found")
+
+// ErrDuplicateEntry 表示唯一键冲突（并发下的"先查后插"竞态兜底）。
+// 服务层据此映射为领域哨兵错误（如 core.ErrRoleCodeExists）。
+var ErrDuplicateEntry = errors.New("rbac: duplicate entry")
+
+// IsDuplicate 报告 err 链上是否为唯一键冲突。
+func IsDuplicate(err error) bool { return errors.Is(err, ErrDuplicateEntry) }
 
 // IsNotFound 报告 err 链上是否为"记录不存在"。
 func IsNotFound(err error) bool { return errors.Is(err, ErrRecordNotFound) }
@@ -46,20 +55,6 @@ type RoleRepo interface {
 	CountUsers(ctx context.Context, roleID uint64) (int64, error)
 }
 
-// PermissionSync 描述一次权限同步的差量（§2.3 同步规则），由 registry.Sync 计算，
-// 在单个事务内应用。
-type PermissionSync struct {
-	// Inserts 新增权限（代码新注册），status = 启用。
-	Inserts []model.Permission
-	// MetadataUpdates 已存在权限的展示元数据更新（name/module/description）。
-	MetadataUpdates []model.Permission
-	// ReactivateIDs 从"已废弃"恢复为"启用"的权限 ID（代码重新注册）。
-	ReactivateIDs []uint64
-	// DeprecateIDs 从"启用"标记为"已废弃"的权限 ID（代码不再注册，§2.3 规则 5/6）。
-	// 手动禁用（status=0）的权限不被触碰。
-	DeprecateIDs []uint64
-}
-
 // PermissionRepo 是权限表数据访问。
 type PermissionRepo interface {
 	FindByCode(ctx context.Context, code string) (*model.Permission, error)
@@ -67,8 +62,8 @@ type PermissionRepo interface {
 	ListAll(ctx context.Context) ([]model.Permission, error)
 	// SetStatus 更新权限状态（启用/手动禁用；废弃状态由同步机制管理）。
 	SetStatus(ctx context.Context, id uint64, status uint8) error
-	// ApplySync 在单个事务内应用权限同步差量。
-	ApplySync(ctx context.Context, s PermissionSync) error
+	// ApplySync 在单个事务内应用权限同步差量计划（registry.Diff 计算）。
+	ApplySync(ctx context.Context, plan registry.SyncPlan) error
 }
 
 // UserRoleRepo 是用户角色关联表数据访问（纯关联表，撤销即物理删除，§5.3）。

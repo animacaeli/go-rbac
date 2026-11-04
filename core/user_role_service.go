@@ -6,8 +6,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/animacaeli/go-rbac/internal/repository"
 	"github.com/animacaeli/go-rbac/model"
-	"github.com/animacaeli/go-rbac/repository"
 )
 
 // UserRoleService 用户角色关联管理（§2.2）。

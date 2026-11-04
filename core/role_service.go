@@ -8,9 +8,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/animacaeli/go-rbac/internal/repository"
 	"github.com/animacaeli/go-rbac/model"
 	"github.com/animacaeli/go-rbac/registry"
-	"github.com/animacaeli/go-rbac/repository"
 )
 
 // ServiceDeps 汇聚管理服务所需的依赖。由 rbac.New 统一装配。
@@ -96,6 +96,10 @@ func (s *RoleService) Create(ctx context.Context, operator AuthorizationContext,
 		Status:      model.RoleStatusEnabled,
 	}
 	if err := s.deps.Roles.Create(ctx, role); err != nil {
+		// 并发同 code 的"先查后插"竞态：唯一键兜底，映射为领域错误。
+		if repository.IsDuplicate(err) {
+			return nil, fmt.Errorf("%w: %s", ErrRoleCodeExists, code)
+		}
 		return nil, err
 	}
 	if err := s.deps.record(ctx, NewEvent(EventRoleCreated, operator, code, map[string]string{

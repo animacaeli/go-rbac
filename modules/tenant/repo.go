@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/animacaeli/go-rbac/core"
+	"github.com/animacaeli/go-rbac/internal/repository"
 	"github.com/animacaeli/go-rbac/model"
-	"github.com/animacaeli/go-rbac/repository"
 	mysqlDriver "github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 )
@@ -91,6 +91,10 @@ func (x roleRepo) Create(ctx context.Context, role *model.Role) error {
 		"created_at":  nowUTC(),
 		"updated_at":  nowUTC(),
 	}).Error; err != nil {
+		var me *mysqlDriver.MySQLError
+		if errors.As(err, &me) && me.Number == 1062 {
+			return repository.ErrDuplicateEntry
+		}
 		return err
 	}
 	// 回读填充模型字段（含 ID）。

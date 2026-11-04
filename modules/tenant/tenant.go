@@ -39,13 +39,12 @@ import (
 	"embed"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/animacaeli/go-rbac"
 	"github.com/animacaeli/go-rbac/core"
+	gormrepo "github.com/animacaeli/go-rbac/internal/repository/gormrepo"
 	"github.com/animacaeli/go-rbac/migrations"
 	"github.com/animacaeli/go-rbac/model"
-	gormrepo "github.com/animacaeli/go-rbac/repository/gormrepo"
 	"gorm.io/gorm"
 )
 
@@ -135,17 +134,13 @@ func (m *Module) ensureBuiltinRole(ctx context.Context, tenantID string) (uint64
 	if id > 0 {
 		return id, nil
 	}
-	created := map[string]any{
-		"tenant_id":   tenantID,
-		"code":        model.BuiltinSuperAdminRoleCode,
-		"name":        "超级管理员（租户）",
-		"description": "内置受保护角色：租户级超级管理员载体",
-		"is_builtin":  true,
-		"status":      model.RoleStatusEnabled,
-		"created_at":  time.Now().UTC(),
-		"updated_at":  time.Now().UTC(),
-	}
-	if err := m.db.WithContext(ctx).Table("rbac_roles").Create(created).Error; err != nil {
+	// INSERT IGNORE：并发种子时唯一键 (tenant_id, code) 冲突静默幂等。
+	if err := m.db.WithContext(ctx).Exec(
+		"INSERT IGNORE INTO rbac_roles (tenant_id, code, name, description, is_builtin, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))",
+		tenantID, model.BuiltinSuperAdminRoleCode,
+		"超级管理员（租户）", "内置受保护角色：租户级超级管理员载体",
+		true, model.RoleStatusEnabled,
+	).Error; err != nil {
 		return 0, fmt.Errorf("rbac/modules/tenant: seed tenant super admin role: %w", err)
 	}
 	err = m.db.WithContext(ctx).

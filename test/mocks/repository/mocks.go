@@ -8,8 +8,9 @@ import (
 	"context"
 	"time"
 
+	"github.com/animacaeli/go-rbac/internal/repository"
 	"github.com/animacaeli/go-rbac/model"
-	"github.com/animacaeli/go-rbac/repository"
+	"github.com/animacaeli/go-rbac/registry"
 	mock "github.com/stretchr/testify/mock"
 )
 
@@ -602,16 +603,16 @@ func (_m *MockPermissionRepo) EXPECT() *MockPermissionRepo_Expecter {
 }
 
 // ApplySync provides a mock function for the type MockPermissionRepo
-func (_mock *MockPermissionRepo) ApplySync(ctx context.Context, s repository.PermissionSync) error {
-	ret := _mock.Called(ctx, s)
+func (_mock *MockPermissionRepo) ApplySync(ctx context.Context, plan registry.SyncPlan) error {
+	ret := _mock.Called(ctx, plan)
 
 	if len(ret) == 0 {
 		panic("no return value specified for ApplySync")
 	}
 
 	var r0 error
-	if returnFunc, ok := ret.Get(0).(func(context.Context, repository.PermissionSync) error); ok {
-		r0 = returnFunc(ctx, s)
+	if returnFunc, ok := ret.Get(0).(func(context.Context, registry.SyncPlan) error); ok {
+		r0 = returnFunc(ctx, plan)
 	} else {
 		r0 = ret.Error(0)
 	}
@@ -625,20 +626,20 @@ type MockPermissionRepo_ApplySync_Call struct {
 
 // ApplySync is a helper method to define mock.On call
 //   - ctx context.Context
-//   - s repository.PermissionSync
-func (_e *MockPermissionRepo_Expecter) ApplySync(ctx any, s any) *MockPermissionRepo_ApplySync_Call {
-	return &MockPermissionRepo_ApplySync_Call{Call: _e.mock.On("ApplySync", ctx, s)}
+//   - plan registry.SyncPlan
+func (_e *MockPermissionRepo_Expecter) ApplySync(ctx any, plan any) *MockPermissionRepo_ApplySync_Call {
+	return &MockPermissionRepo_ApplySync_Call{Call: _e.mock.On("ApplySync", ctx, plan)}
 }
 
-func (_c *MockPermissionRepo_ApplySync_Call) Run(run func(ctx context.Context, s repository.PermissionSync)) *MockPermissionRepo_ApplySync_Call {
+func (_c *MockPermissionRepo_ApplySync_Call) Run(run func(ctx context.Context, plan registry.SyncPlan)) *MockPermissionRepo_ApplySync_Call {
 	_c.Call.Run(func(args mock.Arguments) {
 		var arg0 context.Context
 		if args[0] != nil {
 			arg0 = args[0].(context.Context)
 		}
-		var arg1 repository.PermissionSync
+		var arg1 registry.SyncPlan
 		if args[1] != nil {
-			arg1 = args[1].(repository.PermissionSync)
+			arg1 = args[1].(registry.SyncPlan)
 		}
 		run(
 			arg0,
@@ -653,7 +654,7 @@ func (_c *MockPermissionRepo_ApplySync_Call) Return(err error) *MockPermissionRe
 	return _c
 }
 
-func (_c *MockPermissionRepo_ApplySync_Call) RunAndReturn(run func(ctx context.Context, s repository.PermissionSync) error) *MockPermissionRepo_ApplySync_Call {
+func (_c *MockPermissionRepo_ApplySync_Call) RunAndReturn(run func(ctx context.Context, plan registry.SyncPlan) error) *MockPermissionRepo_ApplySync_Call {
 	_c.Call.Return(run)
 	return _c
 }

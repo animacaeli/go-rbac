@@ -36,3 +36,9 @@ func runWithDeadlockRetry(fn func() error) error {
 	}
 	return err
 }
+
+// isDuplicateEntry 报告 MySQL 唯一键冲突（1062）。
+func isDuplicateEntry(err error) bool {
+	var me *mysql.MySQLError
+	return errors.As(err, &me) && me.Number == 1062
+}

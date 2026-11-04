@@ -12,8 +12,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/animacaeli/go-rbac/internal/repository"
 	"github.com/animacaeli/go-rbac/model"
-	"github.com/animacaeli/go-rbac/repository"
+	"github.com/animacaeli/go-rbac/registry"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -28,6 +29,14 @@ func New(db *gorm.DB) *Repos { return &Repos{db: db} }
 
 func (r *Repos) writer(ctx context.Context) *gorm.DB { return r.db.WithContext(ctx) }
 
+// translateDuplicate 将 MySQL 1062 翻译为 ErrDuplicateEntry（runWithDeadlockRetry 同文件）。
+func translateDuplicate(err error) error {
+	if isDuplicateEntry(err) {
+		return repository.ErrDuplicateEntry
+	}
+	return err
+}
+
 func notFoundByID(what string, id uint64) error {
 	return fmt.Errorf("%w: %s id=%d", repository.ErrRecordNotFound, what, id)
 }
@@ -37,7 +46,7 @@ func notFoundByID(what string, id uint64) error {
 type roleRepo struct{ r *Repos }
 
 func (x roleRepo) Create(ctx context.Context, role *model.Role) error {
-	return x.r.writer(ctx).Create(role).Error
+	return translateDuplicate(x.r.writer(ctx).Create(role).Error)
 }
 
 func (x roleRepo) FindByID(ctx context.Context, id uint64) (*model.Role, error) {
@@ -162,19 +171,19 @@ func (x permissionRepo) SetStatus(ctx context.Context, id uint64, status uint8) 
 		Error
 }
 
-// ApplySync 在单个事务内应用同步差量（§2.3）。
-func (x permissionRepo) ApplySync(ctx context.Context, s repository.PermissionSync) error {
-	if len(s.Inserts) == 0 && len(s.MetadataUpdates) == 0 && len(s.ReactivateIDs) == 0 && len(s.DeprecateIDs) == 0 {
+// ApplySync 在单个事务内应用同步差量计划（§2.3，registry.Diff 计算）。
+func (x permissionRepo) ApplySync(ctx context.Context, plan registry.SyncPlan) error {
+	if !plan.Changed() {
 		return nil
 	}
 	return x.r.writer(ctx).Transaction(func(tx *gorm.DB) error {
-		for i := range s.Inserts {
+		for i := range plan.Inserts {
 			// 幂等兜底：并发重复同步时唯一键冲突视为已插入。
-			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&s.Inserts[i]).Error; err != nil {
+			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&plan.Inserts[i]).Error; err != nil {
 				return err
 			}
 		}
-		for _, p := range s.MetadataUpdates {
+		for _, p := range plan.MetadataUpdates {
 			if err := tx.Model(&model.Permission{}).
 				Where("id = ?", p.ID).
 				Updates(map[string]any{
@@ -185,14 +194,14 @@ func (x permissionRepo) ApplySync(ctx context.Context, s repository.PermissionSy
 				return err
 			}
 		}
-		for _, id := range s.ReactivateIDs {
+		for _, id := range plan.ReactivateIDs {
 			if err := tx.Model(&model.Permission{}).
 				Where("id = ? AND status = ?", id, model.PermissionStatusDeprecated).
 				Update("status", model.PermissionStatusEnabled).Error; err != nil {
 				return err
 			}
 		}
-		for _, id := range s.DeprecateIDs {
+		for _, id := range plan.DeprecateIDs {
 			if err := tx.Model(&model.Permission{}).
 				Where("id = ? AND status = ?", id, model.PermissionStatusEnabled).
 				Update("status", model.PermissionStatusDeprecated).Error; err != nil {
@@ -269,37 +278,40 @@ func (x rolePermissionRepo) SetPermissions(ctx context.Context, roleID uint64, p
 		rows = append(rows, model.RolePermission{RoleID: roleID, PermissionID: id})
 	}
 
-	return x.r.writer(ctx).Transaction(func(tx *gorm.DB) error {
-		var currentIDs []uint64
-		if err := tx.Model(&model.RolePermission{}).
-			Where("role_id = ?", roleID).
-			Pluck("permission_id", &currentIDs).Error; err != nil {
-			return err
-		}
-		for _, cur := range currentIDs {
-			if _, keep := want[cur]; !keep {
-				if err := tx.Where("role_id = ? AND permission_id = ?", roleID, cur).
-					Delete(&model.RolePermission{}).Error; err != nil {
+	// 差量事务幂等：并发下 RR 间隙锁死锁（1213）有界重试（同 Grant）。
+	return runWithDeadlockRetry(func() error {
+		return x.r.writer(ctx).Transaction(func(tx *gorm.DB) error {
+			var currentIDs []uint64
+			if err := tx.Model(&model.RolePermission{}).
+				Where("role_id = ?", roleID).
+				Pluck("permission_id", &currentIDs).Error; err != nil {
+				return err
+			}
+			for _, cur := range currentIDs {
+				if _, keep := want[cur]; !keep {
+					if err := tx.Where("role_id = ? AND permission_id = ?", roleID, cur).
+						Delete(&model.RolePermission{}).Error; err != nil {
+						return err
+					}
+				}
+			}
+			current := make(map[uint64]struct{}, len(currentIDs))
+			for _, cur := range currentIDs {
+				current[cur] = struct{}{}
+			}
+			var add []model.RolePermission
+			for _, row := range rows {
+				if _, exists := current[row.PermissionID]; !exists {
+					add = append(add, row)
+				}
+			}
+			if len(add) > 0 {
+				if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&add).Error; err != nil {
 					return err
 				}
 			}
-		}
-		current := make(map[uint64]struct{}, len(currentIDs))
-		for _, cur := range currentIDs {
-			current[cur] = struct{}{}
-		}
-		var add []model.RolePermission
-		for _, row := range rows {
-			if _, exists := current[row.PermissionID]; !exists {
-				add = append(add, row)
-			}
-		}
-		if len(add) > 0 {
-			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&add).Error; err != nil {
-				return err
-			}
-		}
-		return nil
+			return nil
+		})
 	})
 }
 

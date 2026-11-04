@@ -11,8 +11,8 @@ MYSQL_DSN ?= root:rootpass@tcp(127.0.0.1:3306)/go_rbac_test?parseTime=true&loc=U
 REDIS_ADDR ?= 127.0.0.1:6380
 
 .DEFAULT_GOAL := help
-.PHONY: help build test test-race test-integration bench-integration cover lint vuln fmt fmt-check \
-        vet mocks hooks compose-up compose-down check bench ci clean
+.PHONY: help build test test-race test-integration bench-integration cover cover-integration \
+        lint vuln fmt fmt-check vet mocks mocks-check hooks compose-up compose-down check bench ci clean
 
 help: ## 显示帮助
 	@awk 'BEGIN {FS = ":.*##"; printf "\n用法: make \033[36m<target>\033[0m\n\n"} /^[a-zA-Z_-]+:.*?##/ {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -28,11 +28,33 @@ test-race: ## 单元测试（含竞态检测）
 
 test-integration: compose-up ## 集成测试（需要 Docker，自动拉起 MySQL 8 + Redis 7）
 	RBAC_TEST_MYSQL_DSN='$(MYSQL_DSN)' RBAC_TEST_REDIS_ADDR='$(REDIS_ADDR)' \
-		$(GO) test -race -v ./repository/gormrepo/ ./cache/redis/ ./modules/tenant/
+		$(GO) test -race -v ./internal/repository/gormrepo/ ./cache/redis/ ./modules/tenant/
 
 bench-integration: compose-up ## §9.4 性能基线（真实 MySQL + Redis）
 	RBAC_TEST_MYSQL_DSN='$(MYSQL_DSN)' RBAC_TEST_REDIS_ADDR='$(REDIS_ADDR)' \
-		$(GO) test -run '^$$' -bench . -benchtime=20x ./repository/gormrepo/ ./core/
+		$(GO) test -run '^$$' -bench . -benchtime=20x ./internal/repository/gormrepo/ ./core/
+
+# 覆盖率口径：库代码包（排除生成代码与示例）
+COV_PKGS := $(shell $(GO) list ./... | grep -v '/test/' | grep -v '/examples/' | paste -sd, -)
+
+cover-integration: compose-up ## 单元 + 集成合并覆盖率（库代码口径）
+	@$(GO) test -coverpkg="$(COV_PKGS)" -coverprofile=/tmp/cov-unit.out ./... > /dev/null
+	@RBAC_TEST_MYSQL_DSN='$(MYSQL_DSN)' RBAC_TEST_REDIS_ADDR='$(REDIS_ADDR)' \
+		$(GO) test -coverpkg="$(COV_PKGS)" -coverprofile=/tmp/cov-int.out \
+		./interna./internal/repository/gormrepo/ ./cache/redis/ ./modules/tenant/ > /dev/null
+	@echo "mode: set" > coverage.out
+	@grep -h -v '^mode' /tmp/cov-unit.out /tmp/cov-int.out >> coverage.out
+	@$(GO) tool cover -func=coverage.out | tail -1
+	@echo "明细: go tool cover -html=coverage.out"
+
+mocks-check: ## 校验 test/mocks 与接口定义一致（CI 使用）
+	@command -v mockery >/dev/null 2>&1 || { \
+		echo "安装 mockery v3..."; \
+		$(GO) install github.com/vektra/mockery/v3@latest; \
+	}
+	@PATH="$(GOPATH_BIN):$$PATH" mockery > /dev/null
+	@git diff --exit-code -- test/mocks || { \
+		echo "test/mocks 与接口定义不一致：请运行 make mocks 并提交"; exit 1; }
 
 cover: ## 单元测试 + 覆盖率汇总
 	$(GO) test -coverprofile=coverage.out ./...

@@ -26,6 +26,10 @@ jobs:
         uses: golangci/golangci-lint-action@v7
         with:
           args: ./...
+      - name: Check generated mocks freshness
+        run: |
+          go install github.com/vektra/mockery/v3@latest
+          make mocks-check
 
   test:
     name: Unit tests (${{ matrix.go }})
@@ -86,7 +90,7 @@ jobs:
         env:
           RBAC_TEST_MYSQL_DSN: root:rootpass@tcp(127.0.0.1:3306)/go_rbac_test?parseTime=true&loc=UTC&charset=utf8mb4
           RBAC_TEST_REDIS_ADDR: 127.0.0.1:6380
-        run: go test -race -v ./repository/gormrepo/ ./cache/redis/ ./modules/tenant/
+        run: go test -race -v ./internal/repository/gormrepo/ ./cache/redis/ ./modules/tenant/
 
   vuln:
     name: Vulnerabilities (govulncheck)

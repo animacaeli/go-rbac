@@ -124,6 +124,11 @@ app, err := rbac.New(
 一致性边界（§6.7）：正常运行下授权撤销在"事务提交 + 版本递增完成"后即时生效；
 不提供跨缓存层的严格线性一致。
 
+大小写语义：MySQL 排序规则（utf8mb4_0900_ai_ci）下 `subject_id` 不区分大小写，
+缓存 key 区分——同一身份的不同拼写会得到一致的授权结果，但缓存条目各自独立
+（仅冗余，无正确性影响）；权限码由注册中心校验拒绝大写，无此问题。业务侧
+建议 subject_id 统一小写。
+
 ## 可选模块
 
 ```go
@@ -249,6 +254,7 @@ git tag v0.x.0 && git push origin v0.x.0   # 触发 .github/workflows/release.ym
 
 ```bash
 make check             # 本地提交前检查（与 CI 一致：gofmt / vet / golangci-lint / 单元测试）
+make cover-integration # 单元 + 集成合并覆盖率（库代码口径）
 make test-integration  # 集成测试（自动用 docker compose 拉起 MySQL 8，无需手动设 DSN）
 make vuln              # govulncheck 漏洞检测
 make cover             # 单元测试 + 覆盖率汇总

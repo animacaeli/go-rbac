@@ -9,11 +9,11 @@ import (
 
 	"github.com/animacaeli/go-rbac/cache"
 	"github.com/animacaeli/go-rbac/core"
+	"github.com/animacaeli/go-rbac/internal/repository"
+	gormrepo "github.com/animacaeli/go-rbac/internal/repository/gormrepo"
 	"github.com/animacaeli/go-rbac/migrations"
 	"github.com/animacaeli/go-rbac/model"
 	"github.com/animacaeli/go-rbac/registry"
-	"github.com/animacaeli/go-rbac/repository"
-	gormrepo "github.com/animacaeli/go-rbac/repository/gormrepo"
 	"gorm.io/gorm"
 )
 
@@ -159,14 +159,19 @@ func (a *App) Migrate(ctx context.Context) error {
 	return migrations.Apply(ctx, a.cfg.db, all)
 }
 
-// SyncPermissions 将注册中心同步至数据库（§2.3），幂等可重复执行。
+// SyncPermissions 将注册中心同步至数据库（§2.3），幂等可重复执行：
+// registry.Diff 计算差量计划，仓储在单事务内应用。
 // 同步后递增全局 epoch：废弃/恢复启用直接影响全体读者（§6.3 保守失效）。
 func (a *App) SyncPermissions(ctx context.Context) (registry.SyncResult, error) {
-	result, err := registry.Sync(ctx, a.cfg.reg, a.repos.Permissions)
+	existing, err := a.repos.Permissions.ListAll(ctx)
 	if err != nil {
-		return result, err
+		return registry.SyncResult{}, fmt.Errorf("rbac: sync load permissions: %w", err)
 	}
-	if result.Changed() {
+	result, plan := registry.Diff(a.cfg.reg, existing)
+	if plan.Changed() {
+		if err := a.repos.Permissions.ApplySync(ctx, plan); err != nil {
+			return result, fmt.Errorf("rbac: sync apply: %w", err)
+		}
 		if err := a.authorizer.IncrEpoch(ctx); err != nil {
 			return result, err
 		}

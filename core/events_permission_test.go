@@ -4,9 +4,9 @@ import (
 	"testing"
 
 	"github.com/animacaeli/go-rbac/core"
+	"github.com/animacaeli/go-rbac/internal/repository"
 	"github.com/animacaeli/go-rbac/model"
 	"github.com/animacaeli/go-rbac/registry"
-	"github.com/animacaeli/go-rbac/repository"
 	cachemocks "github.com/animacaeli/go-rbac/test/mocks/cache"
 	coremocks "github.com/animacaeli/go-rbac/test/mocks/core"
 	"github.com/stretchr/testify/mock"

@@ -7,9 +7,9 @@ import (
 
 	"github.com/animacaeli/go-rbac/cache"
 	"github.com/animacaeli/go-rbac/core"
+	"github.com/animacaeli/go-rbac/internal/repository"
 	"github.com/animacaeli/go-rbac/model"
 	"github.com/animacaeli/go-rbac/registry"
-	"github.com/animacaeli/go-rbac/repository"
 	cachemocks "github.com/animacaeli/go-rbac/test/mocks/cache"
 	repositorymocks "github.com/animacaeli/go-rbac/test/mocks/repository"
 	"github.com/stretchr/testify/mock"

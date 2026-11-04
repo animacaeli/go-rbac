@@ -2,7 +2,7 @@ template: testify
 template-data:
   unroll-variadic: true
 packages:
-  github.com/animacaeli/go-rbac/repository:
+  github.com/animacaeli/go-rbac/internal/repository:
     config:
       dir: test/mocks/repository
       pkgname: repositorymocks

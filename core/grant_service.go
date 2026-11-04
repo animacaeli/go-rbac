@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/animacaeli/go-rbac/internal/repository"
 	"github.com/animacaeli/go-rbac/model"
-	"github.com/animacaeli/go-rbac/repository"
 )
 
 // GrantService 用户额外授权管理（§2.5），完整生命周期：
