@@ -1,0 +1,36 @@
+template: testify
+template-data:
+  unroll-variadic: true
+packages:
+  github.com/animacaeli/go-rbac/repository:
+    config:
+      dir: test/mocks/repository
+      pkgname: repositorymocks
+      structname: Mock{{.InterfaceName}}
+      filename: mocks.go
+    interfaces:
+      RoleRepo: {}
+      PermissionRepo: {}
+      UserRoleRepo: {}
+      RolePermissionRepo: {}
+      UserGrantRepo: {}
+      AuthorizationRepo: {}
+  github.com/animacaeli/go-rbac/cache:
+    config:
+      dir: test/mocks/cache
+      pkgname: cachemocks
+      structname: Mock{{.InterfaceName}}
+      filename: mocks.go
+    interfaces:
+      PermissionCache: {}
+  github.com/animacaeli/go-rbac/core:
+    config:
+      dir: test/mocks/core
+      pkgname: coremocks
+      structname: Mock{{.InterfaceName}}
+      filename: mocks.go
+    interfaces:
+      Authorizer: {}
+      SubjectResolver: {}
+      SubjectStatusChecker: {}
+      Metrics: {}
