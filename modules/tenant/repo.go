@@ -2,6 +2,7 @@ package tenant
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -463,14 +464,18 @@ func (x authzRepo) NearestGrantExpiry(ctx context.Context, subjectID string, now
 	if err != nil {
 		return nil, err
 	}
-	var row *time.Time
+	// MIN() 空集返回 NULL：sql.NullTime 承接（同 base 仓储，§6.5）。
+	var nullTime sql.NullTime
 	if err := db.Table("rbac_user_grants").
 		Select("MIN(expires_at)").
 		Where("tenant_id = ? AND subject_id = ? AND revoked_at IS NULL AND expires_at IS NOT NULL AND expires_at > ?", t, subjectID, now).
-		Scan(&row).Error; err != nil {
+		Scan(&nullTime).Error; err != nil {
 		return nil, err
 	}
-	return row, nil
+	if nullTime.Valid {
+		return &nullTime.Time, nil
+	}
+	return nil, nil
 }
 
 var _ repository.RoleRepo = roleRepo{}

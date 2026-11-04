@@ -8,6 +8,7 @@ package gormrepo
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 
@@ -449,15 +450,20 @@ func (x authorizationRepo) HasBuiltinSuperAdminRole(ctx context.Context, subject
 }
 
 func (x authorizationRepo) NearestGrantExpiry(ctx context.Context, subjectID string, now time.Time) (*time.Time, error) {
-	var row *time.Time
+	// MIN() 空集返回 NULL：必须用 sql.NullTime 承接——扫进 *time.Time 会产生
+	// "unsupported Scan" 错误，使"无到期授权"与真实故障无法区分（§6.5 审计发现）。
+	var nullTime sql.NullTime
 	if err := x.r.writer(ctx).
 		Table("rbac_user_grants").
 		Select("MIN(expires_at)").
 		Where("subject_id = ? AND revoked_at IS NULL AND expires_at IS NOT NULL AND expires_at > ?", subjectID, now).
-		Scan(&row).Error; err != nil {
+		Scan(&nullTime).Error; err != nil {
 		return nil, err
 	}
-	return row, nil
+	if nullTime.Valid {
+		return &nullTime.Time, nil
+	}
+	return nil, nil
 }
 
 // Assemble 返回满足 repository.Repos 的接口聚合。

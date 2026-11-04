@@ -9,9 +9,13 @@
 
 ### Fixed
 
-- §6.5 审计发现：`NearestGrantExpiry` 读取失败时原实现按"永久"继续写缓存，
-  丢失 TTL 上限——临时授权可能在到期后被缓存继续放行至整个 TTL 结束；
-  现改为跳过写缓存（数据照常返回），并附回归测试
+- §6.5 审计发现（两层修复）：
+  1. 仓储层 `NearestGrantExpiry` 用 `*time.Time` 扫描 `MIN(expires_at)`，
+     空集 NULL 产生 "unsupported Scan" 错误——"无到期授权"与基础设施故障
+     不可区分；改用 `sql.NullTime`（base 与 tenant 双实现）
+  2. 授权层：到期时间读取失败时不再按"永久"写缓存（丢失 TTL 上限，
+     临时授权可能在到期后被缓存放行至整个 TTL 结束），改为跳过写缓存
+     并附回归测试
 
 - 并发授权在 REPEATABLE READ 下因唯一索引间隙锁死锁（MySQL 1213）：
   Grant 事务增加有界重试（base/tenant 双实现；并发压力测试在 CI 捕获）
