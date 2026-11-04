@@ -65,6 +65,8 @@ type PermissionRepo interface {
 	FindByCode(ctx context.Context, code string) (*model.Permission, error)
 	FindByCodes(ctx context.Context, codes []string) ([]model.Permission, error)
 	ListAll(ctx context.Context) ([]model.Permission, error)
+	// SetStatus 更新权限状态（启用/手动禁用；废弃状态由同步机制管理）。
+	SetStatus(ctx context.Context, id uint64, status uint8) error
 	// ApplySync 在单个事务内应用权限同步差量。
 	ApplySync(ctx context.Context, s PermissionSync) error
 }

@@ -4,30 +4,50 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/animacaeli/go-rbac/cache"
 	"github.com/animacaeli/go-rbac/model"
 	"github.com/animacaeli/go-rbac/repository"
+	"golang.org/x/sync/singleflight"
 )
 
-// AuthorizationService 实现 Authorizer（§4.3），并承担缓存 key 构造与失效。
+// AuthorizationService 实现 Authorizer（§4.3），并统一负责缓存 key 构造、
+// 版本号 + epoch 两级失效（§6）与缓存击穿防护。
 //
-// 读取路径（§6.2 的 Phase 1 形态，NoopCache 默认即每次回源数据库）：
-//  1. 校验 AuthorizationContext（v1：TenantID 必须为空，fail closed）
-//  2. （若注入）账号状态检查：false → ErrSubjectInactive；error → fail closed
-//  3. 超级管理员判定：Has* 恒真；GetPermissions 返回空集合（§4.3，不引入通配符语义）
-//  4. 缓存读取 → 未命中回源数据库聚合（角色权限并集 ∪ 额外授权）
-//  5. 写回缓存：TTL 不超过最近一条临时授权的到期时间（§6.5）
+// == 缓存一致性机制（§6，Phase 2 形态） ==
 //
-// Phase 2 将引入版本号 + epoch 两级失效（§6.1/§6.3）；当前失效策略为
-// 授权变更后按主体精确删除缓存 key（NoopCache 下为空操作）。
+// 三族 key（§6.1）：
+//
+//	rbac:{scope}:epoch                          # 全局 epoch（粗粒度失效）
+//	rbac:{scope}:subject:{subject_id}:version   # 主体权限版本号
+//	rbac:{scope}:subject:{subject_id}:perm:v{version}
+//
+// 其中 perm key 的 version 是"生成键"：gen = epoch<<32 | subjectVersion。
+// 两个整数合并进一个 key 后缀，与 §6.1 的 key 形状一致，同时让 epoch 递增
+// （权限禁用等低频全局事件）天然使所有旧生成键不可达——全员冷启动一次（§6.3）。
+//
+// 读取流程（§6.2）：
+//  1. 读取 epoch 与版本号，得到生成键 gen
+//  2. 读取 perm:v{gen}；命中直接返回
+//  3. 未命中 → singleflight 合并并发回源（§6.8 击穿防护）→ 查询数据库
+//  4. 写回前复核生成键未变；已变则丢弃结果重新走流程（最多重试一次，
+//     仍不稳定则返回未缓存的数据库结果——正确性不受影响）
+//  5. 写回 TTL 不超过主体最近一条临时授权的到期时间（§6.5）
+//
+// 写入流程（§6.2 不变性，承重墙）：版本号只允许"落后于"数据，永远不"超前"。
+// 服务层先提交数据库事务，成功后才递增版本 / epoch；递增失败时管理接口
+// 整体报错（§6.6/§6.7），不出现半成功状态。
+//
+// TTL 是垃圾回收机制而非正确性机制：旧生成键在 TTL 内自然过期。
 type AuthorizationService struct {
 	repo    repository.AuthorizationRepo
 	cch     cache.PermissionCache
 	checker SubjectStatusChecker
 	metrics Metrics
 	ttl     time.Duration
+	sf      singleflight.Group
 }
 
 var _ Authorizer = (*AuthorizationService)(nil)
@@ -58,7 +78,28 @@ type loaded struct {
 	isSuper     bool
 }
 
-// load 装载主体的有效授权状态（§6.2 读流程）。
+// ---- key 构造（§6.1，Core 统一负责） ----
+
+func epochKey(scope string) string {
+	return "rbac:" + scope + ":epoch"
+}
+
+func subjectVersionKey(scope, subjectID string) string {
+	return "rbac:" + scope + ":subject:" + subjectID + ":version"
+}
+
+func subjectPermKey(scope, subjectID string, gen int64) string {
+	return "rbac:" + scope + ":subject:" + subjectID + ":perm:v" + strconv.FormatInt(gen, 10)
+}
+
+// generationKey 合并 epoch 与主体版本号为单个生成键。
+// counter 使用低 32 位（现实中不可能触达），epoch 占高位；
+// 任一递增都会改变生成键，使旧 perm key 不可达。
+func generationKey(epoch, subjectVersion int64) int64 {
+	return epoch<<32 | subjectVersion
+}
+
+// load 装载主体的有效授权状态。
 func (s *AuthorizationService) load(ctx context.Context, ac AuthorizationContext) (loaded, error) {
 	start := time.Now()
 	cacheHit := false
@@ -80,62 +121,186 @@ func (s *AuthorizationService) load(ctx context.Context, ac AuthorizationContext
 		}
 	}
 
-	isSuper, err := s.repo.HasBuiltinSuperAdminRole(ctx, ac.SubjectID.String())
+	// 最多两轮：生成键在回源期间变化时丢弃结果重走流程（§6.2 第 5 步）。
+	// 超管状态以哨兵码参与缓存：热路径（含超管）零数据库查询（§9.4）。
+	for attempt := 0; attempt < 2; attempt++ {
+		l, hit, unstable, err := s.loadOnce(ctx, ac)
+		if err != nil {
+			return loaded{}, err
+		}
+		if hit {
+			cacheHit = true
+		}
+		if !unstable {
+			return l, nil
+		}
+	}
+	// 两轮均不稳定（高频变更窗口）：返回未缓存的数据库结果，保守正确。
+	set, isSuper, err := s.loadFromDB(ctx, ac)
 	if err != nil {
-		return loaded{}, fmt.Errorf("rbac: check super administrator: %w", err)
+		return loaded{}, err
+	}
+	return loaded{permissions: set, isSuper: isSuper}, nil
+}
+
+// loadOnce 执行一轮"读生成键 → 读缓存 → （singleflight）回源 + 复核 + 写回"。
+// unstable=true 表示写回前生成键已变，调用方应重试。
+func (s *AuthorizationService) loadOnce(ctx context.Context, ac AuthorizationContext) (l loaded, hit, unstable bool, err error) {
+	scope := ac.Scope()
+	subject := ac.SubjectID.String()
+
+	epoch, ok, err := s.cch.GetInt(ctx, epochKey(scope))
+	if err != nil {
+		// §6.6：缓存故障 → 回源数据库，且无法确认生成键 → 不写回。
+		set, isSuper, err := s.loadFromDB(ctx, ac)
+		return loaded{permissions: set, isSuper: isSuper}, false, false, err
+	}
+	_ = ok // 键缺失 = 生成键 0，语义有效
+	version, _, err := s.cch.GetInt(ctx, subjectVersionKey(scope, subject))
+	if err != nil {
+		set, isSuper, err := s.loadFromDB(ctx, ac)
+		return loaded{permissions: set, isSuper: isSuper}, false, false, err
+	}
+	gen := generationKey(epoch, version)
+
+	if cached, ok, err := s.cch.Get(ctx, subjectPermKey(scope, subject, gen)); err == nil && ok {
+		return parseCached(cached), true, false, nil
+	}
+	// 未命中或故障（§6.6：故障回源）→ singleflight 合并同 key 并发回源。
+
+	v, err, _ := s.sf.Do(scope+"/"+subject, func() (any, error) {
+		return s.aggregateAndCache(ctx, ac, gen)
+	})
+	if err != nil {
+		return loaded{}, false, false, err
+	}
+	result := v.(aggregateResult)
+	return loaded{permissions: result.set, isSuper: result.isSuper}, false, result.unstable, nil
+}
+
+type aggregateResult struct {
+	set      map[string]struct{}
+	isSuper  bool
+	unstable bool
+}
+
+// superAdminSentinel 是超管状态的缓存哨兵码：含通配符 *，注册中心校验必然
+// 拒绝，任何真实权限码都不可能与它冲突。
+const superAdminSentinel = "rbac:*super*"
+
+// parseCached 解析缓存集合：含哨兵 → 超管（空集合 + isSuper）。
+func parseCached(cached []string) loaded {
+	set := make(map[string]struct{}, len(cached))
+	for _, code := range cached {
+		if code == superAdminSentinel {
+			return loaded{permissions: map[string]struct{}{}, isSuper: true}
+		}
+		set[code] = struct{}{}
+	}
+	return loaded{permissions: set}
+}
+
+// aggregateAndCache 在 singleflight 内执行：二次探测缓存 → 数据库聚合 →
+// 复核生成键 → 写回。flight 期间可能已有同类请求完成写回，先探一次可省 DB。
+func (s *AuthorizationService) aggregateAndCache(ctx context.Context, ac AuthorizationContext, gen int64) (aggregateResult, error) {
+	scope := ac.Scope()
+	subject := ac.SubjectID.String()
+
+	if cached, ok, err := s.cch.Get(ctx, subjectPermKey(scope, subject, gen)); err == nil && ok {
+		l := parseCached(cached)
+		return aggregateResult{set: l.permissions, isSuper: l.isSuper}, nil
+	}
+
+	isSuper, err := s.repo.HasBuiltinSuperAdminRole(ctx, subject)
+	if err != nil {
+		return aggregateResult{}, fmt.Errorf("rbac: check super administrator: %w", err)
 	}
 	if isSuper {
-		// 超管不走缓存：Has* 恒真、GetPermissions 空集合，无聚合可缓存。
-		return loaded{permissions: map[string]struct{}{}, isSuper: true}, nil
+		// 超管：缓存哨兵集合（TTL 走默认值），Has* 恒真、GetPermissions 空集合。
+		_ = s.cch.Set(ctx, subjectPermKey(scope, subject, gen), []string{superAdminSentinel}, s.ttl)
+		return aggregateResult{set: map[string]struct{}{}, isSuper: true}, nil
 	}
 
-	key := s.subjectKey(ac)
-	if cached, ok, err := s.cch.Get(ctx, key); err == nil && ok {
-		cacheHit = true
-		set := make(map[string]struct{}, len(cached))
-		for _, code := range cached {
-			set[code] = struct{}{}
-		}
-		return loaded{permissions: set}, nil
-	}
-	// 缓存未命中或故障（§6.6：故障时回源数据库，不信任旧缓存）——继续走数据库。
-
+	// 预读最近到期时间（TTL 上限），与聚合结果一并使用。
 	now := time.Now().UTC()
-	rolePerms, err := s.repo.EffectiveRolePermissions(ctx, ac.SubjectID.String())
+	set, nearest, err := s.aggregate(ctx, ac, now)
 	if err != nil {
-		return loaded{}, fmt.Errorf("rbac: load role permissions: %w", err)
-	}
-	grantPerms, err := s.repo.EffectiveGrantPermissions(ctx, ac.SubjectID.String(), now)
-	if err != nil {
-		return loaded{}, fmt.Errorf("rbac: load grant permissions: %w", err)
+		return aggregateResult{}, err
 	}
 
-	set := make(map[string]struct{}, len(rolePerms)+len(grantPerms))
-	cached := make([]string, 0, len(rolePerms)+len(grantPerms))
-	for _, code := range rolePerms {
-		if _, dup := set[code]; !dup {
-			set[code] = struct{}{}
-			cached = append(cached, code)
-		}
+	// 写回前复核生成键（§6.2 第 5 步 / §6.4 写前复核）。
+	epoch, _, err := s.cch.GetInt(ctx, epochKey(scope))
+	if err != nil {
+		return aggregateResult{set: set}, nil // 无法复核 → 返回数据但不写回
 	}
-	for _, code := range grantPerms {
-		if _, dup := set[code]; !dup {
-			set[code] = struct{}{}
-			cached = append(cached, code)
-		}
+	version, _, err := s.cch.GetInt(ctx, subjectVersionKey(scope, subject))
+	if err != nil {
+		return aggregateResult{set: set}, nil
+	}
+	if generationKey(epoch, version) != gen {
+		return aggregateResult{set: set, unstable: true}, nil
 	}
 
-	// 写回缓存：TTL 以最近一条临时授权到期时间为上限（§6.5）。
 	ttl := s.ttl
-	if nearest, err := s.repo.NearestGrantExpiry(ctx, ac.SubjectID.String(), now); err == nil && nearest != nil {
+	if nearest != nil {
 		if bounded := nearest.Sub(now); bounded > 0 && bounded < ttl {
 			ttl = bounded
 		}
 	}
-	// 缓存写失败不影响鉴权结果（下次回源即可）。
-	_ = s.cch.Set(ctx, key, cached, ttl)
+	// 缓存写失败不影响本次鉴权结果（下次回源即可）。
+	_ = s.cch.Set(ctx, subjectPermKey(scope, subject, gen), flatten(set), ttl)
+	return aggregateResult{set: set}, nil
+}
 
-	return loaded{permissions: set}, nil
+// loadFromDB 直接回源数据库（不读不写缓存），返回集合与超管判定。
+func (s *AuthorizationService) loadFromDB(ctx context.Context, ac AuthorizationContext) (map[string]struct{}, bool, error) {
+	subject := ac.SubjectID.String()
+	isSuper, err := s.repo.HasBuiltinSuperAdminRole(ctx, subject)
+	if err != nil {
+		return nil, false, fmt.Errorf("rbac: check super administrator: %w", err)
+	}
+	if isSuper {
+		return map[string]struct{}{}, true, nil
+	}
+	now := time.Now().UTC()
+	set, _, err := s.aggregate(ctx, ac, now)
+	return set, false, err
+}
+
+// aggregate 查询数据库并求并集，返回集合与最近临时授权到期时间。
+func (s *AuthorizationService) aggregate(ctx context.Context, ac AuthorizationContext, now time.Time) (map[string]struct{}, *time.Time, error) {
+	subject := ac.SubjectID.String()
+
+	rolePerms, err := s.repo.EffectiveRolePermissions(ctx, subject)
+	if err != nil {
+		return nil, nil, fmt.Errorf("rbac: load role permissions: %w", err)
+	}
+	grantPerms, err := s.repo.EffectiveGrantPermissions(ctx, subject, now)
+	if err != nil {
+		return nil, nil, fmt.Errorf("rbac: load grant permissions: %w", err)
+	}
+	nearest, err := s.repo.NearestGrantExpiry(ctx, subject, now)
+	if err != nil {
+		// 到期时间只影响 TTL 上限，读取失败按永久处理。
+		nearest = nil
+	}
+
+	set := make(map[string]struct{}, len(rolePerms)+len(grantPerms))
+	for _, code := range rolePerms {
+		set[code] = struct{}{}
+	}
+	for _, code := range grantPerms {
+		set[code] = struct{}{}
+	}
+	return set, nearest, nil
+}
+
+func flatten(set map[string]struct{}) []string {
+	out := make([]string, 0, len(set))
+	for code := range set {
+		out = append(out, code)
+	}
+	return out
 }
 
 // HasPermission 判断主体是否持有权限（字面匹配，v1 无通配符）。
@@ -211,7 +376,7 @@ func (s *AuthorizationService) GetPermissions(ctx context.Context, ac Authorizat
 }
 
 // IsSuperAdministrator 判定主体是否为超级管理员（§7.3）。
-// 仍受账号状态约束（checker 在 load 内执行）；此处独立判定。
+// 仍受账号状态约束（checker）；此处独立判定，不经过缓存。
 func (s *AuthorizationService) IsSuperAdministrator(ctx context.Context, ac AuthorizationContext) (bool, error) {
 	if err := ac.Validate(model.SubjectIDMaxLength); err != nil {
 		return false, err
@@ -232,29 +397,32 @@ func (s *AuthorizationService) IsSuperAdministrator(ctx context.Context, ac Auth
 	return ok, nil
 }
 
-// ---- 缓存失效（Phase 1：按主体精确删除；NoopCache 下为空操作） ----
+// ---- 失效操作（§6.3 失效矩阵；v1 恒为 default 授权域） ----
 
-// permKeyPrefix 与 §6.1 key 形状一致；Phase 2 引入版本号后 key 追加 :v{version}。
-const permKeyPrefix = "rbac"
-
-func (s *AuthorizationService) subjectKey(ac AuthorizationContext) string {
-	return permKeyPrefix + ":" + ac.Scope() + ":subject:" + ac.SubjectID.String() + ":perm"
-}
-
-// InvalidateSubject 删除单个主体的权限缓存。授权变更后必须调用（§6.3）；
+// IncrSubjectVersion 递增主体权限版本号（精确级失效）。
+// 适用：用户角色变更、用户额外授权 / 撤销 / 到期。
+// 调用时机：数据库事务提交成功之后（§6.2 不变性）。
 // 失败时管理接口应报错而非静默吞掉（§6.6）。
-func (s *AuthorizationService) InvalidateSubject(ctx context.Context, subjectID SubjectID) error {
-	key := permKeyPrefix + ":" + DefaultScope + ":subject:" + subjectID.String() + ":perm"
-	return s.cch.Delete(ctx, key)
+func (s *AuthorizationService) IncrSubjectVersion(ctx context.Context, subjectID SubjectID) error {
+	_, err := s.cch.Incr(ctx, subjectVersionKey(DefaultScope, subjectID.String()))
+	return err
 }
 
-// InvalidateSubjects 批量删除主体缓存（角色权限变更的 fan-out，§6.3）。
+// IncrSubjectVersions 批量递增（角色权限变更 / 角色禁用的 fan-out，§6.3）。
 // 任一失败即返回错误，调用方可据此对管理接口整体报错。
-func (s *AuthorizationService) InvalidateSubjects(ctx context.Context, subjectIDs []string) error {
+func (s *AuthorizationService) IncrSubjectVersions(ctx context.Context, subjectIDs []string) error {
 	for _, id := range subjectIDs {
-		if err := s.InvalidateSubject(ctx, SubjectID(id)); err != nil {
+		if err := s.IncrSubjectVersion(ctx, SubjectID(id)); err != nil {
 			return fmt.Errorf("rbac: invalidate subject %s: %w", id, err)
 		}
 	}
 	return nil
+}
+
+// IncrEpoch 递增全局 epoch（粗糙级失效）。
+// 适用：权限禁用等低频全局事件——一次性使所有旧生成键不可达，
+// 代价是全员冷启动一次（§6.3）。
+func (s *AuthorizationService) IncrEpoch(ctx context.Context) error {
+	_, err := s.cch.Incr(ctx, epochKey(DefaultScope))
+	return err
 }

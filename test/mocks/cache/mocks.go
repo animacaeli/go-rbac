@@ -178,6 +178,144 @@ func (_c *MockPermissionCache_Get_Call) RunAndReturn(run func(ctx context.Contex
 	return _c
 }
 
+// GetInt provides a mock function for the type MockPermissionCache
+func (_mock *MockPermissionCache) GetInt(ctx context.Context, key string) (int64, bool, error) {
+	ret := _mock.Called(ctx, key)
+
+	if len(ret) == 0 {
+		panic("no return value specified for GetInt")
+	}
+
+	var r0 int64
+	var r1 bool
+	var r2 error
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string) (int64, bool, error)); ok {
+		return returnFunc(ctx, key)
+	}
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string) int64); ok {
+		r0 = returnFunc(ctx, key)
+	} else {
+		r0 = ret.Get(0).(int64)
+	}
+	if returnFunc, ok := ret.Get(1).(func(context.Context, string) bool); ok {
+		r1 = returnFunc(ctx, key)
+	} else {
+		r1 = ret.Get(1).(bool)
+	}
+	if returnFunc, ok := ret.Get(2).(func(context.Context, string) error); ok {
+		r2 = returnFunc(ctx, key)
+	} else {
+		r2 = ret.Error(2)
+	}
+	return r0, r1, r2
+}
+
+// MockPermissionCache_GetInt_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'GetInt'
+type MockPermissionCache_GetInt_Call struct {
+	*mock.Call
+}
+
+// GetInt is a helper method to define mock.On call
+//   - ctx context.Context
+//   - key string
+func (_e *MockPermissionCache_Expecter) GetInt(ctx any, key any) *MockPermissionCache_GetInt_Call {
+	return &MockPermissionCache_GetInt_Call{Call: _e.mock.On("GetInt", ctx, key)}
+}
+
+func (_c *MockPermissionCache_GetInt_Call) Run(run func(ctx context.Context, key string)) *MockPermissionCache_GetInt_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 context.Context
+		if args[0] != nil {
+			arg0 = args[0].(context.Context)
+		}
+		var arg1 string
+		if args[1] != nil {
+			arg1 = args[1].(string)
+		}
+		run(
+			arg0,
+			arg1,
+		)
+	})
+	return _c
+}
+
+func (_c *MockPermissionCache_GetInt_Call) Return(value int64, ok bool, err error) *MockPermissionCache_GetInt_Call {
+	_c.Call.Return(value, ok, err)
+	return _c
+}
+
+func (_c *MockPermissionCache_GetInt_Call) RunAndReturn(run func(ctx context.Context, key string) (int64, bool, error)) *MockPermissionCache_GetInt_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// Incr provides a mock function for the type MockPermissionCache
+func (_mock *MockPermissionCache) Incr(ctx context.Context, key string) (int64, error) {
+	ret := _mock.Called(ctx, key)
+
+	if len(ret) == 0 {
+		panic("no return value specified for Incr")
+	}
+
+	var r0 int64
+	var r1 error
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string) (int64, error)); ok {
+		return returnFunc(ctx, key)
+	}
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string) int64); ok {
+		r0 = returnFunc(ctx, key)
+	} else {
+		r0 = ret.Get(0).(int64)
+	}
+	if returnFunc, ok := ret.Get(1).(func(context.Context, string) error); ok {
+		r1 = returnFunc(ctx, key)
+	} else {
+		r1 = ret.Error(1)
+	}
+	return r0, r1
+}
+
+// MockPermissionCache_Incr_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'Incr'
+type MockPermissionCache_Incr_Call struct {
+	*mock.Call
+}
+
+// Incr is a helper method to define mock.On call
+//   - ctx context.Context
+//   - key string
+func (_e *MockPermissionCache_Expecter) Incr(ctx any, key any) *MockPermissionCache_Incr_Call {
+	return &MockPermissionCache_Incr_Call{Call: _e.mock.On("Incr", ctx, key)}
+}
+
+func (_c *MockPermissionCache_Incr_Call) Run(run func(ctx context.Context, key string)) *MockPermissionCache_Incr_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 context.Context
+		if args[0] != nil {
+			arg0 = args[0].(context.Context)
+		}
+		var arg1 string
+		if args[1] != nil {
+			arg1 = args[1].(string)
+		}
+		run(
+			arg0,
+			arg1,
+		)
+	})
+	return _c
+}
+
+func (_c *MockPermissionCache_Incr_Call) Return(n int64, err error) *MockPermissionCache_Incr_Call {
+	_c.Call.Return(n, err)
+	return _c
+}
+
+func (_c *MockPermissionCache_Incr_Call) RunAndReturn(run func(ctx context.Context, key string) (int64, error)) *MockPermissionCache_Incr_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // Set provides a mock function for the type MockPermissionCache
 func (_mock *MockPermissionCache) Set(ctx context.Context, key string, permissions []string, ttl time.Duration) error {
 	ret := _mock.Called(ctx, key, permissions, ttl)

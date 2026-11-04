@@ -16,6 +16,8 @@ import (
 	"github.com/animacaeli/go-rbac"
 	"github.com/animacaeli/go-rbac/core"
 	"github.com/animacaeli/go-rbac/model"
+	"github.com/animacaeli/go-rbac/modules/audit"
+	"github.com/animacaeli/go-rbac/modules/template"
 	"github.com/animacaeli/go-rbac/registry"
 	"github.com/animacaeli/go-rbac/repository"
 	gormrepo "github.com/animacaeli/go-rbac/repository/gormrepo"
@@ -35,6 +37,8 @@ type IntegrationSuite struct {
 	app     *rbac.App
 	reg     *registry.Registry
 	permIDs map[string]uint64
+	audit   *audit.Module
+	tpl     *template.Module
 }
 
 func TestIntegrationSuite(t *testing.T) {
@@ -63,7 +67,17 @@ func (s *IntegrationSuite) SetupSuite() {
 		registry.New("order:export", "导出订单", "订单管理"),
 	))
 
-	app, err := rbac.New(rbac.WithDB(db), rbac.WithPermissionRegistry(s.reg))
+	// Phase 2：携带 audit / template 模块组装（迁移顺序 Core → 模块注册顺序）。
+	s.audit = audit.New()
+	s.tpl = template.New(template.Define(
+		"ops_tpl", "运营模板", "模板复制演示",
+		"user:list", "user:delete",
+	))
+	app, err := rbac.New(
+		rbac.WithDB(db),
+		rbac.WithPermissionRegistry(s.reg),
+		rbac.WithModules(s.audit, s.tpl),
+	)
 	require.NoError(s.T(), err)
 	s.app = app
 	s.repos = gormrepo.New(db).Assemble()
@@ -91,6 +105,7 @@ func (s *IntegrationSuite) loadPermIDs() map[string]uint64 {
 func (s *IntegrationSuite) resetSchema() {
 	tables := []string{
 		"schema_migrations",
+		"rbac_audit_logs",
 		"rbac_user_grants", "rbac_role_permissions", "rbac_user_roles",
 		"rbac_permissions", "rbac_roles",
 	}
@@ -107,7 +122,8 @@ func (s *IntegrationSuite) TestMigrate_IdempotentRerun() {
 	s.Require().NoError(err)
 	var count int64
 	s.Require().NoError(s.db.Table("schema_migrations").Count(&count).Error)
-	s.Equal(int64(1), count, "同一版本只记录一次")
+	// Core 0001 + audit 模块 0001；同一版本只记录一次。
+	s.Equal(int64(2), count, "重跑不产生新的版本记录")
 }
 
 func (s *IntegrationSuite) TestSyncPermissions_IdempotentRerun() {
@@ -289,4 +305,92 @@ func (s *IntegrationSuite) TestValidatePermissionCodes_AgainstLiveRegistry() {
 	err = s.app.ValidatePermissionCodes("typo:code")
 	s.Require().Error(err)
 	assert.Contains(s.T(), err.Error(), "typo:code")
+}
+
+func (s *IntegrationSuite) TestAuditModule_RecordsAuthorizationChanges() {
+	ctx := s.ctx
+	admin := core.AuthorizationContext{SubjectID: "root-admin"}
+
+	// Arrange + Act：角色创建 → 用户角色分配 → 额外授权 → 撤销。
+	role, err := s.app.Roles().Create(ctx, admin, "audited_role", "被审计角色", "")
+	s.Require().NoError(err)
+	s.Require().NoError(s.app.UserRoles().Assign(ctx, admin, "50001", role.ID))
+	s.Require().NoError(s.app.Grants().Grant(ctx, admin, "50001", "order:export", nil, "审计演示"))
+	s.Require().NoError(s.app.Grants().Revoke(ctx, admin, "50001", "order:export"))
+
+	// Assert：§2.10 事件全链路落库；可按操作人/目标查询。
+	q := audit.NewQuery(s.audit)
+	byOperator, err := q.List(ctx, audit.Filter{Operator: "root-admin"})
+	s.Require().NoError(err)
+	s.Require().Len(byOperator, 4, "create + assign + grant + revoke")
+
+	bySubject, err := q.List(ctx, audit.Filter{Subject: "50001"})
+	s.Require().NoError(err)
+	s.Require().Len(bySubject, 3, "assign + grant + revoke 均以被操作对象为目标")
+
+	types := map[string]bool{}
+	for _, log := range byOperator {
+		types[log.EventType] = true
+	}
+	for _, want := range []string{
+		string(core.EventRoleCreated), string(core.EventUserRoleAssigned),
+		string(core.EventUserGranted), string(core.EventGrantRevoked),
+	} {
+		s.True(types[want], "missing event %s", want)
+	}
+}
+
+func (s *IntegrationSuite) TestTemplateModule_CreateFromTemplateCopiesSnapshot() {
+	ctx := s.ctx
+	admin := core.AuthorizationContext{SubjectID: "root-admin"}
+
+	// Act：从模板创建角色 = 创建 + 权限快照复制（§2.4）。
+	role, err := s.tpl.CreateFromTemplate(ctx, admin, "ops_tpl", "ops_from_tpl", "运营-模板创建")
+	s.Require().NoError(err)
+
+	// Assert：权限与模板一致。
+	perms, err := s.app.Roles().PermissionsOfRole(ctx, role.ID)
+	s.Require().NoError(err)
+	codes := make([]string, 0, len(perms))
+	for _, p := range perms {
+		codes = append(codes, p.Code)
+	}
+	s.ElementsMatch([]string{"user:list", "user:delete"}, codes)
+
+	// 幂等重跑：角色已存在 → 对齐权限快照，不报错。
+	_, err = s.tpl.CreateFromTemplate(ctx, admin, "ops_tpl", "ops_from_tpl", "运营-模板创建")
+	s.Require().NoError(err)
+
+	// 授权者约束照常生效：非持权操作者不能从含未持有权限的模板创建。
+	notHolder := core.AuthorizationContext{SubjectID: "60001"}
+	_, err = s.tpl.CreateFromTemplate(ctx, notHolder, "ops_tpl", "ops_hijack", "越权")
+	s.ErrorIs(err, core.ErrGrantorPermissionDenied)
+}
+
+func (s *IntegrationSuite) TestPermissionService_DisableIncrementsEpoch() {
+	ctx := s.ctx
+	admin := core.AuthorizationContext{SubjectID: "root-admin"}
+	user := core.AuthorizationContext{SubjectID: "70001"}
+
+	// Arrange：用户经角色持有 user:delete。
+	role, err := s.app.Roles().Create(ctx, admin, "epoch_role", "E", "")
+	s.Require().NoError(err)
+	s.Require().NoError(s.app.Roles().SetPermissions(ctx, admin, role.ID, []string{"user:delete"}))
+	s.Require().NoError(s.app.UserRoles().Assign(ctx, admin, "70001", role.ID))
+	ok, err := s.app.Authorizer().HasPermission(ctx, user, "user:delete")
+	s.Require().NoError(err)
+	s.True(ok)
+
+	// Act：禁用权限（§6.3 → INCR epoch）。
+	s.Require().NoError(s.app.Permissions().SetStatus(ctx, admin, "user:delete", model.PermissionStatusDisabled))
+
+	// Assert：NoopCache 下每次回源，立即失效；重新启用后恢复。
+	ok, err = s.app.Authorizer().HasPermission(ctx, user, "user:delete")
+	s.Require().NoError(err)
+	s.False(ok)
+
+	s.Require().NoError(s.app.Permissions().SetStatus(ctx, admin, "user:delete", model.PermissionStatusEnabled))
+	ok, err = s.app.Authorizer().HasPermission(ctx, user, "user:delete")
+	s.Require().NoError(err)
+	s.True(ok)
 }

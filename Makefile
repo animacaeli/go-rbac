@@ -8,10 +8,11 @@
 GO ?= go
 GOPATH_BIN := $(shell $(GO) env GOPATH)/bin
 MYSQL_DSN ?= root:rootpass@tcp(127.0.0.1:3306)/go_rbac_test?parseTime=true&loc=UTC&charset=utf8mb4
+REDIS_ADDR ?= 127.0.0.1:6380
 
 .DEFAULT_GOAL := help
-.PHONY: help build test test-race test-integration cover lint vuln fmt fmt-check \
-        vet mocks hooks compose-up compose-down check ci clean
+.PHONY: help build test test-race test-integration bench-integration cover lint vuln fmt fmt-check \
+        vet mocks hooks compose-up compose-down check bench ci clean
 
 help: ## 显示帮助
 	@awk 'BEGIN {FS = ":.*##"; printf "\n用法: make \033[36m<target>\033[0m\n\n"} /^[a-zA-Z_-]+:.*?##/ {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -25,8 +26,13 @@ test: ## 单元测试
 test-race: ## 单元测试（含竞态检测）
 	$(GO) test -race ./...
 
-test-integration: compose-up ## 集成测试（需要 Docker，自动拉起 MySQL 8）
-	RBAC_TEST_MYSQL_DSN='$(MYSQL_DSN)' $(GO) test -race -v ./repository/gormrepo/
+test-integration: compose-up ## 集成测试（需要 Docker，自动拉起 MySQL 8 + Redis 7）
+	RBAC_TEST_MYSQL_DSN='$(MYSQL_DSN)' RBAC_TEST_REDIS_ADDR='$(REDIS_ADDR)' \
+		$(GO) test -race -v ./repository/gormrepo/ ./cache/redis/
+
+bench-integration: compose-up ## §9.4 性能基线（真实 MySQL + Redis）
+	RBAC_TEST_MYSQL_DSN='$(MYSQL_DSN)' RBAC_TEST_REDIS_ADDR='$(REDIS_ADDR)' \
+		$(GO) test -run '^$$' -bench . -benchtime=20x ./repository/gormrepo/ ./core/
 
 cover: ## 单元测试 + 覆盖率汇总
 	$(GO) test -coverprofile=coverage.out ./...
@@ -82,6 +88,8 @@ compose-down: ## 停止本地 MySQL
 	docker compose down
 
 check: fmt-check vet lint test ## 本地提交前检查（与 CI 一致）
+
+bench: bench-integration ## 别名：性能基线
 
 ci: check test-race vuln ## 本地完整 CI 等价流程
 

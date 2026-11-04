@@ -34,3 +34,4 @@ packages:
       SubjectResolver: {}
       SubjectStatusChecker: {}
       Metrics: {}
+      EventSink: {}

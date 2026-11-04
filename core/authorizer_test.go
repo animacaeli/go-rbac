@@ -3,6 +3,8 @@ package core_test
 import (
 	"context"
 	"errors"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,39 +31,52 @@ func (s *AuthorizationServiceSuite) SetupTest() {
 	s.cch = cachemocks.NewMockPermissionCache(s.T())
 	s.checker = coremocks.NewMockSubjectStatusChecker(s.T())
 	s.sut = core.NewAuthorizationService(s.authzRepo, s.cch, nil, core.NoopMetrics{}, 5*time.Minute)
+
 }
 
 func TestAuthorizationServiceSuite(t *testing.T) { suite.Run(t, new(AuthorizationServiceSuite)) }
 
 var (
-	operator1 = core.AuthorizationContext{SubjectID: "10001"}
-	operator2 = core.AuthorizationContext{SubjectID: "10002"}
+	subject1 = core.AuthorizationContext{SubjectID: "10001"}
+	subject2 = core.AuthorizationContext{SubjectID: "10002"}
 )
 
-// expectNormalSubject 配置一个非超管主体：缓存未命中，从数据库聚合两条来源。
-func (s *AuthorizationServiceSuite) expectNormalSubject(subject core.AuthorizationContext, rolePerms, grantPerms []string) {
-	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, subject.SubjectID.String()).
-		Return(false, nil)
-	s.cch.On("Get", mock.Anything, mock.Anything).Return(nil, false, nil).Maybe()
-	s.authzRepo.On("EffectiveRolePermissions", mock.Anything, subject.SubjectID.String()).
-		Return(rolePerms, nil)
-	s.authzRepo.On("EffectiveGrantPermissions", mock.Anything, subject.SubjectID.String(), mock.AnythingOfType("time.Time")).
-		Return(grantPerms, nil)
-	s.authzRepo.On("NearestGrantExpiry", mock.Anything, subject.SubjectID.String(), mock.AnythingOfType("time.Time")).
-		Return(nil, nil)
-	s.cch.On("Set", mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		Return(nil).Maybe()
+// generation 计算生成键（与实现保持一致：epoch<<32 | version）。
+func generation(epoch, version int64) int64 { return epoch<<32 | version }
+
+func permKey(subject string, gen int64) string {
+	return "rbac:default:subject:" + subject + ":perm:v" + strconv.FormatInt(gen, 10)
+}
+
+func versionKey(subject string) string {
+	return "rbac:default:subject:" + subject + ":version"
+}
+
+// expectColdRead 配置一次完整冷读：生成键 (epoch, version)，缓存未命中，
+// 数据库聚合 rolePerms ∪ grantPerms，写回。
+func (s *AuthorizationServiceSuite) expectColdRead(subject core.AuthorizationContext, epoch, version int64, rolePerms, grantPerms []string, nearest *time.Time) {
+	sid := subject.SubjectID.String()
+	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, sid).Return(false, nil)
+	// 快路径 + flight 内二次探测 + 写回前复核：GetInt 可能被多次调用。
+	s.cch.On("GetInt", mock.Anything, "rbac:default:epoch").Return(epoch, true, nil)
+	s.cch.On("GetInt", mock.Anything, versionKey(sid)).Return(version, true, nil)
+	s.cch.On("Get", mock.Anything, permKey(sid, generation(epoch, version))).Return(nil, false, nil)
+	s.authzRepo.On("EffectiveRolePermissions", mock.Anything, sid).Return(rolePerms, nil)
+	s.authzRepo.On("EffectiveGrantPermissions", mock.Anything, sid, mock.AnythingOfType("time.Time")).Return(grantPerms, nil)
+	s.authzRepo.On("NearestGrantExpiry", mock.Anything, sid, mock.AnythingOfType("time.Time")).Return(nearest, nil)
+	s.cch.On("Set", mock.Anything, permKey(sid, generation(epoch, version)), mock.Anything, mock.Anything).Return(nil).Maybe()
 }
 
 func (s *AuthorizationServiceSuite) TestGetPermissions_MultiRoleUnionWithGrants() {
 	// Arrange
-	s.expectNormalSubject(operator1,
-		[]string{"user:list", "order:list"},   // 角色权限（跨角色并集）
-		[]string{"order:export", "user:list"}, // 额外授权（与角色重叠一项）
+	s.expectColdRead(subject1, 0, 0,
+		[]string{"user:list", "order:list"},
+		[]string{"order:export", "user:list"},
+		nil,
 	)
 
 	// Act
-	perms, err := s.sut.GetPermissions(s.ctx, operator1)
+	perms, err := s.sut.GetPermissions(s.ctx, subject1)
 
 	// Assert
 	s.Require().NoError(err)
@@ -81,10 +96,10 @@ func (s *AuthorizationServiceSuite) TestHasPermission_LiteralMatch() {
 	for _, tt := range tests {
 		s.Run(tt.name, func() {
 			// Arrange
-			s.expectNormalSubject(operator1, []string{"user:list"}, nil)
+			s.expectColdRead(subject1, 0, 0, []string{"user:list"}, nil, nil)
 
 			// Act
-			ok, err := s.sut.HasPermission(s.ctx, operator1, tt.permission)
+			ok, err := s.sut.HasPermission(s.ctx, subject1, tt.permission)
 
 			// Assert
 			s.Require().NoError(err)
@@ -95,29 +110,27 @@ func (s *AuthorizationServiceSuite) TestHasPermission_LiteralMatch() {
 
 func (s *AuthorizationServiceSuite) TestHasAnyHasAll_Semantics() {
 	// Arrange
-	s.expectNormalSubject(operator1, []string{"user:list", "order:list"}, nil)
+	s.expectColdRead(subject1, 0, 0, []string{"user:list", "order:list"}, nil, nil)
 
 	// Act + Assert
-	any, err := s.sut.HasAnyPermission(s.ctx, operator1, "user:delete", "order:list")
+	any, err := s.sut.HasAnyPermission(s.ctx, subject1, "user:delete", "order:list")
 	s.Require().NoError(err)
 	s.True(any)
 
-	all, err := s.sut.HasAllPermissions(s.ctx, operator1, "user:list", "order:list")
+	all, err := s.sut.HasAllPermissions(s.ctx, subject1, "user:list", "order:list")
 	s.Require().NoError(err)
 	s.True(all)
 
-	all, err = s.sut.HasAllPermissions(s.ctx, operator1, "user:list", "order:export")
+	all, err = s.sut.HasAllPermissions(s.ctx, subject1, "user:list", "order:export")
 	s.Require().NoError(err)
 	s.False(all)
 }
 
 func (s *AuthorizationServiceSuite) TestHasEmptyPermissionCodes_FailClosed() {
-	// Arrange — 不设置任何仓储期望：不应触达仓储。
-
 	// Act
-	_, errAny := s.sut.HasAnyPermission(s.ctx, operator1)
-	_, errAll := s.sut.HasAllPermissions(s.ctx, operator1)
-	_, errOne := s.sut.HasPermission(s.ctx, operator1, "")
+	_, errAny := s.sut.HasAnyPermission(s.ctx, subject1)
+	_, errAll := s.sut.HasAllPermissions(s.ctx, subject1)
+	_, errOne := s.sut.HasPermission(s.ctx, subject1, "")
 
 	// Assert
 	s.ErrorIs(errAny, core.ErrNoPermissionDeclared)
@@ -126,14 +139,18 @@ func (s *AuthorizationServiceSuite) TestHasEmptyPermissionCodes_FailClosed() {
 }
 
 func (s *AuthorizationServiceSuite) TestSuperAdmin_HasPermissionAlwaysTrue() {
-	// Arrange
-	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, operator1.SubjectID.String()).
+	// Arrange：超管判定在回源路径内完成，结果以哨兵码缓存。
+	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, subject1.SubjectID.String()).
 		Return(true, nil)
+	s.cch.On("GetInt", mock.Anything, "rbac:default:epoch").Return(int64(0), false, nil)
+	s.cch.On("GetInt", mock.Anything, versionKey("10001")).Return(int64(0), false, nil)
+	s.cch.On("Get", mock.Anything, permKey("10001", 0)).Return(nil, false, nil)
+	s.cch.On("Set", mock.Anything, permKey("10001", 0), mock.Anything, mock.Anything).Return(nil).Maybe()
 
 	// Act
-	ok, err := s.sut.HasPermission(s.ctx, operator1, "anything:whatever")
-	perms, permErr := s.sut.GetPermissions(s.ctx, operator1)
-	isSuper, superErr := s.sut.IsSuperAdministrator(s.ctx, operator1)
+	ok, err := s.sut.HasPermission(s.ctx, subject1, "anything:whatever")
+	perms, permErr := s.sut.GetPermissions(s.ctx, subject1)
+	isSuper, superErr := s.sut.IsSuperAdministrator(s.ctx, subject1)
 
 	// Assert
 	s.Require().NoError(err)
@@ -147,11 +164,11 @@ func (s *AuthorizationServiceSuite) TestSuperAdmin_HasPermissionAlwaysTrue() {
 func (s *AuthorizationServiceSuite) TestSubjectInactive_DeniedWithSentinel() {
 	// Arrange
 	sut := core.NewAuthorizationService(s.authzRepo, s.cch, s.checker, core.NoopMetrics{}, time.Minute)
-	s.checker.On("IsSubjectActive", mock.Anything, operator1.SubjectID).
+	s.checker.On("IsSubjectActive", mock.Anything, subject1.SubjectID).
 		Return(false, nil)
 
 	// Act
-	ok, err := sut.HasPermission(s.ctx, operator1, "user:list")
+	ok, err := sut.HasPermission(s.ctx, subject1, "user:list")
 
 	// Assert
 	s.Require().ErrorIs(err, core.ErrSubjectInactive)
@@ -161,11 +178,11 @@ func (s *AuthorizationServiceSuite) TestSubjectInactive_DeniedWithSentinel() {
 func (s *AuthorizationServiceSuite) TestSubjectStatusCheckError_FailClosed() {
 	// Arrange
 	sut := core.NewAuthorizationService(s.authzRepo, s.cch, s.checker, core.NoopMetrics{}, time.Minute)
-	s.checker.On("IsSubjectActive", mock.Anything, operator1.SubjectID).
+	s.checker.On("IsSubjectActive", mock.Anything, subject1.SubjectID).
 		Return(false, errors.New("user service down"))
 
 	// Act
-	ok, err := sut.HasPermission(s.ctx, operator1, "user:list")
+	ok, err := sut.HasPermission(s.ctx, subject1, "user:list")
 
 	// Assert
 	s.Require().Error(err)
@@ -195,71 +212,73 @@ func (s *AuthorizationServiceSuite) TestInvalidContext_FailClosed() {
 }
 
 func (s *AuthorizationServiceSuite) TestRepoError_FailClosed() {
-	// Arrange
-	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, operator1.SubjectID.String()).
+	// Arrange：回源路径内超管判定失败 → fail closed。
+	s.cch.On("GetInt", mock.Anything, "rbac:default:epoch").Return(int64(0), false, nil)
+	s.cch.On("GetInt", mock.Anything, versionKey("10001")).Return(int64(0), false, nil)
+	s.cch.On("Get", mock.Anything, permKey("10001", 0)).Return(nil, false, nil)
+	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, subject1.SubjectID.String()).
 		Return(false, errors.New("db down"))
 
 	// Act
-	ok, err := s.sut.HasPermission(s.ctx, operator1, "user:list")
+	ok, err := s.sut.HasPermission(s.ctx, subject1, "user:list")
 
 	// Assert
 	s.Require().Error(err)
 	s.False(ok)
 }
 
+// §6.2：命中路径不触达数据库。
 func (s *AuthorizationServiceSuite) TestCacheHit_RepoNotQueried() {
-	// Arrange
-	key := "rbac:default:subject:10001:perm"
-	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, operator1.SubjectID.String()).
-		Return(false, nil)
-	s.cch.On("Get", mock.Anything, key).Return([]string{"user:list"}, true, nil)
-	// Effective* / Set 均未设置期望：命中路径不得回源。
+	// Arrange：生成键 epoch=3, version=7。
+	gen := generation(3, 7)
+	s.cch.On("GetInt", mock.Anything, "rbac:default:epoch").Return(int64(3), true, nil)
+	s.cch.On("GetInt", mock.Anything, versionKey("10001")).Return(int64(7), true, nil)
+	s.cch.On("Get", mock.Anything, permKey("10001", gen)).Return([]string{"user:list"}, true, nil)
+	// 仓储无任何期望：命中路径（含超管判定）零数据库查询（§9.4）。
 
 	// Act
-	ok, err := s.sut.HasPermission(s.ctx, operator1, "user:list")
+	ok, err := s.sut.HasPermission(s.ctx, subject1, "user:list")
 
 	// Assert
 	s.Require().NoError(err)
 	s.True(ok)
 }
 
-func (s *AuthorizationServiceSuite) TestCacheError_FallsBackToDB() {
-	// Arrange
-	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, operator1.SubjectID.String()).
-		Return(false, nil)
-	s.cch.On("Get", mock.Anything, mock.Anything).Return(nil, false, errors.New("redis down"))
-	s.authzRepo.On("EffectiveRolePermissions", mock.Anything, operator1.SubjectID.String()).
-		Return([]string{"user:list"}, nil)
-	s.authzRepo.On("EffectiveGrantPermissions", mock.Anything, operator1.SubjectID.String(), mock.AnythingOfType("time.Time")).
-		Return(nil, nil)
-	s.authzRepo.On("NearestGrantExpiry", mock.Anything, operator1.SubjectID.String(), mock.AnythingOfType("time.Time")).
-		Return(nil, nil)
-	s.cch.On("Set", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+// §6.2 第 5 步：写回前生成键变化 → 丢弃结果重走流程，旧生成键不被写入。
+func (s *AuthorizationServiceSuite) TestWriteBackVerify_GenerationChanged_Retry() {
+	// Arrange：version 在第一轮聚合完成后变为 1（模拟并发授权变更）。
+	// 单线程下的 GetInt(version) 调用序列是确定的：
+	//   #1 快路径(0) → #2 flight 写回复核(1) → #3 第二轮快路径(1) → #4 复核(1)
+	sid := "10001"
+	vk := versionKey(sid)
+	s.cch.On("GetInt", mock.Anything, "rbac:default:epoch").Return(int64(0), true, nil)
+	s.cch.On("GetInt", mock.Anything, vk).Return(int64(0), true, nil).Once()
+	s.cch.On("GetInt", mock.Anything, vk).Return(int64(1), true, nil).Times(3)
+	s.cch.On("Get", mock.Anything, mock.Anything).Return(nil, false, nil) // 全部未命中
+	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, sid).Return(false, nil)
+	s.authzRepo.On("EffectiveRolePermissions", mock.Anything, sid).
+		Return([]string{"user:list"}, nil).Twice()
+	s.authzRepo.On("EffectiveGrantPermissions", mock.Anything, sid, mock.AnythingOfType("time.Time")).
+		Return(nil, nil).Twice()
+	s.authzRepo.On("NearestGrantExpiry", mock.Anything, sid, mock.AnythingOfType("time.Time")).
+		Return(nil, nil).Twice()
+	// v0（过期生成键）绝不允许被写入（未注册期望，写入即 panic）；v1 允许。
+	s.cch.On("Set", mock.Anything, permKey(sid, 1), mock.Anything, mock.Anything).Return(nil).Maybe()
 
 	// Act
-	ok, err := s.sut.HasPermission(s.ctx, operator1, "user:list")
+	ok, err := s.sut.HasPermission(s.ctx, subject1, "user:list")
 
-	// Assert：§6.6 Redis 故障时鉴权回源数据库。
+	// Assert：两轮聚合（丢弃 + 重走流程），v0 未写入（防旧数据污染新键）。
 	s.Require().NoError(err)
 	s.True(ok)
 }
 
+// §6.5：写回 TTL 不超过最近临时授权到期时间。
 func (s *AuthorizationServiceSuite) TestCacheTTL_CappedByNearestGrantExpiry() {
 	// Arrange
-	sut := core.NewAuthorizationService(s.authzRepo, s.cch, nil, core.NoopMetrics{}, 5*time.Minute)
-	key := "rbac:default:subject:10002:perm"
 	expiry := time.Now().UTC().Add(time.Minute)
-	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, operator2.SubjectID.String()).
-		Return(false, nil)
-	s.cch.On("Get", mock.Anything, key).Return(nil, false, nil)
-	s.authzRepo.On("EffectiveRolePermissions", mock.Anything, operator2.SubjectID.String()).
-		Return(nil, nil)
-	s.authzRepo.On("EffectiveGrantPermissions", mock.Anything, operator2.SubjectID.String(), mock.AnythingOfType("time.Time")).
-		Return([]string{"order:export"}, nil)
-	s.authzRepo.On("NearestGrantExpiry", mock.Anything, operator2.SubjectID.String(), mock.AnythingOfType("time.Time")).
-		Return(&expiry, nil)
-	// §6.5：TTL 不得超过最近到期时间 → 期望 Set 的 ttl ≈ 1 分钟。
-	s.cch.On("Set", mock.Anything, key, mock.Anything, mock.Anything).
+	s.expectColdRead(subject2, 0, 0, nil, []string{"order:export"}, &expiry)
+	s.cch.On("Set", mock.Anything, permKey("10002", 0), mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
 			ttl := args.Get(3).(time.Duration)
 			s.Greater(ttl, 50*time.Second)
@@ -268,23 +287,85 @@ func (s *AuthorizationServiceSuite) TestCacheTTL_CappedByNearestGrantExpiry() {
 		Return(nil)
 
 	// Act
-	perms, err := sut.GetPermissions(s.ctx, operator2)
+	perms, err := s.sut.GetPermissions(s.ctx, subject2)
 
 	// Assert
 	s.Require().NoError(err)
 	s.Equal([]string{"order:export"}, perms)
 }
 
-func (s *AuthorizationServiceSuite) TestInvalidateSubject_DeletesCacheKey() {
+// §6.6：缓存故障（含整数键读取失败）→ 回源数据库，不写回。
+func (s *AuthorizationServiceSuite) TestCacheError_FallsBackToDBWithoutWriteBack() {
 	// Arrange
-	key := "rbac:default:subject:10001:perm"
-	s.cch.On("Delete", mock.Anything, key).Return(nil)
+	s.cch.On("GetInt", mock.Anything, "rbac:default:epoch").
+		Return(int64(0), false, errors.New("redis down"))
+	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, "10001").Return(false, nil)
+	s.authzRepo.On("EffectiveRolePermissions", mock.Anything, "10001").Return([]string{"user:list"}, nil)
+	s.authzRepo.On("EffectiveGrantPermissions", mock.Anything, "10001", mock.AnythingOfType("time.Time")).Return(nil, nil)
+	s.authzRepo.On("NearestGrantExpiry", mock.Anything, "10001", mock.AnythingOfType("time.Time")).Return(nil, nil)
+	// Set 未注册期望：无法确认生成键时不得写回。
 
 	// Act
-	err := s.sut.InvalidateSubject(s.ctx, operator1.SubjectID)
+	ok, err := s.sut.HasPermission(s.ctx, subject1, "user:list")
 
 	// Assert
 	s.Require().NoError(err)
+	s.True(ok)
+}
+
+// §6.3：授权变更失效 = 版本 / epoch 递增。
+func (s *AuthorizationServiceSuite) TestInvalidate_Operations() {
+	// Arrange
+	s.cch.On("Incr", mock.Anything, versionKey("10001")).Return(int64(1), nil)
+	s.cch.On("Incr", mock.Anything, "rbac:default:epoch").Return(int64(2), nil)
+	// 10002 的版本递增失败 → 批量操作整体报错（§6.6）。
+	s.cch.On("Incr", mock.Anything, versionKey("10002")).Return(int64(0), errors.New("redis down"))
+
+	// Act + Assert
+	s.Require().NoError(s.sut.IncrSubjectVersion(s.ctx, subject1.SubjectID))
+	s.Require().NoError(s.sut.IncrEpoch(s.ctx))
+	s.Require().Error(s.sut.IncrSubjectVersions(s.ctx, []string{"10001", "10002"}))
+}
+
+// §6.8：singleflight 击穿防护——同主体并发未命中只触发一次数据库聚合。
+func (s *AuthorizationServiceSuite) TestSingleflight_ConcurrentMisses_SingleDBAggregate() {
+	// Arrange
+	sid := "10001"
+	s.cch.On("GetInt", mock.Anything, "rbac:default:epoch").Return(int64(0), true, nil)
+	s.cch.On("GetInt", mock.Anything, versionKey(sid)).Return(int64(0), true, nil)
+	s.cch.On("Get", mock.Anything, mock.Anything).Return(nil, false, nil)
+	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, sid).Return(false, nil)
+	// 聚合耗时 100ms：并发请求在此窗口内到达，singleflight 合并为一次回源。
+	// .Once()：多余聚合会使 mock panic —— 断言即"恰好一次"。
+	s.authzRepo.On("EffectiveRolePermissions", mock.Anything, sid).
+		Run(func(mock.Arguments) { time.Sleep(100 * time.Millisecond) }).
+		Return([]string{"user:list"}, nil).Once()
+	s.authzRepo.On("EffectiveGrantPermissions", mock.Anything, sid, mock.AnythingOfType("time.Time")).
+		Return(nil, nil).Once()
+	s.authzRepo.On("NearestGrantExpiry", mock.Anything, sid, mock.AnythingOfType("time.Time")).
+		Return(nil, nil).Once()
+	s.cch.On("Set", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+
+	const n = 20
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	results := make([]bool, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			results[i], errs[i] = s.sut.HasPermission(s.ctx, subject1, "user:list")
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		s.Require().NoError(errs[i])
+		s.True(results[i])
+	}
 }
 
 func makeLongString(n int) string {

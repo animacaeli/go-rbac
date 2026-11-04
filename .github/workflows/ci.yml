@@ -47,7 +47,7 @@ jobs:
         run: go tool cover -func=coverage.out | tail -1
 
   integration:
-    name: Integration (MySQL 8)
+    name: Integration (MySQL 8 + Redis 7)
     runs-on: ubuntu-latest
     services:
       mysql:
@@ -62,16 +62,26 @@ jobs:
           --health-interval 3s
           --health-timeout 3s
           --health-retries 30
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
-      - name: Run integration tests
+      - name: Run integration tests (MySQL + Redis consistency suites)
         env:
           RBAC_TEST_MYSQL_DSN: root:rootpass@tcp(127.0.0.1:3306)/go_rbac_test?parseTime=true&loc=UTC&charset=utf8mb4
-        run: go test -race -v ./repository/gormrepo/
+          RBAC_TEST_REDIS_ADDR: 127.0.0.1:6380
+        run: go test -race -v ./repository/gormrepo/ ./cache/redis/
 
   vuln:
     name: Vulnerabilities (govulncheck)

@@ -16,6 +16,7 @@ type config struct {
 	cch             cache.PermissionCache
 	reg             *registry.Registry
 	statusChecker   core.SubjectStatusChecker
+	eventSink       core.EventSink
 	logger          *slog.Logger
 	metrics         core.Metrics
 	modules         []Module
@@ -65,3 +66,7 @@ func WithGrantorConstraint(enabled bool) Option {
 // WithCacheTTL 配置权限缓存 TTL 上限（可选，默认 5 分钟）。
 // 实际 TTL 始终不超过主体最近一条临时授权的到期时间（§6.5）。
 func WithCacheTTL(d time.Duration) Option { return func(c *config) { c.cacheTTL = d } }
+
+// WithEventSink 注入授权变更事件实现（可选，默认丢弃事件）。
+// Audit 模块等价于在模块注册期注入；业务项目也可直接使用本选项。
+func WithEventSink(sink core.EventSink) Option { return func(c *config) { c.eventSink = sink } }

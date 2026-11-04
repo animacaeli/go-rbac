@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/animacaeli/go-rbac/cache"
@@ -47,6 +48,11 @@ func New(opts ...Option) (*App, error) {
 		repos.Authorization, cfg.cch, cfg.statusChecker, cfg.metrics, cfg.cacheTTL,
 	)
 
+	events := core.NewEventBus()
+	if cfg.eventSink != nil {
+		events.SetSink(cfg.eventSink)
+	}
+
 	deps := core.ServiceDeps{
 		Roles:           repos.Roles,
 		Permissions:     repos.Permissions,
@@ -55,16 +61,19 @@ func New(opts ...Option) (*App, error) {
 		Grants:          repos.Grants,
 		Registry:        cfg.reg,
 		Authorizer:      authorizer,
+		Events:          events,
 		GrantorMustHold: cfg.grantorMustHold,
 	}
 
 	app := &App{
-		cfg:        cfg,
-		repos:      repos,
-		authorizer: authorizer,
-		roles:      core.NewRoleService(deps),
-		userRoles:  core.NewUserRoleService(deps),
-		grants:     core.NewGrantService(deps),
+		cfg:         cfg,
+		repos:       repos,
+		authorizer:  authorizer,
+		events:      events,
+		roles:       core.NewRoleService(deps),
+		userRoles:   core.NewUserRoleService(deps),
+		grants:      core.NewGrantService(deps),
+		permissions: core.NewPermissionService(deps),
 	}
 
 	// Module Registry：注册（无数据库副作用）+ 迁移收集（§3.3）。
@@ -83,13 +92,15 @@ func New(opts ...Option) (*App, error) {
 
 // App 是 RBAC 应用的组装根：服务获取、迁移执行、权限同步。
 type App struct {
-	cfg        config
-	repos      repository.Repos
-	authorizer *core.AuthorizationService
-	roles      *core.RoleService
-	userRoles  *core.UserRoleService
-	grants     *core.GrantService
-	migrations []Migration
+	cfg         config
+	repos       repository.Repos
+	authorizer  *core.AuthorizationService
+	events      *core.EventBus
+	roles       *core.RoleService
+	userRoles   *core.UserRoleService
+	grants      *core.GrantService
+	permissions *core.PermissionService
+	migrations  []Migration
 }
 
 // Authorizer 返回统一授权服务（注入框架适配器）。
@@ -103,6 +114,13 @@ func (a *App) UserRoles() *core.UserRoleService { return a.userRoles }
 
 // Grants 返回用户额外授权管理服务。
 func (a *App) Grants() *core.GrantService { return a.grants }
+
+// Permissions 返回权限资源管理服务（状态控制与查询）。
+func (a *App) Permissions() *core.PermissionService { return a.permissions }
+
+// SetEventSink 注入授权变更事件实现（Audit 模块在 Register 时调用，
+// 业务项目也可经 WithEventSink 在组装期注入）。
+func (a *App) SetEventSink(sink core.EventSink) { a.events.SetSink(sink) }
 
 // Registry 返回权限注册中心（含内置 rbac:* 权限码）。
 func (a *App) Registry() *registry.Registry { return a.cfg.reg }
@@ -119,8 +137,25 @@ func (a *App) Migrate(ctx context.Context) error {
 }
 
 // SyncPermissions 将注册中心同步至数据库（§2.3），幂等可重复执行。
+// 同步后递增全局 epoch：废弃/恢复启用直接影响全体读者（§6.3 保守失效）。
 func (a *App) SyncPermissions(ctx context.Context) (registry.SyncResult, error) {
-	return registry.Sync(ctx, a.cfg.reg, a.repos.Permissions)
+	result, err := registry.Sync(ctx, a.cfg.reg, a.repos.Permissions)
+	if err != nil {
+		return result, err
+	}
+	if result.Changed() {
+		if err := a.authorizer.IncrEpoch(ctx); err != nil {
+			return result, err
+		}
+		_ = a.events.Record(ctx, core.NewEvent(core.EventPermissionsSynced,
+			core.AuthorizationContext{}, "registry", map[string]string{
+				"created":     strconv.Itoa(result.Created),
+				"updated":     strconv.Itoa(result.Updated),
+				"reactivated": strconv.Itoa(result.Reactivated),
+				"deprecated":  strconv.Itoa(result.Deprecated),
+			}))
+	}
+	return result, nil
 }
 
 // ValidatePermissionCodes 启动期权限码交叉校验（§2.6）：将路由或集中声明的
@@ -166,5 +201,5 @@ func (a *App) SeedSuperAdmin(ctx context.Context, subjectID string) error {
 	if err := a.repos.UserRoles.Assign(ctx, subjectID, role.ID); err != nil {
 		return fmt.Errorf("rbac: seed super admin subject: %w", err)
 	}
-	return a.authorizer.InvalidateSubject(ctx, core.SubjectID(subjectID))
+	return a.authorizer.IncrSubjectVersion(ctx, core.SubjectID(subjectID))
 }

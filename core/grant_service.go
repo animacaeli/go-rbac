@@ -27,6 +27,7 @@ func NewGrantService(deps ServiceDeps) *GrantService { return &GrantService{deps
 //
 // 落库为单事务：先撤销同 (subject_id, permission_id) 的未撤销行（含已过期），
 // 再插入新授权（§2.5 主防线；生成列唯一约束兜底并发）。
+// 提交成功后递增该用户版本号（§6.3）。
 func (s *GrantService) Grant(ctx context.Context, operator AuthorizationContext, subjectID, permissionCode string, expiresAt *time.Time, reason string) error {
 	if err := validateSubject(subjectID); err != nil {
 		return err
@@ -56,7 +57,14 @@ func (s *GrantService) Grant(ctx context.Context, operator AuthorizationContext,
 	if err := s.deps.Grants.Grant(ctx, g, now); err != nil {
 		return err
 	}
-	return s.deps.Authorizer.InvalidateSubject(ctx, SubjectID(subjectID))
+	if err := s.deps.Authorizer.IncrSubjectVersion(ctx, SubjectID(subjectID)); err != nil {
+		return err
+	}
+	detail := map[string]string{"permission": permissionCode, "reason": reason}
+	if expiresAt != nil {
+		detail["expires_at"] = expiresAt.Format(time.RFC3339)
+	}
+	return s.deps.record(ctx, NewEvent(EventUserGranted, operator, subjectID, detail))
 }
 
 // Revoke 撤销用户当前活跃的额外授权（保留记录，§2.5）。
@@ -77,7 +85,12 @@ func (s *GrantService) Revoke(ctx context.Context, operator AuthorizationContext
 	if rows == 0 {
 		return fmt.Errorf("%w: subject=%s permission=%s", ErrGrantNotFound, subjectID, permissionCode)
 	}
-	return s.deps.Authorizer.InvalidateSubject(ctx, SubjectID(subjectID))
+	if err := s.deps.Authorizer.IncrSubjectVersion(ctx, SubjectID(subjectID)); err != nil {
+		return err
+	}
+	return s.deps.record(ctx, NewEvent(EventGrantRevoked, operator, subjectID, map[string]string{
+		"permission": permissionCode,
+	}))
 }
 
 // FindActive 返回当前未撤销的授权记录（无论是否已到期）。

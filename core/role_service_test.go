@@ -10,6 +10,7 @@ import (
 	"github.com/animacaeli/go-rbac/model"
 	"github.com/animacaeli/go-rbac/registry"
 	"github.com/animacaeli/go-rbac/repository"
+	cachemocks "github.com/animacaeli/go-rbac/test/mocks/cache"
 	repositorymocks "github.com/animacaeli/go-rbac/test/mocks/repository"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
@@ -18,18 +19,20 @@ import (
 // serviceHarness 汇聚三个管理服务测试套件共用的装配逻辑。
 type serviceHarness struct {
 	suite.Suite
-	ctx         context.Context
-	roles       *repositorymocks.MockRoleRepo
-	perms       *repositorymocks.MockPermissionRepo
-	userRoles   *repositorymocks.MockUserRoleRepo
-	rolePerms   *repositorymocks.MockRolePermissionRepo
-	grants      *repositorymocks.MockUserGrantRepo
-	authzRepo   *repositorymocks.MockAuthorizationRepo
-	reg         *registry.Registry
-	deps        core.ServiceDeps
-	roleSvc     *core.RoleService
-	userRoleSvc *core.UserRoleService
-	grantSvc    *core.GrantService
+	ctx       context.Context
+	roles     *repositorymocks.MockRoleRepo
+	perms     *repositorymocks.MockPermissionRepo
+	userRoles *repositorymocks.MockUserRoleRepo
+	rolePerms *repositorymocks.MockRolePermissionRepo
+	grants    *repositorymocks.MockUserGrantRepo
+	authzRepo *repositorymocks.MockAuthorizationRepo
+	// authzCacheMock 非 nil 时注入授权服务（观测版本/epoch 递增）；nil 用 NoopCache。
+	authzCacheMock *cachemocks.MockPermissionCache
+	reg            *registry.Registry
+	deps           core.ServiceDeps
+	roleSvc        *core.RoleService
+	userRoleSvc    *core.UserRoleService
+	grantSvc       *core.GrantService
 }
 
 var (
@@ -38,6 +41,12 @@ var (
 	// subject 是被授权的普通用户。
 	subject = "10001"
 )
+
+// cchIncrExpect 断言版本/epoch 递增调用（需先注入 authzCacheMock）。
+func (h *serviceHarness) cchIncrExpect(key string) {
+	h.Require().NotNil(h.authzCacheMock, "SetupTest 需先创建 authzCacheMock")
+	h.authzCacheMock.On("Incr", mock.Anything, key).Return(int64(1), nil)
+}
 
 func (h *serviceHarness) setupHarness(grantorMustHold bool) {
 	h.ctx = context.Background()
@@ -49,9 +58,13 @@ func (h *serviceHarness) setupHarness(grantorMustHold bool) {
 	h.authzRepo = repositorymocks.NewMockAuthorizationRepo(h.T())
 	h.reg = registry.NewRegistry()
 
-	// 授权服务用真实实现 + mock 聚合仓储 + NoopCache：
+	// 授权服务用真实实现 + mock 聚合仓储：
 	// 服务层经 authorizer 做持权检查，路径为 HasBuiltinSuperAdminRole → Effective*。
-	authorizer := core.NewAuthorizationService(h.authzRepo, cache.NoopCache{}, nil, core.NoopMetrics{}, time.Minute)
+	authzCache := cache.PermissionCache(cache.NoopCache{})
+	if h.authzCacheMock != nil {
+		authzCache = h.authzCacheMock
+	}
+	authorizer := core.NewAuthorizationService(h.authzRepo, authzCache, nil, core.NoopMetrics{}, time.Minute)
 
 	h.deps = core.ServiceDeps{
 		Roles:           h.roles,

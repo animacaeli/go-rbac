@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/animacaeli/go-rbac/model"
@@ -22,6 +23,8 @@ type ServiceDeps struct {
 	Registry        *registry.Registry
 	// Authorizer 用于"授权者必须持有拟授予权限"约束（§2.2）与缓存失效。
 	Authorizer *AuthorizationService
+	// Events 授权变更事件总线（nil 时事件被丢弃）。
+	Events *EventBus
 	// GrantorMustHold 默认开启；关闭用于"权限管理员不需要持有全部业务权限"的场景。
 	GrantorMustHold bool
 }
@@ -49,8 +52,16 @@ func (d ServiceDeps) grantorAllowed(ctx context.Context, operator AuthorizationC
 	return nil
 }
 
+// record 分发授权变更事件（事件失败向上传播，§2.10/§6.7）。
+func (d ServiceDeps) record(ctx context.Context, e Event) error {
+	if d.Events == nil {
+		return nil
+	}
+	return d.Events.Record(ctx, e)
+}
+
 // RoleService 角色管理（§2.4）。方法首个参数 operator 为操作者授权上下文，
-// 用于授权者约束。
+// 用于授权者约束与审计事件。
 type RoleService struct {
 	deps ServiceDeps
 }
@@ -59,7 +70,7 @@ type RoleService struct {
 func NewRoleService(deps ServiceDeps) *RoleService { return &RoleService{deps: deps} }
 
 // Create 创建角色（启用状态，非内置）。
-func (s *RoleService) Create(ctx context.Context, _ AuthorizationContext, code, name, description string) (*model.Role, error) {
+func (s *RoleService) Create(ctx context.Context, operator AuthorizationContext, code, name, description string) (*model.Role, error) {
 	code = strings.TrimSpace(code)
 	if code == "" || len(code) > model.RoleCodeMaxLength {
 		return nil, fmt.Errorf("%w: %q", ErrInvalidRoleCode, code)
@@ -83,6 +94,12 @@ func (s *RoleService) Create(ctx context.Context, _ AuthorizationContext, code, 
 		Status:      model.RoleStatusEnabled,
 	}
 	if err := s.deps.Roles.Create(ctx, role); err != nil {
+		return nil, err
+	}
+	if err := s.deps.record(ctx, NewEvent(EventRoleCreated, operator, code, map[string]string{
+		"role_id": strconv.FormatUint(role.ID, 10),
+		"name":    name,
+	})); err != nil {
 		return nil, err
 	}
 	return role, nil
@@ -113,8 +130,9 @@ func (s *RoleService) List(ctx context.Context, f repository.RoleFilter) ([]mode
 
 // Update 修改角色展示元数据（name/description）。code 与 status 不可经此修改。
 // 内置角色允许更新展示信息，但不可删除/禁用（§2.4）。
-func (s *RoleService) Update(ctx context.Context, _ AuthorizationContext, id uint64, name, description string) error {
-	if _, err := s.Get(ctx, id); err != nil {
+func (s *RoleService) Update(ctx context.Context, operator AuthorizationContext, id uint64, name, description string) error {
+	role, err := s.Get(ctx, id)
+	if err != nil {
 		return err
 	}
 	if strings.TrimSpace(name) == "" || len(name) > model.NameMaxLength {
@@ -123,12 +141,18 @@ func (s *RoleService) Update(ctx context.Context, _ AuthorizationContext, id uin
 	if len(description) > model.DescMaxLength {
 		return fmt.Errorf("%w: description too long (max %d chars)", ErrInvalidPermissionDef, model.DescMaxLength)
 	}
-	return s.deps.Roles.UpdateProfile(ctx, id, name, description)
+	if err := s.deps.Roles.UpdateProfile(ctx, id, name, description); err != nil {
+		return err
+	}
+	return s.deps.record(ctx, NewEvent(EventRoleUpdated, operator, role.Code, map[string]string{
+		"role_id": strconv.FormatUint(id, 10),
+		"name":    name,
+	}))
 }
 
 // SetStatus 启用/禁用角色。内置角色受保护（§7.3）。
-// 禁用后批量失效关联用户缓存（§6.3 失效矩阵）。
-func (s *RoleService) SetStatus(ctx context.Context, _ AuthorizationContext, id uint64, status uint8) error {
+// 状态变化后批量递增关联用户版本号（§6.3 失效矩阵）。
+func (s *RoleService) SetStatus(ctx context.Context, operator AuthorizationContext, id uint64, status uint8) error {
 	role, err := s.Get(ctx, id)
 	if err != nil {
 		return err
@@ -139,15 +163,25 @@ func (s *RoleService) SetStatus(ctx context.Context, _ AuthorizationContext, id 
 	if status != model.RoleStatusEnabled && status != model.RoleStatusDisabled {
 		return fmt.Errorf("rbac: invalid role status %d", status)
 	}
+	if role.Status == status {
+		return nil // 幂等：状态未变化
+	}
 	if err := s.deps.Roles.SetStatus(ctx, id, status); err != nil {
 		return err
 	}
-	return s.invalidateRoleSubjects(ctx, id)
+	if err := s.incrRoleSubjectVersions(ctx, id); err != nil {
+		return err
+	}
+	return s.deps.record(ctx, NewEvent(EventRoleStatusChanged, operator, role.Code, map[string]string{
+		"role_id": strconv.FormatUint(id, 10),
+		"from":    strconv.FormatUint(uint64(role.Status), 10),
+		"to":      strconv.FormatUint(uint64(status), 10),
+	}))
 }
 
 // Delete 删除角色：内置角色受保护；正在被分配给用户的角色拒绝删除（§2.4）。
 // 删除时在同一事务清理关联行（§5.3）。
-func (s *RoleService) Delete(ctx context.Context, _ AuthorizationContext, id uint64) error {
+func (s *RoleService) Delete(ctx context.Context, operator AuthorizationContext, id uint64) error {
 	role, err := s.Get(ctx, id)
 	if err != nil {
 		return err
@@ -162,7 +196,12 @@ func (s *RoleService) Delete(ctx context.Context, _ AuthorizationContext, id uin
 	if n > 0 {
 		return fmt.Errorf("%w: %d subject(s)", ErrRoleInUse, n)
 	}
-	return s.deps.Roles.DeleteWithAssociations(ctx, id)
+	if err := s.deps.Roles.DeleteWithAssociations(ctx, id); err != nil {
+		return err
+	}
+	return s.deps.record(ctx, NewEvent(EventRoleDeleted, operator, role.Code, map[string]string{
+		"role_id": strconv.FormatUint(id, 10),
+	}))
 }
 
 // SetPermissions 将角色权限集合整体替换为给定权限码集合（差量事务）。
@@ -172,6 +211,8 @@ func (s *RoleService) Delete(ctx context.Context, _ AuthorizationContext, id uin
 //   - 每个权限码必须在 Registry 注册（§2.2：只能引用已注册权限）
 //   - 每个权限必须处于启用状态
 //   - 授权者必须持有全部拟授予权限（§2.2，默认开启；超管除外）
+//
+// 提交成功后批量递增拥有该角色的用户版本号（§6.3）。
 func (s *RoleService) SetPermissions(ctx context.Context, operator AuthorizationContext, roleID uint64, permissionCodes []string) error {
 	role, err := s.Get(ctx, roleID)
 	if err != nil {
@@ -192,7 +233,14 @@ func (s *RoleService) SetPermissions(ctx context.Context, operator Authorization
 	if err := s.deps.RolePermissions.SetPermissions(ctx, roleID, permIDs); err != nil {
 		return err
 	}
-	return s.invalidateRoleSubjects(ctx, roleID)
+	if err := s.incrRoleSubjectVersions(ctx, roleID); err != nil {
+		return err
+	}
+	return s.deps.record(ctx, NewEvent(EventRolePermissionsChanged, operator, role.Code, map[string]string{
+		"role_id":    strconv.FormatUint(roleID, 10),
+		"codes":      strings.Join(permissionCodes, ","),
+		"code_count": strconv.Itoa(len(permissionCodes)),
+	}))
 }
 
 // PermissionsOfRole 返回角色当前关联的权限（展示用，含禁用/废弃状态）。
@@ -252,12 +300,12 @@ func (s *RoleService) resolveEnabledPermissionIDs(ctx context.Context, codes []s
 	return ids, nil
 }
 
-// invalidateRoleSubjects 批量失效角色关联用户的缓存（§6.3）。
+// incrRoleSubjectVersions 批量递增角色关联用户的版本号（§6.3 角色权限变更）。
 // 失效失败时返回错误：管理接口不得在失效失败时静默报成功（§6.6）。
-func (s *RoleService) invalidateRoleSubjects(ctx context.Context, roleID uint64) error {
+func (s *RoleService) incrRoleSubjectVersions(ctx context.Context, roleID uint64) error {
 	subjects, err := s.deps.UserRoles.SubjectIDsOfRole(ctx, roleID)
 	if err != nil {
 		return fmt.Errorf("rbac: load role subjects for invalidation: %w", err)
 	}
-	return s.deps.Authorizer.InvalidateSubjects(ctx, subjects)
+	return s.deps.Authorizer.IncrSubjectVersions(ctx, subjects)
 }

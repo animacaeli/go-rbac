@@ -20,6 +20,11 @@ type SyncResult struct {
 	Deprecated int
 }
 
+// Changed 报告本次同步是否产生任何差量。
+func (r SyncResult) Changed() bool {
+	return r.Created+r.Updated+r.Reactivated+r.Deprecated > 0
+}
+
 // Sync 将注册中心内容同步至数据库（§2.3 同步规则），幂等可重复执行：
 //
 //  1. 新增权限自动注册（不自动授权给任何角色）；

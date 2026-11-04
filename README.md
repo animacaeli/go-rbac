@@ -8,7 +8,9 @@
 - 框架解耦：核心授权逻辑不绑定任何 Web 框架；提供 Gin 适配器（Fiber / Echo 按需扩展）
 - 默认拒绝、失败关闭：无权限即拒绝；数据库 / 缓存 / 身份解析异常一律不得放行
 - 版本化 SQL 迁移（`io/fs` embed + `schema_migrations`），幂等可重复执行
-- 不使用 Redis 也可正常运行（默认 NoopCache；Redis 版本号缓存于 Phase 2 提供）
+- **权限缓存（§6）**：版本号 + 全局 epoch 两级失效、写前复核、singleflight 击穿防护；
+  不使用 Redis 也可正常运行（默认 NoopCache），Redis 适配器开箱即用
+- 授权变更审计（Audit 模块）与角色模板（Template 模块）按需启用
 - 设计文档：[docs/go-rbac-design.md](docs/go-rbac-design.md)（v0.3.0-design 定稿）
 
 ## 快速开始（Gin）
@@ -88,6 +90,66 @@ app.Grants().Revoke(ctx, operator, "10001", "order:export")
 `SeedSuperAdmin` 种子初始化；`HasPermission` 对超管恒真，`GetPermissions` 返回空集合，
 前端应以 `IsSuperAdministrator` 单独判断。
 
+## 权限缓存（§6）
+
+不注入缓存时默认 NoopCache（每次回源数据库，行为正确只是慢）。注入 Redis 后获得
+完整的一致性机制：
+
+```go
+import rediscache "github.com/animacaeli/go-rbac/cache/redis"
+import "github.com/redis/go-redis/v9"
+
+cli := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+app, err := rbac.New(
+    rbac.WithDB(db),
+    rbac.WithCache(rediscache.New(cli)), // 可选：rbac.WithCacheTTL(10 * time.Minute)
+)
+```
+
+机制要点（详见设计文档 §6）：
+
+- **两级失效**：用户级版本号递增（授权变更精确失效）+ 全局 epoch 递增
+  （权限禁用等低频全局事件，全员冷启动一次）；权限码字面进入生成键
+  `perm:v{epoch<<32|version}`，旧数据只可能落在旧生成键下，新读者不可达
+- **不变性（承重墙）**：版本号只在数据库事务提交成功后递增——版本号只允许
+  落后于数据，永远不允许超前于数据
+- **写前复核**：回填缓存前复核生成键未变，已变则丢弃结果重走流程
+- **击穿防护**：singleflight 合并同主体并发回源
+- **临时授权**：缓存 TTL 不超过最近一条授权到期时间，查询层始终校验 expires_at
+- **故障语义**：Redis 故障时鉴权回源数据库；管理接口的版本递增失败整体报错
+  （权限管理在 Redis 故障期间不可用——可用性换一致性的刻意选择）
+
+一致性边界（§6.7）：正常运行下授权撤销在"事务提交 + 版本递增完成"后即时生效；
+不提供跨缓存层的严格线性一致。
+
+## 可选模块
+
+```go
+import (
+    "github.com/animacaeli/go-rbac/modules/audit"
+    "github.com/animacaeli/go-rbac/modules/template"
+)
+
+app, err := rbac.New(
+    rbac.WithDB(db),
+    rbac.WithPermissionRegistry(permissions),
+    rbac.WithModules(
+        audit.New(), // 授权变更审计（rbac_audit_logs，随 Migrate 自动建表）
+        template.New( // 角色模板：Snapshot/Copy 模式
+            template.Define("ops_lead", "运营主管", "用户与订单管理",
+                "user:list", "order:list", "order:export"),
+        ),
+    ),
+)
+// 模板创建角色（复制当前模板权限快照，后续模板变化不影响已创建角色）：
+role, err := tplModule.CreateFromTemplate(ctx, operator, "ops_lead", "ops_42", "运营主管-42")
+// 审计查询（需 rbac:audit:read 权限保护）：
+logs, err := audit.NewQuery(auditModule).List(ctx, audit.Filter{Operator: "10001"})
+```
+
+Audit 默认 Strict 策略（审计写入失败 → 授权变更操作整体报错）；
+`audit.New(audit.WithLogOnly())` 降级为仅记日志。
+
 ## 错误语义（§2.6）
 
 | 情况 | HTTP 状态 |
@@ -111,10 +173,13 @@ app.Grants().Revoke(ctx, operator, "10001", "order:export")
 
 - [x] **Phase 1 核心 RBAC**：模型 / 迁移 / Registry + 同步 / 角色与授权管理服务 /
       授权服务（含超管）/ Gin 中间件 / 启动期校验 / 内置 `rbac:*` 权限码 / NoopCache
-- [ ] Phase 2 缓存与管理：Redis Adapter、版本号 + epoch 两级失效、singleflight、
-      角色模板、Audit 模块、Metrics 落地
+- [x] **Phase 2 缓存与管理能力**：Redis Adapter、版本号 + epoch 两级失效（写前复核、
+      singleflight）、失效矩阵全覆盖测试、临时授权过期、角色模板、权限批量操作、
+      Audit 模块（事件总线 + Strict/LogOnly 策略）、CountingMetrics、§9.4 性能基线
+      （命中路径 P99 < 1ms、冷聚合 P99 < 50ms、1k 用户批量失效 < 100ms、
+      500 权限幂等同步 < 2s，实测见 CI / `make bench`）
 - [ ] Phase 3 高级模块：Menu / DataScope / Multi-Tenant（第一验收项 = §5.5 迁移契约测试）
-- [ ] Phase 4 稳定性与生态：文档、兼容性测试、CI、发布规范
+- [ ] Phase 4 稳定性与生态：文档、兼容性测试、发布规范
 
 ## 开发
 

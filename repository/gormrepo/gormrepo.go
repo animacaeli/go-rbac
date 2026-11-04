@@ -153,6 +153,14 @@ func (x permissionRepo) ListAll(ctx context.Context) ([]model.Permission, error)
 	return perms, nil
 }
 
+func (x permissionRepo) SetStatus(ctx context.Context, id uint64, status uint8) error {
+	return x.r.writer(ctx).
+		Model(&model.Permission{}).
+		Where("id = ?", id).
+		Update("status", status).
+		Error
+}
+
 // ApplySync 在单个事务内应用同步差量（§2.3）。
 func (x permissionRepo) ApplySync(ctx context.Context, s repository.PermissionSync) error {
 	if len(s.Inserts) == 0 && len(s.MetadataUpdates) == 0 && len(s.ReactivateIDs) == 0 && len(s.DeprecateIDs) == 0 {
