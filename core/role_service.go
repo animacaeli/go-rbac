@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/animacaeli/go-rbac/model"
@@ -227,6 +228,8 @@ func (s *RoleService) resolveEnabledPermissionIDs(ctx context.Context, codes []s
 	for c := range unique {
 		distinct = append(distinct, c)
 	}
+	// 排序保证确定性行为（map 迭代顺序随机，会传导到 SetPermissions 的入参顺序）。
+	sort.Strings(distinct)
 	perms, err := s.deps.Permissions.FindByCodes(ctx, distinct)
 	if err != nil {
 		return nil, err

@@ -245,8 +245,10 @@ func (s *RoleServiceSuite) TestSetPermissions_GrantorHolds_Replaced() {
 	s.perms.On("FindByCodes", mock.Anything, mock.Anything).
 		Return([]model.Permission{permsByCode["user:list"], permsByCode["order:export"]}, nil)
 	s.expectGrantorHolds(codes...)
+	// 入参顺序按权限码字典序确定（resolveEnabledPermissionIDs 排序）：
+	// "order:export"(ID=101) < "user:list"(ID=100)。
 	s.rolePerms.On("SetPermissions", mock.Anything, uint64(2),
-		[]uint64{permsByCode["user:list"].ID, permsByCode["order:export"].ID}).
+		[]uint64{permsByCode["order:export"].ID, permsByCode["user:list"].ID}).
 		Return(nil)
 	s.userRoles.On("SubjectIDsOfRole", mock.Anything, uint64(2)).Return(nil, nil)
 
