@@ -333,10 +333,16 @@ func (x grantRepo) Revoke(ctx context.Context, subjectID string, permissionID ui
 	if err != nil {
 		return 0, err
 	}
-	res := db.Table("rbac_user_grants").
-		Where("tenant_id = ? AND subject_id = ? AND permission_id = ? AND revoked_at IS NULL", t, subjectID, permissionID).
-		Updates(map[string]any{"revoked_at": now, "revoked_by": revokedBy})
-	return res.RowsAffected, res.Error
+	// 同 base 仓储：UPDATE 幂等，RR 间隙锁死锁有界重试。
+	var affected int64
+	err = runWithDeadlockRetry(func() error {
+		res := db.Table("rbac_user_grants").
+			Where("tenant_id = ? AND subject_id = ? AND permission_id = ? AND revoked_at IS NULL", t, subjectID, permissionID).
+			Updates(map[string]any{"revoked_at": now, "revoked_by": revokedBy})
+		affected = res.RowsAffected
+		return res.Error
+	})
+	return affected, err
 }
 
 func (x grantRepo) FindActive(ctx context.Context, subjectID string, permissionID uint64) (*model.UserGrant, error) {

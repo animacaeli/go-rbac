@@ -367,14 +367,21 @@ func (x userGrantRepo) Grant(ctx context.Context, g model.UserGrant, now time.Ti
 }
 
 func (x userGrantRepo) Revoke(ctx context.Context, subjectID string, permissionID uint64, revokedBy string, now time.Time) (int64, error) {
-	res := x.r.writer(ctx).
-		Model(&model.UserGrant{}).
-		Where("subject_id = ? AND permission_id = ? AND revoked_at IS NULL", subjectID, permissionID).
-		Updates(map[string]any{
-			"revoked_at": now,
-			"revoked_by": revokedBy,
-		})
-	return res.RowsAffected, res.Error
+	// 单条 UPDATE 同样持有唯一索引 next-key 锁：并发授权/撤销风暴下可成为
+	// 死锁受害者（CI 并发压力测试实测）。UPDATE 幂等，有界重试。
+	var affected int64
+	err := runWithDeadlockRetry(func() error {
+		res := x.r.writer(ctx).
+			Model(&model.UserGrant{}).
+			Where("subject_id = ? AND permission_id = ? AND revoked_at IS NULL", subjectID, permissionID).
+			Updates(map[string]any{
+				"revoked_at": now,
+				"revoked_by": revokedBy,
+			})
+		affected = res.RowsAffected
+		return res.Error
+	})
+	return affected, err
 }
 
 func (x userGrantRepo) FindActive(ctx context.Context, subjectID string, permissionID uint64) (*model.UserGrant, error) {

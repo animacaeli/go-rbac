@@ -58,6 +58,12 @@
   消除"集成不计入"导致的覆盖率失真）；CI 增加 `make mocks-check`
   （生成代码与接口定义一致性校验）；App 装配级单测
 
+### Fixed（CI 并发压力实测）
+
+- `Grant`/`Revoke` 死锁重试：Revoke（单条 UPDATE，同样持唯一索引 next-key 锁）
+  此前无重试，Grant 重试上限 3 次在双写者×25 轮相邻 subject 风暴下被穿——
+  Revoke 补齐重试，上限统一提至 5 次（base/tenant 双实现）
+
 ### Fixed（复审补充）
 
 - `App.Roles().List` 的公共可用性被 internal 迁移打断（参数

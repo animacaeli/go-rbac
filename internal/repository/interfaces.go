@@ -44,7 +44,7 @@ func DeadlockRetry(fn func() error) error {
 }
 
 const (
-	deadlockRetryAttempts = 3
+	deadlockRetryAttempts = 5
 	deadlockRetryBackoff  = 5 * time.Millisecond
 )
 
