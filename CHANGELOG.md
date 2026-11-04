@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-05
+
+Phase 4：稳定性与生态（设计文档 §8）。
+
 ### Added
 
 - 适配器多租户支持：`ginadapter.WithTenantResolver` /
