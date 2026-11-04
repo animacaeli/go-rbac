@@ -205,7 +205,7 @@ func (s *IsolationSuite) SetupSuite() {
 		rbac.WithDB(db),
 		rbac.WithPermissionRegistry(reg),
 		rbac.WithCache(rediscache.New(redis.NewClient(&redis.Options{Addr: mr.Addr()}))),
-		rbac.WithModules(s.tenantM), // tenant 必须注册在首个
+		rbac.WithModules(s.tenantM), // tenant 建议首位（迁移顺序）
 	)
 	require.NoError(s.T(), err)
 	s.app = app

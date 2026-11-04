@@ -250,9 +250,14 @@ func (s *AuthorizationService) aggregateAndCache(ctx context.Context, ac Authori
 
 	// 预读最近到期时间（TTL 上限），与聚合结果一并使用。
 	now := time.Now().UTC()
-	set, nearest, err := s.aggregate(ctx, ac, now)
+	set, nearest, expiryErr, err := s.aggregate(ctx, ac, now)
 	if err != nil {
 		return aggregateResult{}, err
+	}
+	if expiryErr != nil {
+		// §6.5：无法确认最近到期时间 → 不写缓存（临时授权不得在到期后
+		// 被缓存继续放行），本次返回未缓存数据。
+		return aggregateResult{set: set}, nil
 	}
 
 	// 写回前复核生成键（§6.2 第 5 步 / §6.4 写前复核）。
@@ -290,36 +295,40 @@ func (s *AuthorizationService) loadFromDB(ctx context.Context, ac AuthorizationC
 		return map[string]struct{}{}, true, nil
 	}
 	now := time.Now().UTC()
-	set, _, err := s.aggregate(ctx, ac, now)
+	set, _, _, err := s.aggregate(ctx, ac, now)
 	return set, false, err
 }
 
-// aggregate 查询数据库并求并集，返回集合与最近临时授权到期时间。
-func (s *AuthorizationService) aggregate(ctx context.Context, ac AuthorizationContext, now time.Time) (map[string]struct{}, *time.Time, error) {
+// aggregate 查询数据库并求并集。
+// 返回：集合、最近临时授权到期时间（TTL 上限）、到期时间读取错误
+// （expiryErr 只影响"能否写缓存"，不影响数据正确性）、主查询错误。
+func (s *AuthorizationService) aggregate(ctx context.Context, ac AuthorizationContext, now time.Time) (set map[string]struct{}, nearest *time.Time, expiryErr error, err error) {
 	subject := ac.SubjectID.String()
 
 	rolePerms, err := s.repo.EffectiveRolePermissions(ctx, subject)
 	if err != nil {
-		return nil, nil, fmt.Errorf("rbac: load role permissions: %w", err)
+		return nil, nil, nil, fmt.Errorf("rbac: load role permissions: %w", err)
 	}
 	grantPerms, err := s.repo.EffectiveGrantPermissions(ctx, subject, now)
 	if err != nil {
-		return nil, nil, fmt.Errorf("rbac: load grant permissions: %w", err)
+		return nil, nil, nil, fmt.Errorf("rbac: load grant permissions: %w", err)
 	}
-	nearest, err := s.repo.NearestGrantExpiry(ctx, subject, now)
-	if err != nil {
-		// 到期时间只影响 TTL 上限，读取失败按永久处理。
+	nearest, nearestErr := s.repo.NearestGrantExpiry(ctx, subject, now)
+	if nearestErr != nil {
+		// §6.5：TTL 上限依赖最近到期时间。读取失败时不得按"永久"写缓存——
+		// 否则临时授权可能在到期后被缓存继续放行至整个 TTL 结束。
+		// 处置：返回数据但不写缓存（cacheUnsafe），下次读取重新尝试。
 		nearest = nil
 	}
 
-	set := make(map[string]struct{}, len(rolePerms)+len(grantPerms))
+	set = make(map[string]struct{}, len(rolePerms)+len(grantPerms))
 	for _, code := range rolePerms {
 		set[code] = struct{}{}
 	}
 	for _, code := range grantPerms {
 		set[code] = struct{}{}
 	}
-	return set, nearest, nil
+	return set, nearest, nearestErr, nil
 }
 
 func flatten(set map[string]struct{}) []string {

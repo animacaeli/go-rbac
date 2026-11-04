@@ -26,7 +26,7 @@
 //	app, _ := rbac.New(
 //	    rbac.WithDB(db),
 //	    rbac.WithPermissionRegistry(reg),
-//	    rbac.WithModules(tenantMod), // 必须注册在首个（其他模块经 App 取最新服务）
+//	    rbac.WithModules(tenantMod), // 建议注册在首位（迁移按注册顺序执行，租户契约先行）
 //	)
 //	// 请求入口（中间件）：从可信上下文解析租户并注入
 //	ctx = core.ContextWithTenant(ctx, tenantID)
