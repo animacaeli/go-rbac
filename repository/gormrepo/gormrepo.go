@@ -31,8 +31,6 @@ func notFoundByID(what string, id uint64) error {
 	return fmt.Errorf("%w: %s id=%d", repository.ErrRecordNotFound, what, id)
 }
 
-func nowUTC() time.Time { return time.Now().UTC() }
-
 // ---- RoleRepo ----
 
 type roleRepo struct{ r *Repos }

@@ -10,7 +10,7 @@ import (
 	"gorm.io/gorm"
 )
 
-func TestNew_WithoutDB_ReturnsDBRequiredError(t *testing.T) {
+func TestNew_WithoutDB_ReturnsErrDBRequired(t *testing.T) {
 	// Act
 	app, err := rbac.New()
 
@@ -19,8 +19,8 @@ func TestNew_WithoutDB_ReturnsDBRequiredError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when WithDB is missing")
 	}
-	if err != rbac.DBRequiredError && !errors.Is(err, rbac.DBRequiredError) {
-		t.Fatalf("expected DBRequiredError, got %v", err)
+	if err != rbac.ErrDBRequired && !errors.Is(err, rbac.ErrDBRequired) {
+		t.Fatalf("expected ErrDBRequired, got %v", err)
 	}
 }
 

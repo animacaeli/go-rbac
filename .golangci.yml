@@ -1,0 +1,18 @@
+version: "2"
+
+# 生成代码不参与 lint
+linters:
+  default: standard
+  exclusions:
+    generated: lax
+    rules:
+      # 测试代码放宽 errcheck（require/assert 模式下的故意忽略）
+      - path: _test\.go
+        linters:
+          - errcheck
+    paths:
+      - test/mocks
+
+formatters:
+  enable:
+    - gofmt

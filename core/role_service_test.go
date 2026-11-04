@@ -103,10 +103,6 @@ func (h *serviceHarness) expectGrantorIsSuper() {
 		Return(true, nil)
 }
 
-func (h *serviceHarness) notFound(err error) bool {
-	return repository.IsNotFound(err)
-}
-
 // ---- RoleService ----
 
 type RoleServiceSuite struct {

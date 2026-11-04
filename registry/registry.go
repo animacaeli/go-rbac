@@ -147,11 +147,16 @@ func ValidateCode(code string) error {
 			return fmt.Errorf("%w: segment too long (max %d chars) in %q", ErrInvalidPermissionCode, model.RoleCodeMaxLength, code)
 		}
 		for _, c := range p {
-			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_') {
+			if !isCodeChar(c) {
 				return fmt.Errorf("%w: segment %q in %q contains illegal character %q (want [a-z0-9_])",
 					ErrInvalidPermissionCode, p, code, string(c))
 			}
 		}
 	}
 	return nil
+}
+
+// isCodeChar 报告字符是否属于权限码合法字符集 [a-z0-9_]。
+func isCodeChar(c rune) bool {
+	return c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_'
 }

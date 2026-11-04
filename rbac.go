@@ -22,8 +22,8 @@ import (
 	"github.com/animacaeli/go-rbac/registry"
 )
 
-// DBRequiredError 表示未注入数据库句柄。
-var DBRequiredError = errors.New("rbac: WithDB is required")
+// ErrDBRequired 表示未注入数据库句柄。
+var ErrDBRequired = errors.New("rbac: WithDB is required")
 
 // 公开错误面：库内哨兵错误的别名（§3.4：公开 API 面最小化，
 // Repository 接口保持内部）。

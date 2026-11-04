@@ -30,7 +30,7 @@ func New(opts ...Option) (*App, error) {
 		opt(&cfg)
 	}
 	if cfg.db == nil {
-		return nil, DBRequiredError
+		return nil, ErrDBRequired
 	}
 	if cfg.logger == nil {
 		cfg.logger = slog.Default()

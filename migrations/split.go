@@ -48,7 +48,7 @@ func splitStatements(script string) []string {
 		case c == '/' && i+1 < len(rs) && rs[i+1] == '*':
 			// 块注释：丢弃
 			i += 2
-			for i+1 < len(rs) && !(rs[i] == '*' && rs[i+1] == '/') {
+			for i+1 < len(rs) && (rs[i] != '*' || rs[i+1] != '/') {
 				i++
 			}
 			i += 2

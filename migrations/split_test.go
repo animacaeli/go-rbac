@@ -89,9 +89,7 @@ func TestCoreMigrations_EmbeddedAndParsable(t *testing.T) {
 	}
 	// §5.2 五张核心表必须全部出现在初始迁移中。
 	var tables []string
-	for _, stmt := range splitStatements(core[0].SQL) {
-		tables = append(tables, stmt)
-	}
+	tables = append(tables, splitStatements(core[0].SQL)...)
 	joined := ""
 	for _, s := range tables {
 		joined += s

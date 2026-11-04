@@ -118,13 +118,27 @@ app.Grants().Revoke(ctx, operator, "10001", "order:export")
 
 ## 开发
 
+常用命令见 `make help`：
+
 ```bash
-go test ./...                 # 单元测试
-docker compose up -d          # 本地 MySQL
-RBAC_TEST_MYSQL_DSN='root:rootpass@tcp(127.0.0.1:3306)/go_rbac_test?parseTime=true&loc=UTC&charset=utf8mb4' \
-  go test ./repository/gormrepo/    # 集成测试（未设置 DSN 时自动跳过）
-mockery                        # 重新生成测试替身（test/mocks）
+make check             # 本地提交前检查（与 CI 一致：gofmt / vet / golangci-lint / 单元测试）
+make test-integration  # 集成测试（自动用 docker compose 拉起 MySQL 8，无需手动设 DSN）
+make vuln              # govulncheck 漏洞检测
+make cover             # 单元测试 + 覆盖率汇总
+make mocks             # 重新生成测试替身（mockery v3 → test/mocks）
+make hooks             # 安装 git hooks（首次 clone 后执行一次）
 ```
+
+Git hooks（`make hooks` 安装）：
+
+- **pre-commit**（秒级拦截）：暂存内容涉及 Go 代码时执行 gofmt 检查、
+  `go mod tidy` 幂等检查、`go vet`
+- **pre-push**（分钟级完整检查）：build / vet / golangci-lint / govulncheck /
+  `go test -race`；未安装的工具自动跳过（CI 中强制执行）
+
+CI（`.github/workflows/ci.yml`）：lint（golangci-lint）、单元测试矩阵
+（Go 1.23 + stable，含竞态检测与覆盖率）、MySQL 8 集成测试、govulncheck
+漏洞检测，push / PR 自动触发。
 
 > 注：设计文档 §4.7 的内置权限码 `rbac:user:assign-role` 含连字符，与 §2.2/§2.3
 > 冻结的权限码字符集（小写字母/数字/下划线/冒号）冲突，实现规范化为

@@ -1,0 +1,32 @@
+#!/bin/sh
+# pre-push：推送前完整检查（分钟级）。
+# 与 CI 保持一致：build / vet / lint / 漏洞检测 / 竞态单元测试。
+# 未安装的工具自动跳过并提示（CI 中强制执行）。
+# 安装：make hooks
+set -e
+cd "$(git rev-parse --show-toplevel)"
+
+echo "==> pre-push: go build"
+go build ./...
+
+echo "==> pre-push: go vet"
+go vet ./...
+
+if command -v golangci-lint >/dev/null 2>&1; then
+    echo "==> pre-push: golangci-lint"
+    golangci-lint run ./...
+else
+    echo "==> pre-push: 跳过 golangci-lint（未安装；make lint 可自动安装）"
+fi
+
+if command -v govulncheck >/dev/null 2>&1; then
+    echo "==> pre-push: govulncheck"
+    govulncheck ./...
+else
+    echo "==> pre-push: 跳过 govulncheck（未安装；make vuln 可自动安装）"
+fi
+
+echo "==> pre-push: go test -race"
+go test -race ./...
+
+echo "==> pre-push: 全部通过"

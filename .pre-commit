@@ -1,0 +1,30 @@
+#!/bin/sh
+# pre-commit：快速拦截（秒级）。完整检查（test/lint/vuln）在 pre-push 与 CI。
+# 安装：make hooks
+set -e
+cd "$(git rev-parse --show-toplevel)"
+
+# 仅在暂存内容涉及 Go 代码或模块文件时执行。
+staged=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.go$|^go\.(mod|sum)$' || true)
+if [ -z "$staged" ]; then
+    exit 0
+fi
+
+echo "==> pre-commit: gofmt 检查"
+unformatted=$(echo "$staged" | grep '\.go$' | xargs gofmt -l 2>/dev/null || true)
+if [ -n "$unformatted" ]; then
+    echo "以下文件需要 gofmt（make fmt）:"
+    echo "$unformatted"
+    exit 1
+fi
+
+echo "==> pre-commit: go mod tidy 幂等检查"
+go mod tidy
+if ! git diff --quiet -- go.mod go.sum; then
+    echo "go mod tidy 产生了变更（依赖不一致），请检查并一并提交:"
+    git diff --stat -- go.mod go.sum
+    exit 1
+fi
+
+echo "==> pre-commit: go vet"
+go vet ./...
