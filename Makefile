@@ -41,7 +41,7 @@ cover-integration: compose-up ## 单元 + 集成合并覆盖率（库代码口�
 	@$(GO) test -coverpkg="$(COV_PKGS)" -coverprofile=/tmp/cov-unit.out ./... > /dev/null
 	@RBAC_TEST_MYSQL_DSN='$(MYSQL_DSN)' RBAC_TEST_REDIS_ADDR='$(REDIS_ADDR)' \
 		$(GO) test -coverpkg="$(COV_PKGS)" -coverprofile=/tmp/cov-int.out \
-		./interna./internal/repository/gormrepo/ ./cache/redis/ ./modules/tenant/ > /dev/null
+		./internal/repository/gormrepo/ ./cache/redis/ ./modules/tenant/ > /dev/null
 	@echo "mode: set" > coverage.out
 	@grep -h -v '^mode' /tmp/cov-unit.out /tmp/cov-int.out >> coverage.out
 	@$(GO) tool cover -func=coverage.out | tail -1

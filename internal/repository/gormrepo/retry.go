@@ -1,44 +1,10 @@
 package gormrepo
 
-import (
-	"errors"
-	"time"
+import "github.com/animacaeli/go-rbac/internal/repository"
 
-	"github.com/go-sql-driver/mysql"
+// 死锁重试（1213）与重复键翻译（1062）的共享实现位于 internal/repository
+// （与 tenant 模块共用；本包不再持有独立副本）。
+var (
+	runWithDeadlockRetry = repository.DeadlockRetry
+	translateDuplicate   = repository.TranslateDuplicate
 )
-
-// deadlockRetryAttempts / deadlockBackoff：授权变更管理接口的并发死锁重试参数。
-// 背景：REPEATABLE READ 下，Grant 事务按 (subject_id, permission_id) 唯一索引
-// 扫描的 next-key 锁，在相邻 subject_id（如 91001 / 91002 的索引条目相邻）
-// 并发授权时可能在共享间隙边界上死锁（MySQL 1213）。管理操作低频且事务
-// 幂等（重试会重新评估活跃授权状态），有界重试是正确且安全的应对。
-const (
-	deadlockRetryAttempts = 3
-	deadlockBaseBackoff   = 5 * time.Millisecond
-)
-
-func isDeadlock(err error) bool {
-	var me *mysql.MySQLError
-	return errors.As(err, &me) && me.Number == 1213
-}
-
-// runWithDeadlockRetry 执行事务体，遇到 MySQL 死锁（1213）时退避重试。
-func runWithDeadlockRetry(fn func() error) error {
-	var err error
-	for attempt := 0; attempt < deadlockRetryAttempts; attempt++ {
-		if err = fn(); err == nil {
-			return nil
-		}
-		if !isDeadlock(err) {
-			return err
-		}
-		time.Sleep(deadlockBaseBackoff * time.Duration(attempt+1))
-	}
-	return err
-}
-
-// isDuplicateEntry 报告 MySQL 唯一键冲突（1062）。
-func isDuplicateEntry(err error) bool {
-	var me *mysql.MySQLError
-	return errors.As(err, &me) && me.Number == 1062
-}

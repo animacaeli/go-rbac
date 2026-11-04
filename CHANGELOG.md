@@ -25,6 +25,15 @@
   消除"集成不计入"导致的覆盖率失真）；CI 增加 `make mocks-check`
   （生成代码与接口定义一致性校验）；App 装配级单测
 
+### Fixed（复审补充）
+
+- `App.Roles().List` 的公共可用性被 internal 迁移打断（参数
+  `repository.RoleFilter` 不可外部命名）：新增 `rbac.RoleFilter` 类型别名恢复
+- 死锁重试助手在 gormrepo 与 tenant 的重复实现合并为
+  `internal/repository` 共享实现（"自包含"规则仅适用于 adapter/cache
+  逃生舱包，tenant 本就依赖 internal）
+- Makefile 中 sed 未转义点导致的路径二次改坏（`./interna./internal/...`）
+
 ### Fixed
 
 - 并发创建同 code 角色的"先查后插"竞态：唯一键冲突现在映射为

@@ -3,14 +3,12 @@ package tenant
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"time"
 
 	"github.com/animacaeli/go-rbac/core"
 	"github.com/animacaeli/go-rbac/internal/repository"
 	"github.com/animacaeli/go-rbac/model"
-	mysqlDriver "github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 )
 
@@ -51,26 +49,8 @@ func (r *Repos) writer(ctx context.Context) (*gorm.DB, string, error) {
 
 func nowUTC() time.Time { return time.Now().UTC() }
 
-// runWithDeadlockRetry：MySQL 1213（RR 间隙锁死锁）有界重试；事务幂等。
-const (
-	deadlockRetryAttempts = 3
-	deadlockBaseBackoff   = 5 * time.Millisecond
-)
-
-func runWithDeadlockRetry(fn func() error) error {
-	var err error
-	for attempt := 0; attempt < deadlockRetryAttempts; attempt++ {
-		if err = fn(); err == nil {
-			return nil
-		}
-		var me *mysqlDriver.MySQLError
-		if !errors.As(err, &me) || me.Number != 1213 {
-			return err
-		}
-		time.Sleep(deadlockBaseBackoff * time.Duration(attempt+1))
-	}
-	return err
-}
+// runWithDeadlockRetry：共享实现（internal/repository.DeadlockRetry）。
+var runWithDeadlockRetry = repository.DeadlockRetry
 
 // ---- RoleRepo ----
 
@@ -91,11 +71,7 @@ func (x roleRepo) Create(ctx context.Context, role *model.Role) error {
 		"created_at":  nowUTC(),
 		"updated_at":  nowUTC(),
 	}).Error; err != nil {
-		var me *mysqlDriver.MySQLError
-		if errors.As(err, &me) && me.Number == 1062 {
-			return repository.ErrDuplicateEntry
-		}
-		return err
+		return repository.TranslateDuplicate(err)
 	}
 	// 回读填充模型字段（含 ID）。
 	created, err := x.FindByCode(ctx, role.Code)

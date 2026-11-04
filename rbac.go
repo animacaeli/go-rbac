@@ -19,6 +19,7 @@ import (
 	"errors"
 
 	"github.com/animacaeli/go-rbac/core"
+	"github.com/animacaeli/go-rbac/internal/repository"
 	"github.com/animacaeli/go-rbac/registry"
 )
 
@@ -50,4 +51,11 @@ var (
 	ErrInvalidPermissionCode = registry.ErrInvalidPermissionCode
 	ErrDuplicateRegistration = registry.ErrDuplicateRegistration
 	ErrInvalidPermissionDef  = registry.ErrInvalidPermissionDef
+)
+
+// 公开数据形状的类型别名：底层类型位于 internal（§3.4），别名让外部
+// 可以命名与构造，而无法实现存储接口。
+type (
+	// RoleFilter 是角色列表过滤条件（App.Roles().List 的入参形状）。
+	RoleFilter = repository.RoleFilter
 )

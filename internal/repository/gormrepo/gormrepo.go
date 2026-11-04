@@ -29,14 +29,6 @@ func New(db *gorm.DB) *Repos { return &Repos{db: db} }
 
 func (r *Repos) writer(ctx context.Context) *gorm.DB { return r.db.WithContext(ctx) }
 
-// translateDuplicate 将 MySQL 1062 翻译为 ErrDuplicateEntry（runWithDeadlockRetry 同文件）。
-func translateDuplicate(err error) error {
-	if isDuplicateEntry(err) {
-		return repository.ErrDuplicateEntry
-	}
-	return err
-}
-
 func notFoundByID(what string, id uint64) error {
 	return fmt.Errorf("%w: %s id=%d", repository.ErrRecordNotFound, what, id)
 }

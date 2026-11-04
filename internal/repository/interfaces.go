@@ -14,6 +14,8 @@ import (
 	"errors"
 	"time"
 
+	mysqlDriver "github.com/go-sql-driver/mysql"
+
 	"github.com/animacaeli/go-rbac/model"
 	"github.com/animacaeli/go-rbac/registry"
 )
@@ -24,6 +26,46 @@ var ErrRecordNotFound = errors.New("rbac: record not found")
 // ErrDuplicateEntry 表示唯一键冲突（并发下的"先查后插"竞态兜底）。
 // 服务层据此映射为领域哨兵错误（如 core.ErrRoleCodeExists）。
 var ErrDuplicateEntry = errors.New("rbac: duplicate entry")
+
+// DeadlockRetry 执行事务体，遇 MySQL 死锁（1213，REPEATABLE READ 间隙锁）
+// 时退避重试。供 gormrepo 与 tenant 模块的幂等事务共用（内部工具，无 API 承诺）。
+func DeadlockRetry(fn func() error) error {
+	var err error
+	for attempt := 0; attempt < deadlockRetryAttempts; attempt++ {
+		if err = fn(); err == nil {
+			return nil
+		}
+		if !isDeadlock(err) {
+			return err
+		}
+		time.Sleep(deadlockRetryBackoff * time.Duration(attempt+1))
+	}
+	return err
+}
+
+const (
+	deadlockRetryAttempts = 3
+	deadlockRetryBackoff  = 5 * time.Millisecond
+)
+
+// isDeadlock / isDuplicateEntry：MySQL 错误码判定（driver 类型断言）。
+func isDeadlock(err error) bool {
+	var me *mysqlDriver.MySQLError
+	return errors.As(err, &me) && me.Number == 1213
+}
+
+func isDuplicateEntry(err error) bool {
+	var me *mysqlDriver.MySQLError
+	return errors.As(err, &me) && me.Number == 1062
+}
+
+// TranslateDuplicate 将唯一键冲突翻译为 ErrDuplicateEntry。
+func TranslateDuplicate(err error) error {
+	if isDuplicateEntry(err) {
+		return ErrDuplicateEntry
+	}
+	return err
+}
 
 // IsDuplicate 报告 err 链上是否为唯一键冲突。
 func IsDuplicate(err error) bool { return errors.Is(err, ErrDuplicateEntry) }
