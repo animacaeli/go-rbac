@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/animacaeli/go-rbac/cache"
+
 	"github.com/animacaeli/go-rbac/core"
 	cachemocks "github.com/animacaeli/go-rbac/test/mocks/cache"
 	coremocks "github.com/animacaeli/go-rbac/test/mocks/core"
@@ -513,4 +515,19 @@ func (s *AuthorizationServiceSuite) TestSync_FailureDeletesReplica() {
 		Return(int64(0), errors.New("db down")).Once()
 	cch.On("Delete", mock.Anything, "rbac:default:epoch").Return(nil).Once()
 	s.Require().Error(sut.SyncEpoch(s.ctx))
+}
+
+// 第六轮审核：Simple 模式（NoopCache）跳过计数器协议——不得产生权威计数器查询
+// （否则每次鉴权 +4 次 DB 查询，违反 Simple 模式的性能契约）。
+func (s *AuthorizationServiceSuite) TestSimpleMode_SkipsCounterProtocol() {
+	// NoopCache + counters mock 未注册任何期望：任何 counters.Get 即 panic。
+	sut := core.NewAuthorizationService(s.authzRepo, s.counters, cache.NoopCache{}, nil, core.NoopMetrics{}, time.Minute)
+	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, "10001").Return(false, nil)
+	s.authzRepo.On("EffectiveRolePermissions", mock.Anything, "10001").Return([]string{"user:list"}, nil)
+	s.authzRepo.On("EffectiveGrantPermissions", mock.Anything, "10001", mock.AnythingOfType("time.Time")).Return(nil, nil)
+	s.authzRepo.On("NearestGrantExpiry", mock.Anything, "10001", mock.AnythingOfType("time.Time")).Return(nil, nil)
+
+	ok, err := sut.HasPermission(s.ctx, subject1, "user:list")
+	s.Require().NoError(err)
+	s.True(ok)
 }

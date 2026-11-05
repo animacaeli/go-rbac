@@ -182,9 +182,20 @@ func (s *AuthorizationService) loadOnce(ctx context.Context, ac AuthorizationCon
 	scope := ac.Scope()
 	subject := ac.SubjectID.String()
 
-	// 生成键协议（§6.2 / §6.1，DB 权威版）：
+	// Simple 模式（NoopCache）：无缓存即无生成键语义——直接回源数据库，
+	// 不走计数器协议（否则每次鉴权额外 +4 次权威计数器查询，Simple 模式
+	// 的性能契约是"仅原有聚合查询"）。
+	if _, simple := s.cch.(cache.NoopCache); simple {
+		set, isSuper, err := s.loadFromDB(ctx, ac)
+		if err != nil {
+			return loaded{}, false, false, err
+		}
+		return loaded{permissions: set, isSuper: isSuper}, false, false, nil
+	}
+
+	// 生成键协议（§6.2 / §6.1，DB 权威版，Cached 模式）：
 	//   - Redis 计数器是 rbac_counters 权威值的缓存副本；
-	//   - 缺失 / 损坏 / 故障 → 从数据库读取权威值并 SetInt 回填缓存
+	//   - 缺失 / 损坏 / 故障 → 从数据库读取权威值并 SetIntMax 单调回填
 	//     （回填的是真实版本号而非重置归零——结构上不存在"重建值与历史
 	//     生成键碰撞"），随后照常走缓存/回源；
 	//   - 任何时刻生成键均取自权威值或其忠实副本：权威值只增不减，
