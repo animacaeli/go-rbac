@@ -359,6 +359,10 @@ func (s *ConsistencySuite) TestCounterEviction_StaleEntryMustNotResurrect() {
 	s.Require().NoError(s.db.Exec(
 		"UPDATE rbac_user_grants SET revoked_at = UTC_TIMESTAMP(3) WHERE subject_id = '95001' AND revoked_at IS NULL",
 	).Error)
+	// 权威语义：直改库也必须伴随权威 epoch 递增（正常路径由变更事务完成）。
+	s.Require().NoError(s.db.Exec(
+		"INSERT INTO rbac_counters (k,v,updated_at) VALUES ('default:epoch',1,UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE v=v+1",
+	).Error)
 
 	// Act-2：读取——旧 perm:v{g} 仍存活且含有 order:export。
 	ok, err = s.app.Authorizer().HasPermission(s.ctx, core.AuthorizationContext{SubjectID: "95001"}, "order:export")

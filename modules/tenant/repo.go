@@ -28,6 +28,8 @@ func newRepos(base repository.Repos, db *gorm.DB) *Repos {
 }
 
 // Assemble 返回满足 repository.Repos 的接口聚合。
+// Counters 复用 base 实现（rbac_counters 为共享表；多租户域信息编码在
+// 计数器键的 scope 前缀中，与 Redis 键同构）。
 func (r *Repos) Assemble() repository.Repos {
 	return repository.Repos{
 		Roles:           roleRepo{r},
@@ -36,6 +38,7 @@ func (r *Repos) Assemble() repository.Repos {
 		RolePermissions: r.base.RolePermissions,
 		Grants:          grantRepo{r},
 		Authorization:   authzRepo{r},
+		Counters:        r.base.Counters,
 	}
 }
 

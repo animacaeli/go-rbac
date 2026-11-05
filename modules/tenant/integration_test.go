@@ -163,7 +163,8 @@ func (s *MigrationContractSuite) TestContract_FreshPath_CoreThenTenantInOnePlan(
 	require.NoError(s.T(), s.db.Raw(
 		"SELECT version FROM schema_migrations ORDER BY module, version",
 	).Scan(&versions).Error)
-	s.Equal([]string{"0001", "0001"}, versions)
+	// Core 0001/0002 + tenant 0001。
+	s.Equal([]string{"0001", "0002", "0001"}, versions)
 }
 
 // IsolationSuite 双租户隔离验证（§2.9 承担项）。

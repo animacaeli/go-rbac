@@ -19,13 +19,14 @@ import (
 // serviceHarness 汇聚三个管理服务测试套件共用的装配逻辑。
 type serviceHarness struct {
 	suite.Suite
-	ctx       context.Context
-	roles     *repositorymocks.MockRoleRepo
-	perms     *repositorymocks.MockPermissionRepo
-	userRoles *repositorymocks.MockUserRoleRepo
-	rolePerms *repositorymocks.MockRolePermissionRepo
-	grants    *repositorymocks.MockUserGrantRepo
-	authzRepo *repositorymocks.MockAuthorizationRepo
+	ctx          context.Context
+	roles        *repositorymocks.MockRoleRepo
+	perms        *repositorymocks.MockPermissionRepo
+	userRoles    *repositorymocks.MockUserRoleRepo
+	rolePerms    *repositorymocks.MockRolePermissionRepo
+	grants       *repositorymocks.MockUserGrantRepo
+	authzRepo    *repositorymocks.MockAuthorizationRepo
+	countersRepo *repositorymocks.MockCountersRepo
 	// authzCacheMock 非 nil 时注入授权服务（观测版本/epoch 递增）；nil 用 NoopCache。
 	authzCacheMock *cachemocks.MockPermissionCache
 	reg            *registry.Registry
@@ -56,6 +57,8 @@ func (h *serviceHarness) setupHarness(grantorMustHold bool) {
 	h.rolePerms = repositorymocks.NewMockRolePermissionRepo(h.T())
 	h.grants = repositorymocks.NewMockUserGrantRepo(h.T())
 	h.authzRepo = repositorymocks.NewMockAuthorizationRepo(h.T())
+	h.countersRepo = repositorymocks.NewMockCountersRepo(h.T())
+	h.countersRepo.On("Get", mock.Anything, mock.Anything).Return(int64(0), nil).Maybe()
 	h.reg = registry.NewRegistry()
 
 	// 授权服务用真实实现 + mock 聚合仓储：
@@ -67,7 +70,7 @@ func (h *serviceHarness) setupHarness(grantorMustHold bool) {
 		h.authzCacheMock.On("InitCounter", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		h.authzCacheMock.On("DeleteByPattern", mock.Anything, mock.Anything).Return(nil).Maybe()
 	}
-	authorizer := core.NewAuthorizationService(h.authzRepo, authzCache, nil, core.NoopMetrics{}, time.Minute)
+	authorizer := core.NewAuthorizationService(h.authzRepo, h.countersRepo, authzCache, nil, core.NoopMetrics{}, time.Minute)
 
 	h.deps = core.ServiceDeps{
 		Roles:           h.roles,
@@ -201,12 +204,11 @@ func (s *RoleServiceSuite) TestSetStatus_Disable_InvalidatesRoleSubjects() {
 	normal := &model.Role{ID: 2, Code: "ops", Status: model.RoleStatusEnabled}
 	s.roles.On("FindByID", mock.Anything, uint64(2)).Return(normal, nil)
 	s.roles.On("SetStatus", mock.Anything, uint64(2), model.RoleStatusDisabled).Return(nil)
-	s.userRoles.On("SubjectIDsOfRole", mock.Anything, uint64(2)).Return([]string{subject}, nil)
 
 	// Act
 	err := s.roleSvc.SetStatus(s.ctx, operator, 2, model.RoleStatusDisabled)
 
-	// Assert：§6.3 角色禁用 → 批量失效关联用户（NoopCache 下为空操作，不报错）。
+	// Assert：P0-2 角色禁用 → epoch 失效（不再逐用户 fan-out）。
 	s.Require().NoError(err)
 }
 
@@ -266,7 +268,10 @@ func (s *RoleServiceSuite) TestSetPermissions_GrantorHolds_Replaced() {
 	s.rolePerms.On("SetPermissions", mock.Anything, uint64(2),
 		[]uint64{permsByCode["order:export"].ID, permsByCode["user:list"].ID}).
 		Return(nil)
-	s.userRoles.On("SubjectIDsOfRole", mock.Anything, uint64(2)).Return(nil, nil)
+	// P0-2：角色级失效走 epoch（权威值已同事务递增，此处同步副本）。
+	if s.authzCacheMock != nil {
+		s.authzCacheMock.On("Incr", mock.Anything, "rbac:default:epoch").Return(int64(1), nil)
+	}
 
 	// Act
 	err := s.roleSvc.SetPermissions(s.ctx, operator, 2, codes)
@@ -300,7 +305,6 @@ func (s *RoleServiceSuite) TestSetPermissions_GrantorIsSuper_BypassConstraint() 
 		Return([]model.Permission{permsByCode["order:export"]}, nil)
 	s.expectGrantorIsSuper() // Effective* 未注册：超管不得走聚合查询
 	s.rolePerms.On("SetPermissions", mock.Anything, uint64(2), mock.Anything).Return(nil)
-	s.userRoles.On("SubjectIDsOfRole", mock.Anything, uint64(2)).Return(nil, nil)
 
 	// Act
 	err := s.roleSvc.SetPermissions(s.ctx, operator, 2, []string{"order:export"})
@@ -358,7 +362,6 @@ func (s *RoleServiceSuite) TestSetPermissions_ConstraintDisabled_GrantorNeedNotH
 		Return([]model.Permission{permsByCode["order:export"]}, nil)
 	// authzRepo 未注册任何期望：约束关闭时不做持权检查。
 	s.rolePerms.On("SetPermissions", mock.Anything, uint64(2), mock.Anything).Return(nil)
-	s.userRoles.On("SubjectIDsOfRole", mock.Anything, uint64(2)).Return(nil, nil)
 
 	// Act
 	err := s.roleSvc.SetPermissions(s.ctx, operator, 2, []string{"order:export"})

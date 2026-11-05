@@ -37,11 +37,11 @@ var (
 	ErrPermissionDisabled            = errors.New("rbac: permission disabled or deprecated")
 	ErrGrantNotFound                 = errors.New("rbac: active grant not found")
 	ErrInvalidGrantExpiry            = errors.New("rbac: grant expiry must be in the future")
-	ErrInvalidationFailedAfterCommit = errors.New("rbac: invalidation failed after commit (safe to retry the same operation)")
+	ErrInvalidationFailedAfterCommit = errors.New("rbac: invalidation failed after commit (retry semantics vary by operation, see docs)")
 
 	// ErrAuditFailedAfterCommit 表示数据库变更已提交、但审计事件写入失败
 	// （Strict 策略，§2.10/§6.7）。重试同一操作是安全的。
-	ErrAuditFailedAfterCommit = errors.New("rbac: audit record failed after commit (safe to retry the same operation)")
+	ErrAuditFailedAfterCommit = errors.New("rbac: audit record failed after commit (audit gap possible under Strict; see docs)")
 
 	ErrGrantorPermissionDenied = errors.New("rbac: grantor does not hold the permission being granted")
 

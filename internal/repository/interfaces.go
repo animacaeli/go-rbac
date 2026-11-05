@@ -160,6 +160,17 @@ type AuthorizationRepo interface {
 	NearestGrantExpiry(ctx context.Context, subjectID string, now time.Time) (*time.Time, error)
 }
 
+// CountersRepo 是数据库权威版本号访问（§6.2，外部审核 P0-1 第一阶段）。
+// epoch 与主体版本在授权变更的同一事务内递增；Redis 计数器只是本表值的
+// 缓存副本（丢失/损坏时经 Get 回填，SetInt 写回缓存层）。
+type CountersRepo interface {
+	// Get 返回计数器当前值（缺失 = 0）。读路径缓存回退时使用。
+	Get(ctx context.Context, key string) (int64, error)
+	// Bump 在独立事务内递增（用于服务层兜底；正常路径应由变更事务内的
+	// BumpTx 完成同事务递增）。
+	Bump(ctx context.Context, key string) error
+}
+
 // Repos 聚合全部数据访问实现，由 rbac.New 组装。
 type Repos struct {
 	Roles           RoleRepo
@@ -168,4 +179,5 @@ type Repos struct {
 	RolePermissions RolePermissionRepo
 	Grants          UserGrantRepo
 	Authorization   AuthorizationRepo
+	Counters        CountersRepo
 }

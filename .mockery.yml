@@ -15,6 +15,7 @@ packages:
       RolePermissionRepo: {}
       UserGrantRepo: {}
       AuthorizationRepo: {}
+      CountersRepo: {}
   github.com/animacaeli/go-rbac/cache:
     config:
       dir: test/mocks/cache

@@ -43,12 +43,13 @@ import (
 //
 // TTL 是垃圾回收机制而非正确性机制：旧生成键在 TTL 内自然过期。
 type AuthorizationService struct {
-	repo    repository.AuthorizationRepo
-	cch     cache.PermissionCache
-	checker SubjectStatusChecker
-	metrics Metrics
-	ttl     time.Duration
-	sf      singleflight.Group
+	repo     repository.AuthorizationRepo
+	counters repository.CountersRepo
+	cch      cache.PermissionCache
+	checker  SubjectStatusChecker
+	metrics  Metrics
+	ttl      time.Duration
+	sf       singleflight.Group
 
 	// tenantRequired 由 tenant 模块经 rbac.App.EnableTenantScope 打开：
 	// AuthorizationContext.TenantID 从"必须为空"变为"必须提供"（§2.9）。
@@ -84,6 +85,7 @@ var _ Authorizer = (*AuthorizationService)(nil)
 // NewAuthorizationService 构造授权服务。ttl <= 0 时默认 5 分钟。
 func NewAuthorizationService(
 	repo repository.AuthorizationRepo,
+	counters repository.CountersRepo,
 	cch cache.PermissionCache,
 	checker SubjectStatusChecker,
 	metrics Metrics,
@@ -98,7 +100,7 @@ func NewAuthorizationService(
 	if ttl <= 0 {
 		ttl = 5 * time.Minute
 	}
-	return &AuthorizationService{repo: repo, cch: cch, checker: checker, metrics: metrics, ttl: ttl}
+	return &AuthorizationService{repo: repo, counters: counters, cch: cch, checker: checker, metrics: metrics, ttl: ttl}
 }
 
 // loaded 是一次授权状态装载的结果。
@@ -180,33 +182,36 @@ func (s *AuthorizationService) loadOnce(ctx context.Context, ac AuthorizationCon
 	scope := ac.Scope()
 	subject := ac.SubjectID.String()
 
-	// 生成键基线协议（§6.2 / §6.1）：
-	//   - 计数器读取失败（含值损坏）→ 缓存状态不可信：回源数据库且不写回（§6.6）；
-	//   - 计数器缺失（首写前或被淘汰）→ 不读权限缓存，进 flight 建立基线后再写；
-	//     使"计数器被淘汰"不可能命中旧生成键下已撤销的权限集合
-	//     （版本号只允许落后于数据、永不允许回退——键丢失即回退，必须旁路）。
-	epoch, epochOK, err := s.cch.GetInt(ctx, epochKey(scope))
-	if err != nil {
-		set, isSuper, err := s.loadFromDB(ctx, ac)
-		return loaded{permissions: set, isSuper: isSuper}, false, false, err
-	}
-	version, versionOK, err := s.cch.GetInt(ctx, subjectVersionKey(scope, subject))
-	if err != nil {
-		set, isSuper, err := s.loadFromDB(ctx, ac)
-		return loaded{permissions: set, isSuper: isSuper}, false, false, err
-	}
-
-	var refGen int64
-	trusted := epochOK && versionOK
-	if trusted {
-		refGen = generationKey(epoch, version)
-		if cached, ok, err := s.cch.Get(ctx, subjectPermKey(scope, subject, refGen)); err == nil && ok {
-			return parseCached(cached), true, false, nil
+	// 生成键协议（§6.2 / §6.1，DB 权威版）：
+	//   - Redis 计数器是 rbac_counters 权威值的缓存副本；
+	//   - 缺失 / 损坏 / 故障 → 从数据库读取权威值并 SetInt 回填缓存
+	//     （回填的是真实版本号而非重置归零——结构上不存在"重建值与历史
+	//     生成键碰撞"），随后照常走缓存/回源；
+	//   - 任何时刻生成键均取自权威值或其忠实副本：权威值只增不减，
+	//     旧生成键下的陈旧条目天然不可达。
+	epoch, epochOK, eErr := s.cch.GetInt(ctx, epochKey(scope))
+	version, versionOK, vErr := s.cch.GetInt(ctx, subjectVersionKey(scope, subject))
+	if eErr != nil || vErr != nil || !epochOK || !versionOK {
+		var err error
+		epoch, version, err = s.recoverCountersFromDB(ctx, scope, subject, eErr, vErr)
+		if err != nil {
+			// 数据库也不可用：回源鉴权数据（不读缓存），fail-closed 语义由
+			// 聚合查询错误承载。
+			set, isSuper, dbErr := s.loadFromDB(ctx, ac)
+			if dbErr != nil {
+				return loaded{}, false, false, dbErr
+			}
+			return loaded{permissions: set, isSuper: isSuper}, false, false, nil
 		}
 	}
-	// 未命中 / 计数器缺失 / 故障 → singleflight 合并回源（§6.8）。
+
+	refGen := generationKey(epoch, version)
+	if cached, ok, err := s.cch.Get(ctx, subjectPermKey(scope, subject, refGen)); err == nil && ok {
+		return parseCached(cached), true, false, nil
+	}
+	// 未命中 / 故障 → singleflight 合并回源（§6.8）。
 	v, err, _ := s.sf.Do(scope+"/"+subject, func() (any, error) {
-		return s.aggregateAndCache(ctx, ac, refGen, trusted)
+		return s.aggregateAndCache(ctx, ac, refGen)
 	})
 	if err != nil {
 		return loaded{}, false, false, err
@@ -237,34 +242,13 @@ func parseCached(cached []string) loaded {
 	return loaded{permissions: set}
 }
 
-// aggregateAndCache 在 singleflight 内执行：建立计数器基线（缺失时）→
-// 读取当前生成键 → 二次探测缓存 → 数据库聚合 → 复核生成键未变 → 写回。
-// refGen 为外层快路径读到的参考生成键；trusted=false 表示外层计数器缺失
-// （首写或被淘汰），此时没有可信参考，flight 以自建基线后的生成键为准。
-func (s *AuthorizationService) aggregateAndCache(ctx context.Context, ac AuthorizationContext, refGen int64, trusted bool) (aggregateResult, error) {
+// aggregateAndCache 在 singleflight 内执行：二次探测缓存 → 数据库聚合 →
+// 复核生成键未变 → 写回。refGen 为外层已确认（缓存副本或 DB 权威值）的生成键。
+func (s *AuthorizationService) aggregateAndCache(ctx context.Context, ac AuthorizationContext, refGen int64) (aggregateResult, error) {
 	scope := ac.Scope()
 	subject := ac.SubjectID.String()
 
-	// 基线协议（§6.2）：缺失的计数器 SETNX 0 重建；若为新建（键曾丢失），
-	// 重建值可能与历史生成键碰撞——必须先清洗受影响的权限条目，再继续。
-	if err := s.ensureCounters(ctx, scope, subject); err != nil {
-		// 无法建立基线 → 数据库聚合但不写回（§6.6）。
-		return s.aggregateUncached(ctx, ac)
-	}
-	gen, ok, err := s.readGeneration(ctx, scope, subject)
-	if err != nil || !ok {
-		return s.aggregateUncached(ctx, ac)
-	}
-	if trusted && gen != refGen {
-		// 外层读取后已发生变更 → 丢弃重走流程（§6.2 第 5 步）。
-		set, _, _, aggErr := s.aggregate(ctx, ac, time.Now().UTC())
-		if aggErr != nil {
-			return aggregateResult{}, aggErr
-		}
-		return aggregateResult{set: set, unstable: true}, nil
-	}
-
-	if cached, hit, err := s.cch.Get(ctx, subjectPermKey(scope, subject, gen)); err == nil && hit {
+	if cached, hit, err := s.cch.Get(ctx, subjectPermKey(scope, subject, refGen)); err == nil && hit {
 		l := parseCached(cached)
 		return aggregateResult{set: l.permissions, isSuper: l.isSuper}, nil
 	}
@@ -275,7 +259,7 @@ func (s *AuthorizationService) aggregateAndCache(ctx context.Context, ac Authori
 	}
 	if isSuper {
 		// 超管：缓存哨兵集合（TTL 走默认值），Has* 恒真、GetPermissions 空集合。
-		_ = s.cch.Set(ctx, subjectPermKey(scope, subject, gen), []string{superAdminSentinel}, s.ttl)
+		_ = s.cch.Set(ctx, subjectPermKey(scope, subject, refGen), []string{superAdminSentinel}, s.ttl)
 		return aggregateResult{set: map[string]struct{}{}, isSuper: true}, nil
 	}
 
@@ -291,10 +275,20 @@ func (s *AuthorizationService) aggregateAndCache(ctx context.Context, ac Authori
 		return aggregateResult{set: set}, nil
 	}
 
-	// 写回前复核生成键（§6.2 第 5 步 / §6.4 写前复核）。
-	gen2, ok, err := s.readGeneration(ctx, scope, subject)
-	if err != nil || !ok || gen2 != gen {
-		return aggregateResult{set: set}, nil // 无法复核 / 已变 → 数据有效但不写回
+	// 写回前复核生成键（§6.2 第 5 步 / §6.4 写前复核）：
+	// 副本可读则以副本比较；副本不可读则以 DB 权威值比较
+	// （权威值 ≥ 写入时生成键 → 允许写回旧键是安全的：读路径只会用
+	// 更高的生成键，写回的旧键天然不被命中——直接跳过写回更简单）。
+	gen2, ok, err := s.readCachedGeneration(ctx, scope, subject)
+	if err != nil || !ok {
+		// 副本不可读：以 DB 权威值兜底比较。
+		dbEpoch, e1 := s.counters.Get(ctx, dbEpochKey(scope))
+		dbVersion, e2 := s.counters.Get(ctx, dbSubjectVersionKey(scope, subject))
+		if e1 != nil || e2 != nil || generationKey(dbEpoch, dbVersion) != refGen {
+			return aggregateResult{set: set}, nil
+		}
+	} else if gen2 != refGen {
+		return aggregateResult{set: set}, nil
 	}
 
 	ttl := s.ttl
@@ -304,43 +298,36 @@ func (s *AuthorizationService) aggregateAndCache(ctx context.Context, ac Authori
 		}
 	}
 	// 缓存写失败不影响本次鉴权结果（下次回源即可）。
-	_ = s.cch.Set(ctx, subjectPermKey(scope, subject, gen), flatten(set), ttl)
+	_ = s.cch.Set(ctx, subjectPermKey(scope, subject, refGen), flatten(set), ttl)
 	return aggregateResult{set: set}, nil
 }
 
-// ensureCounters 对缺失的计数器建立 0 基线（SETNX）。
-// 新建（键曾丢失）即触发清洗：
-//   - epoch 新建 → 该授权域全部权限条目失效（全局生成键不可信）；
-//   - version 新建 → 该主体权限条目失效。
-//
-// 清洗使重建后的生成键命名空间从零开始，历史陈旧条目不可达。
-// 已知残余窗口：SETNX 与清洗完成之间，并发读者可能读到陈旧条目
-// （毫秒级，需在计数器被淘汰后恰好发生；运维上以 volatile-*/noeviction
-// 淘汰策略使计数器（唯一无 TTL 键族）不可淘汰为第一道防线）。
-func (s *AuthorizationService) ensureCounters(ctx context.Context, scope, subject string) error {
-	epochCreated, err := s.cch.InitCounter(ctx, epochKey(scope))
+// recoverCountersFromDB 从数据库读取权威 epoch/版本并回填缓存副本。
+// 返回值即权威生成键的两个分量。回填失败（Redis 写失败）不致命：
+// 生成键仍以权威值参与本次判断，仅下次读仍需回退。
+func (s *AuthorizationService) recoverCountersFromDB(ctx context.Context, scope, subject string, eErr, vErr error) (epoch, version int64, err error) {
+	epoch, err = s.counters.Get(ctx, dbEpochKey(scope))
 	if err != nil {
-		return err
+		return 0, 0, fmt.Errorf("rbac: recover epoch from db: %w", err)
 	}
-	if epochCreated {
-		if err := s.cch.DeleteByPattern(ctx, "rbac:"+scope+":subject:*:perm:*"); err != nil {
-			return err
-		}
-	}
-	versionCreated, err := s.cch.InitCounter(ctx, subjectVersionKey(scope, subject))
+	version, err = s.counters.Get(ctx, dbSubjectVersionKey(scope, subject))
 	if err != nil {
-		return err
+		return 0, 0, fmt.Errorf("rbac: recover subject version from db: %w", err)
 	}
-	if versionCreated {
-		if err := s.cch.DeleteByPattern(ctx, "rbac:"+scope+":subject:"+subject+":perm:*"); err != nil {
-			return err
-		}
+	// 值损坏（eErr/vErr）时先删再写，避免类型错误阻塞 SetInt。
+	if eErr != nil {
+		_ = s.cch.Delete(ctx, epochKey(scope))
 	}
-	return nil
+	if vErr != nil {
+		_ = s.cch.Delete(ctx, subjectVersionKey(scope, subject))
+	}
+	_ = s.cch.SetInt(ctx, epochKey(scope), epoch)
+	_ = s.cch.SetInt(ctx, subjectVersionKey(scope, subject), version)
+	return epoch, version, nil
 }
 
-// readGeneration 读取当前生成键；ok=false 表示计数器缺失（不可信）。
-func (s *AuthorizationService) readGeneration(ctx context.Context, scope, subject string) (int64, bool, error) {
+// readCachedGeneration 读副本生成键；ok=false 表示副本缺失/不可读。
+func (s *AuthorizationService) readCachedGeneration(ctx context.Context, scope, subject string) (int64, bool, error) {
 	epoch, epochOK, err := s.cch.GetInt(ctx, epochKey(scope))
 	if err != nil || !epochOK {
 		return 0, false, err
@@ -352,13 +339,11 @@ func (s *AuthorizationService) readGeneration(ctx context.Context, scope, subjec
 	return generationKey(epoch, version), true, nil
 }
 
-// aggregateUncached 聚合数据库且不读写缓存。
-func (s *AuthorizationService) aggregateUncached(ctx context.Context, ac AuthorizationContext) (aggregateResult, error) {
-	set, isSuper, err := s.loadFromDB(ctx, ac)
-	if err != nil {
-		return aggregateResult{}, err
-	}
-	return aggregateResult{set: set, isSuper: isSuper}, nil
+// DB 权威计数器键（rbac_counters.k）：与 Redis 键后缀同构、去前缀。
+func dbEpochKey(scope string) string { return scope + ":epoch" }
+
+func dbSubjectVersionKey(scope, subject string) string {
+	return scope + ":subject:" + subject + ":version"
 }
 
 // loadFromDB 直接回源数据库（不读不写缓存），返回集合与超管判定。
@@ -531,17 +516,13 @@ func (s *AuthorizationService) IncrSubjectVersion(ctx context.Context, subjectID
 	atomic.AddInt64(&s.inv.attempts, 1)
 	scope := scopeOf(ctx)
 	subject := subjectID.String()
-	newVersion, err := s.cch.Incr(ctx, subjectVersionKey(scope, subject))
-	if err != nil {
+	// 权威版本已在变更事务内递增（rbac_counters）；此处仅同步 Redis 副本。
+	// 同步失败 → 删除副本，迫使读路径回退 DB 权威值（正确性不受影响，
+	// 该主体短暂失去缓存加速）。
+	if _, err := s.cch.Incr(ctx, subjectVersionKey(scope, subject)); err != nil {
 		atomic.AddInt64(&s.inv.failures, 1)
+		_ = s.cch.Delete(ctx, subjectVersionKey(scope, subject))
 		return err
-	}
-	// 自愈双保险（§6.2）：删除新生成键上的旧条目——正常情况下该键本就
-	// 即将失效；异常情况下（计数器曾被淘汰后 INCR-from-missing 复位到 1，
-	// 与历史版本 1 的生成键碰撞）这恰好清掉可能复活的旧权限集合。
-	epoch, ok, err := s.cch.GetInt(ctx, epochKey(scope))
-	if err == nil && ok {
-		_ = s.cch.Delete(ctx, subjectPermKey(scope, subject, generationKey(epoch, newVersion)))
 	}
 	return nil
 }
@@ -567,19 +548,11 @@ func (s *AuthorizationService) IncrEpoch(ctx context.Context) error {
 	// epoch 键被淘汰后 INCR-from-missing 会重建为 1，与历史 epoch=1 时代的
 	// (1, vN) 生成键碰撞且读者信任"在场"计数器——先 SETNX 探测，新建即
 	// 清洗该域全部权限条目，再递增。清洗本身就是一次额外失效，语义安全。
-	created, err := s.cch.InitCounter(ctx, epochKey(scope))
-	if err != nil {
-		atomic.AddInt64(&s.inv.failures, 1)
-		return err
-	}
-	if created {
-		if err := s.cch.DeleteByPattern(ctx, "rbac:"+scope+":subject:*:perm:*"); err != nil {
-			atomic.AddInt64(&s.inv.failures, 1)
-			return err
-		}
-	}
+	// 权威 epoch 已在变更事务内递增；此处仅同步副本，失败即删副本
+	// （读路径回退 DB 权威值——不存在重建碰撞，DB 值只增不减）。
 	if _, err := s.cch.Incr(ctx, epochKey(scope)); err != nil {
 		atomic.AddInt64(&s.inv.failures, 1)
+		_ = s.cch.Delete(ctx, epochKey(scope))
 		return err
 	}
 	return nil

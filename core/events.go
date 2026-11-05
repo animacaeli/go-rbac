@@ -2,7 +2,9 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,7 +26,11 @@ const (
 )
 
 // Event 描述一次授权体系变更：操作人、目标对象、变更内容、时间（§2.10）。
+// ID 为进程内生成的唯一标识（事件类型 + 纳秒时间戳 + 随机后缀），
+// 供审计消费端做幂等去重（同一重试产生不同 ID——重试产生新的历史记录
+// 是文档化语义，见各服务方法注释）。
 type Event struct {
+	ID       string `json:"id"`
 	Type     EventType
 	Operator SubjectID
 	TenantID string
@@ -35,9 +41,12 @@ type Event struct {
 	At     time.Time
 }
 
-// NewEvent 构造事件并填充时间。
+var eventSeq atomic.Uint64
+
+// NewEvent 构造事件并填充时间与唯一 ID。
 func NewEvent(t EventType, operator AuthorizationContext, target string, detail map[string]string) Event {
 	return Event{
+		ID:       fmt.Sprintf("%s-%d-%d", t, time.Now().UnixNano(), eventSeq.Add(1)),
 		Type:     t,
 		Operator: operator.SubjectID,
 		TenantID: operator.TenantID,

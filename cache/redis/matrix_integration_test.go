@@ -186,6 +186,8 @@ func (s *MatrixSuite) TestRow05_CounterEvicted_NoResurrect() {
 
 	s.Require().NoError(s.rdb.Del(s.ctx, "rbac:default:epoch").Err())
 	s.Require().NoError(s.db.Exec("UPDATE rbac_user_grants SET revoked_at = UTC_TIMESTAMP(3) WHERE subject_id='m05' AND revoked_at IS NULL").Error)
+	s.Require().NoError(s.db.Exec(
+		"INSERT INTO rbac_counters (k,v,updated_at) VALUES ('default:epoch',1,UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE v=v+1").Error)
 
 	ok, err := s.app.Authorizer().HasPermission(s.ctx, s.ac("m05"), "order:export")
 	s.Require().NoError(err)
@@ -200,6 +202,8 @@ func (s *MatrixSuite) TestRow06_CounterCorrupt_NoResurrect() {
 
 	s.Require().NoError(s.rdb.Set(s.ctx, "rbac:default:subject:m06:version", "corrupt!!!", 0).Err())
 	s.Require().NoError(s.db.Exec("UPDATE rbac_user_grants SET revoked_at = UTC_TIMESTAMP(3) WHERE subject_id='m06' AND revoked_at IS NULL").Error)
+	s.Require().NoError(s.db.Exec(
+		"INSERT INTO rbac_counters (k,v,updated_at) VALUES ('default:subject:m06:version',1,UTC_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE v=v+1").Error)
 
 	ok, err := s.app.Authorizer().HasPermission(s.ctx, s.ac("m06"), "order:export")
 	s.Require().NoError(err)
@@ -294,4 +298,47 @@ func (s *MatrixSuite) TestRow11_CrossTenant_Rejected() {
 // 行 12：平台超管与租户超管边界 —— 同上，位于 tenant 套件。
 func (s *MatrixSuite) TestRow12_SuperAdminBoundaries() {
 	s.T().Skip("完整断言位于 modules/tenant TestIsolationSuite（同一 CI 门禁运行）")
+}
+
+// P1-1 专项（外部审核第三轮）：多实例并发恢复。
+// 两个服务实例共享同一 MySQL/Redis；计数器副本被淘汰后，两实例并发恢复
+// 必须从 DB 权威值收敛（SetInt 幂等），且不产生陈旧命中。
+func (s *MatrixSuite) TestRow13_MultiInstanceConcurrentRecovery() {
+	ctx := context.Background()
+	s.subjectWithPerms("m13", "r13", "user:list")
+	m1 := s.app
+	// 第二实例：同一 DB + 同一 Redis 的独立 App。
+	m2, err := rbac.New(
+		rbac.WithDB(s.db),
+		rbac.WithPermissionRegistry(s.reg),
+		rbac.WithCache(rediscache.New(s.rdb)),
+	)
+	s.Require().NoError(err)
+
+	ok1, err := m1.Authorizer().HasPermission(ctx, s.ac("m13"), "user:list")
+	s.Require().NoError(err)
+	s.True(ok1)
+
+	// 淘汰计数器副本 + 数据库撤销角色（同事务语义：变更与权威版本递增一并落库）。
+	s.Require().NoError(s.rdb.Del(ctx, "rbac:default:subject:m13:version").Err())
+	s.Require().NoError(s.db.Exec("DELETE FROM rbac_user_roles WHERE subject_id='m13'").Error)
+	s.Require().NoError(s.db.Exec(
+		"INSERT INTO rbac_counters (k,v,updated_at) VALUES ('default:subject:m13:version',1,UTC_TIMESTAMP(3)) " +
+			"ON DUPLICATE KEY UPDATE v=v+1, updated_at=UTC_TIMESTAMP(3)").Error)
+
+	// 两实例并发读取：均以 DB 权威值恢复，均得数据库真相。
+	done := make(chan bool, 2)
+	for _, app := range []*rbac.App{m1, m2} {
+		go func(a *rbac.App) {
+			got, err := a.Authorizer().HasPermission(ctx, s.ac("m13"), "user:list")
+			done <- err == nil && !got
+		}(app)
+	}
+	s.True(<-done, "实例 1 必须读到数据库真相（撤销生效）")
+	s.True(<-done, "实例 2 必须读到数据库真相（撤销生效）")
+
+	// 恢复后缓存收敛到权威生成键。
+	diag, err := m1.CacheDiagnostics(ctx, s.ac("m13"))
+	s.Require().NoError(err)
+	s.True(diag.EpochExists, "副本已从 DB 回填")
 }

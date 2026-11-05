@@ -42,9 +42,7 @@ func (c *fakeFastCache) Incr(_ context.Context, key string) (int64, error) {
 	return c.ints[key], nil
 }
 
-func (c *fakeFastCache) InitCounter(_ context.Context, _ string) (bool, error) { return false, nil }
-
-func (c *fakeFastCache) DeleteByPattern(_ context.Context, _ string) error { return nil }
+func (c *fakeFastCache) SetInt(_ context.Context, _ string, _ int64) error { return nil }
 
 // BenchmarkHasPermission_CacheHit 测量热路径：GetInt×2 + Get 命中即返回。
 func BenchmarkHasPermission_CacheHit(b *testing.B) {
@@ -56,7 +54,7 @@ func BenchmarkHasPermission_CacheHit(b *testing.B) {
 		},
 		ints: map[string]int64{},
 	}
-	sut := core.NewAuthorizationService(repo, cch, nil, core.NoopMetrics{}, time.Minute)
+	sut := core.NewAuthorizationService(repo, nil, cch, nil, core.NoopMetrics{}, time.Minute)
 	ac := core.AuthorizationContext{SubjectID: "10001"}
 	ctx := context.Background()
 

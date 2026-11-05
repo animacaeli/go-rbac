@@ -25,6 +25,10 @@ func NewGrantService(deps ServiceDeps) *GrantService { return &GrantService{deps
 
 // Grant 向用户授予额外权限。
 //
+// Retry 语义（ErrInvalidationFailedAfterCommit 后重试同一操作）：
+// 重试会撤销当前活跃行并插入新的授权历史记录与审计事件（非幂等）。
+// 权威版本随变更事务递增，缓存正确性不受影响；仅历史记录/审计事件条数增加。
+//
 // 校验链：
 //   - subject_id 合法；权限码已在 Registry 注册且数据库中处于启用状态
 //   - 授权者必须持有拟授予权限（§2.2，默认开启；超管除外）

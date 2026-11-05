@@ -128,9 +128,9 @@ func (s *IntegrationSuite) TestMigrate_IdempotentRerun() {
 	s.Require().NoError(err)
 	var count int64
 	s.Require().NoError(s.db.Table("schema_migrations").Count(&count).Error)
-	// Core 0001 + audit/menu/datascope 各 0001（template 为代码声明形态，无迁移）；
+	// Core 0001/0002 + audit/menu/datascope 各 0001（template 无迁移）；
 	// 同一版本只记录一次。
-	s.Equal(int64(4), count, "重跑不产生新的版本记录")
+	s.Equal(int64(5), count, "重跑不产生新的版本记录")
 }
 
 func (s *IntegrationSuite) TestSyncPermissions_IdempotentRerun() {

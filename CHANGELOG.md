@@ -7,6 +7,28 @@
 
 ## [Unreleased]
 
+### Changed（Breaking，DB 权威版本号——外部审核第三轮 P0）
+
+- **版本号权威来源从 Redis 迁移到数据库**（`rbac_counters` 表，迁移 0002）：
+  授权变更与版本递增在同一事务提交；Redis 计数器降级为权威值的缓存副本
+  （丢失/损坏 → DB 回填真实值，不存在重置碰撞；同步失败 → 删副本回退 DB，
+  正确性不受影响）。**提交后失效失败不再产生旧权限放行窗口**——
+  副本落后只影响缓存命中率，不影响正确性
+- `PermissionCache` 接口：新增 `SetInt`，移除 `InitCounter`/`DeleteByPattern`
+  （基线清洗协议随 DB 权威化整体删除）
+- **角色级变更改用 epoch 原子失效**（P0-2）：权限分配/角色禁用/删除/权限
+  禁用/同步一次递增全域 epoch，消除逐用户 fan-out 的部分成功窗口
+  （1k 用户批量失效不再是热点，全域冷启动一次可接受）
+- `Event` 增加 `ID`（幂等消费去重用）；`ErrInvalidationFailedAfterCommit` /
+  `ErrAuditFailedAfterCommit` 文案去除"safe to retry"绝对承诺，
+  README 增加按操作分级的重试语义表
+- 审计策略语义澄清：Strict ≠ 事务性审计（README 对照表）
+
+### Added
+
+- 矩阵门禁第 13 行：双实例共享 DB/Redis 的并发计数器恢复（P1-1）——
+  从 DB 权威值收敛、无陈旧命中（真实 MySQL + Redis，3 遍稳定）
+
 ### Fixed（第三轮自审）
 
 - `IncrEpoch` 重建碰撞洞（第三轮审核发现）：epoch 键被淘汰后经**失效路径**

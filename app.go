@@ -78,7 +78,7 @@ func New(opts ...Option) (*App, error) {
 // 模块（如 tenant）在 Register 期替换仓储后调用。
 func (a *App) rebuildServices() {
 	authorizer := core.NewAuthorizationService(
-		a.repos.Authorization, a.cfg.cch, a.cfg.statusChecker, a.cfg.metrics, a.cfg.cacheTTL,
+		a.repos.Authorization, a.repos.Counters, a.cfg.cch, a.cfg.statusChecker, a.cfg.metrics, a.cfg.cacheTTL,
 	)
 	authorizer.SetTenantScopeRequired(a.tenantScope)
 	a.authorizer = authorizer

@@ -212,7 +212,7 @@ func (s *RoleService) SetStatus(ctx context.Context, operator AuthorizationConte
 	if err := s.deps.Roles.SetStatus(ctx, id, status); err != nil {
 		return err
 	}
-	if err := s.incrRoleSubjectVersions(ctx, id); err != nil {
+	if err := s.deps.invalidateEpoch(ctx); err != nil {
 		return err
 	}
 	return s.deps.record(ctx, NewEvent(EventRoleStatusChanged, operator, role.Code, map[string]string{
@@ -251,6 +251,9 @@ func (s *RoleService) Delete(ctx context.Context, operator AuthorizationContext,
 
 // SetPermissions 将角色权限集合整体替换为给定权限码集合（差量事务）。
 //
+// Retry 语义：整体替换为幂等操作——ErrInvalidationFailedAfterCommit 后
+// 重试同一请求是安全的（结果一致；仅多一条审计事件）。
+//
 // 校验链：
 //   - 角色存在；内置角色禁止权限分配（§7.3）
 //   - 每个权限码必须在 Registry 注册（§2.2：只能引用已注册权限）
@@ -280,7 +283,8 @@ func (s *RoleService) SetPermissions(ctx context.Context, operator Authorization
 	if err := s.deps.RolePermissions.SetPermissions(ctx, roleID, permIDs); err != nil {
 		return err
 	}
-	if err := s.incrRoleSubjectVersions(ctx, roleID); err != nil {
+	// 角色级失效走 epoch（P0-2）：权威值已同事务递增，此处同步 Redis 副本。
+	if err := s.deps.invalidateEpoch(ctx); err != nil {
 		return err
 	}
 	return s.deps.record(ctx, NewEvent(EventRolePermissionsChanged, operator, role.Code, map[string]string{
@@ -345,14 +349,4 @@ func (s *RoleService) resolveEnabledPermissionIDs(ctx context.Context, codes []s
 		ids = append(ids, p.ID)
 	}
 	return ids, nil
-}
-
-// incrRoleSubjectVersions 批量递增角色关联用户的版本号（§6.3 角色权限变更）。
-// 失效失败时返回错误：管理接口不得在失效失败时静默报成功（§6.6）。
-func (s *RoleService) incrRoleSubjectVersions(ctx context.Context, roleID uint64) error {
-	subjects, err := s.deps.UserRoles.SubjectIDsOfRole(ctx, roleID)
-	if err != nil {
-		return fmt.Errorf("rbac: load role subjects for invalidation: %w", err)
-	}
-	return s.deps.invalidateSubjects(ctx, subjects)
 }

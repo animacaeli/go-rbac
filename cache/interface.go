@@ -31,13 +31,8 @@ type PermissionCache interface {
 	// 用于授权变更后的版本号 / epoch 递增（§6.3 失效矩阵）。
 	Incr(ctx context.Context, key string) (int64, error)
 
-	// InitCounter 将整数键初始化为 0（仅当不存在时；SETNX 语义），
-	// 返回是否本次新建。生成键基线协议（§6.2）：新建计数器意味着
-	// 该键曾丢失（淘汰/清空），其重建值可能与历史生成键碰撞——
-	// 调用方必须先以 DeleteByPattern 清洗受影响的权限条目。
-	InitCounter(ctx context.Context, key string) (created bool, err error)
-
-	// DeleteByPattern 按 glob 模式批量删除键（SCAN + DEL）。
-	// 仅用于生成键基线恢复时的权限条目清洗；不接受业务侧随意调用。
-	DeleteByPattern(ctx context.Context, pattern string) error
+	// SetInt 将整数键设置为指定值（DB 权威版本的缓存回填，§6.2）。
+	// 与 Incr 的关系：Incr 为常规同步（副本递增）；SetInt 仅用于
+	// 副本丢失/损坏后从权威值重建。
+	SetInt(ctx context.Context, key string, value int64) error
 }

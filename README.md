@@ -117,6 +117,21 @@ app, err := rbac.New(
 )
 ```
 
+### 版本号权威来源（数据库）
+
+授权变更与权威版本号递增在**同一数据库事务**内提交（`rbac_counters` 表）。
+Redis 中的 epoch / 主体版本只是该权威值的**缓存副本**：
+
+- 副本丢失 / 损坏 / Redis 故障 → 读路径从数据库回填权威值（`SetInt`），
+  生成键永远取真实版本——不存在"重置归零后与历史生成键碰撞"这一类问题
+- 副本同步失败（INCR 失败）→ 删除该副本 → 后续读回退数据库权威值，
+  正确性不受影响（仅该主体短暂失去缓存加速）
+- 角色级变更（权限分配/禁用/删除、权限禁用、同步）递增 **epoch**（一次原子
+  失效全域，消除逐用户 fan-out 的部分成功窗口）；用户级变更递增主体版本
+
+已知边界：Redis 可读但不可写的窄窗口内（如只读副本），副本可能落后于
+权威值直至 TTL；`ErrInvalidationFailedAfterCommit` 语义见下文重试分级。
+
 机制要点（详见设计文档 §6）：
 
 - **两级失效**：用户级版本号递增（授权变更精确失效）+ 全局 epoch 递增
@@ -173,8 +188,16 @@ role, err := tplModule.CreateFromTemplate(ctx, operator, "ops_lead", "ops_42", "
 logs, err := audit.NewQuery(auditModule).List(ctx, audit.Filter{Operator: "10001"})
 ```
 
-Audit 默认 Strict 策略（审计写入失败 → 授权变更操作整体报错）；
-`audit.New(audit.WithLogOnly())` 降级为仅记日志。
+Audit 提供两档失败策略，注意二者**不是**同一保证：
+
+| 策略 | 行为 | 保证 |
+|---|---|---|
+| Strict（默认） | 审计写入失败 → 操作返回 `ErrAuditFailedAfterCommit` | 投递失败可见、可告警；**不是**事务性审计（业务变更已提交，存在审计缺口窗口） |
+| LogOnly | 失败仅记日志，操作继续 | 管理可用性优先，接受审计缺口 |
+
+事务性审计（业务变更与审计事件同事务提交 + Outbox 可靠投递 + 事件 ID
+幂等消费）是规划中的增强（`docs/phase3-evaluation.md`）。`Event.ID` 已就位，
+消费端可据此去重。
 
 ### Menu（§2.7）/ DataScope（§2.8）
 
@@ -236,6 +259,18 @@ _ = tenantMod.SeedSuperAdminInTenant(ctx, "acme", "acme-admin")
   `rbac_role_permissions` / `rbac_user_grants`（v1 冻结稿，见设计文档 §5.2）
 - 表前缀固定 `rbac_`；v1 无 tenant_id（多租户为 Phase 3 可选模块，核心已预留授权域）
 - `app.Migrate(ctx)` 执行 Core → 扩展模块注册顺序的版本化迁移；生产环境建议在发布流程统一执行
+
+### 操作重试语义分级
+
+收到 `ErrInvalidationFailedAfterCommit` 后重试同一操作的正确性因操作而异：
+
+| 操作 | 重试语义 |
+|---|---|
+| SetPermissions / SetStatus / Assign / AssignBatch | **幂等**：重试安全，结果一致 |
+| Grant | 非幂等但安全：撤销旧行+插入新行——重试增加历史记录与审计事件条数，授权结果一致 |
+| Revoke（额外授权撤销） | 首次可能已成功（错误仅来自失效同步）→ 重试返回 `ErrGrantNotFound` 即表示此前已生效 |
+
+权威版本随变更事务递增，任何情况下重试不影响缓存正确性。
 
 ## 管理接口安全责任边界
 

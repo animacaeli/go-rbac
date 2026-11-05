@@ -99,33 +99,10 @@ func (c *Cache) Incr(ctx context.Context, key string) (int64, error) {
 	return v, nil
 }
 
-// InitCounter SETNX 0：建立生成键基线（§6.2）。返回是否本次新建——
-// 新建意味着该计数器曾丢失，重建值可能与历史生成键碰撞（复活旧权限），
-// 调用方必须先清洗受影响的权限条目。
-func (c *Cache) InitCounter(ctx context.Context, key string) (bool, error) {
-	created, err := c.cli.SetNX(ctx, key, 0, 0).Result()
-	if err != nil {
-		return false, fmt.Errorf("rbac/cache/redis: initnx %s: %w", key, err)
+// SetInt 将整数键设置为权威值（副本回填，无 TTL——计数器键族不参与淘汰）。
+func (c *Cache) SetInt(ctx context.Context, key string, value int64) error {
+	if err := c.cli.Set(ctx, key, strconv.FormatInt(value, 10), 0).Err(); err != nil {
+		return fmt.Errorf("rbac/cache/redis: setint %s: %w", key, err)
 	}
-	return created, nil
-}
-
-// DeleteByPattern SCAN + 批量 DEL。
-func (c *Cache) DeleteByPattern(ctx context.Context, pattern string) error {
-	var cursor uint64
-	for {
-		keys, next, err := c.cli.Scan(ctx, cursor, pattern, 500).Result()
-		if err != nil {
-			return fmt.Errorf("rbac/cache/redis: scan %s: %w", pattern, err)
-		}
-		if len(keys) > 0 {
-			if err := c.cli.Del(ctx, keys...).Err(); err != nil {
-				return fmt.Errorf("rbac/cache/redis: del %s: %w", pattern, err)
-			}
-		}
-		cursor = next
-		if cursor == 0 {
-			return nil
-		}
-	}
+	return nil
 }

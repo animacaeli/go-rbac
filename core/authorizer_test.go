@@ -20,6 +20,7 @@ type AuthorizationServiceSuite struct {
 	suite.Suite
 	ctx       context.Context
 	authzRepo *repositorymocks.MockAuthorizationRepo
+	counters  *repositorymocks.MockCountersRepo
 	cch       *cachemocks.MockPermissionCache
 	checker   *coremocks.MockSubjectStatusChecker
 	sut       *core.AuthorizationService
@@ -30,10 +31,9 @@ func (s *AuthorizationServiceSuite) SetupTest() {
 	s.authzRepo = repositorymocks.NewMockAuthorizationRepo(s.T())
 	s.cch = cachemocks.NewMockPermissionCache(s.T())
 	s.checker = coremocks.NewMockSubjectStatusChecker(s.T())
-	s.sut = core.NewAuthorizationService(s.authzRepo, s.cch, nil, core.NoopMetrics{}, 5*time.Minute)
-	// 基线协议：flight 内 SETNX 建立计数器基线（§6.2）；命中路径不调用。
-	s.cch.On("InitCounter", mock.Anything, mock.Anything).Return(false, nil).Maybe()
-	s.cch.On("DeleteByPattern", mock.Anything, mock.Anything).Return(nil).Maybe()
+	s.counters = repositorymocks.NewMockCountersRepo(s.T())
+	s.counters.On("Get", mock.Anything, mock.Anything).Return(int64(0), nil).Maybe()
+	s.sut = core.NewAuthorizationService(s.authzRepo, s.counters, s.cch, nil, core.NoopMetrics{}, 5*time.Minute)
 }
 
 func TestAuthorizationServiceSuite(t *testing.T) { suite.Run(t, new(AuthorizationServiceSuite)) }
@@ -59,6 +59,8 @@ func versionKey(subject string) string {
 func (s *AuthorizationServiceSuite) expectColdRead(subject core.AuthorizationContext, epoch, version int64, rolePerms, grantPerms []string, nearest *time.Time) {
 	sid := subject.SubjectID.String()
 	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, sid).Return(false, nil)
+	// DB 权威计数器兜底（读路径仅在副本缺失/损坏时触达）。
+	s.counters.On("Get", mock.Anything, mock.Anything).Return(int64(0), nil).Maybe()
 	// 快路径 + flight 内二次探测 + 写回前复核：GetInt 可能被多次调用。
 	s.cch.On("GetInt", mock.Anything, "rbac:default:epoch").Return(epoch, true, nil)
 	s.cch.On("GetInt", mock.Anything, versionKey(sid)).Return(version, true, nil)
@@ -165,7 +167,7 @@ func (s *AuthorizationServiceSuite) TestSuperAdmin_HasPermissionAlwaysTrue() {
 
 func (s *AuthorizationServiceSuite) TestSubjectInactive_DeniedWithSentinel() {
 	// Arrange
-	sut := core.NewAuthorizationService(s.authzRepo, s.cch, s.checker, core.NoopMetrics{}, time.Minute)
+	sut := core.NewAuthorizationService(s.authzRepo, s.counters, s.cch, s.checker, core.NoopMetrics{}, time.Minute)
 	s.checker.On("IsSubjectActive", mock.Anything, subject1.SubjectID).
 		Return(false, nil)
 
@@ -179,7 +181,7 @@ func (s *AuthorizationServiceSuite) TestSubjectInactive_DeniedWithSentinel() {
 
 func (s *AuthorizationServiceSuite) TestSubjectStatusCheckError_FailClosed() {
 	// Arrange
-	sut := core.NewAuthorizationService(s.authzRepo, s.cch, s.checker, core.NoopMetrics{}, time.Minute)
+	sut := core.NewAuthorizationService(s.authzRepo, s.counters, s.cch, s.checker, core.NoopMetrics{}, time.Minute)
 	s.checker.On("IsSubjectActive", mock.Anything, subject1.SubjectID).
 		Return(false, errors.New("user service down"))
 
@@ -246,36 +248,6 @@ func (s *AuthorizationServiceSuite) TestCacheHit_RepoNotQueried() {
 	s.True(ok)
 }
 
-// §6.2 第 5 步：写回前生成键变化 → 丢弃结果重走流程，旧生成键不被写入。
-func (s *AuthorizationServiceSuite) TestWriteBackVerify_GenerationChanged_Retry() {
-	// Arrange：version 在第一轮聚合完成后变为 1（模拟并发授权变更）。
-	// 基线协议下 GetInt(version) 的调用序列是确定的：
-	//   #1 快路径(0) → #2 flight 入口 readGeneration(1)（≠refGen → 丢弃重走）
-	//   → #3 第二轮快路径(1) → #4 flight 入口(1) → #5 写回复核(1)
-	sid := "10001"
-	vk := versionKey(sid)
-	s.cch.On("GetInt", mock.Anything, "rbac:default:epoch").Return(int64(0), true, nil)
-	s.cch.On("GetInt", mock.Anything, vk).Return(int64(0), true, nil).Once()
-	s.cch.On("GetInt", mock.Anything, vk).Return(int64(1), true, nil).Times(4)
-	s.cch.On("Get", mock.Anything, mock.Anything).Return(nil, false, nil) // 全部未命中
-	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, sid).Return(false, nil)
-	s.authzRepo.On("EffectiveRolePermissions", mock.Anything, sid).
-		Return([]string{"user:list"}, nil).Twice()
-	s.authzRepo.On("EffectiveGrantPermissions", mock.Anything, sid, mock.AnythingOfType("time.Time")).
-		Return(nil, nil).Twice()
-	s.authzRepo.On("NearestGrantExpiry", mock.Anything, sid, mock.AnythingOfType("time.Time")).
-		Return(nil, nil).Twice()
-	// v0（过期生成键）绝不允许被写入（未注册期望，写入即 panic）；v1 允许。
-	s.cch.On("Set", mock.Anything, permKey(sid, 1), mock.Anything, mock.Anything).Return(nil).Maybe()
-
-	// Act
-	ok, err := s.sut.HasPermission(s.ctx, subject1, "user:list")
-
-	// Assert：两轮聚合（丢弃 + 重走流程），v0 未写入（防旧数据污染新键）。
-	s.Require().NoError(err)
-	s.True(ok)
-}
-
 // §6.5：写回 TTL 不超过最近临时授权到期时间。
 func (s *AuthorizationServiceSuite) TestCacheTTL_CappedByNearestGrantExpiry() {
 	// Arrange
@@ -295,25 +267,6 @@ func (s *AuthorizationServiceSuite) TestCacheTTL_CappedByNearestGrantExpiry() {
 	// Assert
 	s.Require().NoError(err)
 	s.Equal([]string{"order:export"}, perms)
-}
-
-// §6.6：缓存故障（含整数键读取失败）→ 回源数据库，不写回。
-func (s *AuthorizationServiceSuite) TestCacheError_FallsBackToDBWithoutWriteBack() {
-	// Arrange
-	s.cch.On("GetInt", mock.Anything, "rbac:default:epoch").
-		Return(int64(0), false, errors.New("redis down"))
-	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, "10001").Return(false, nil)
-	s.authzRepo.On("EffectiveRolePermissions", mock.Anything, "10001").Return([]string{"user:list"}, nil)
-	s.authzRepo.On("EffectiveGrantPermissions", mock.Anything, "10001", mock.AnythingOfType("time.Time")).Return(nil, nil)
-	s.authzRepo.On("NearestGrantExpiry", mock.Anything, "10001", mock.AnythingOfType("time.Time")).Return(nil, nil)
-	// Set 未注册期望：无法确认生成键时不得写回。
-
-	// Act
-	ok, err := s.sut.HasPermission(s.ctx, subject1, "user:list")
-
-	// Assert
-	s.Require().NoError(err)
-	s.True(ok)
 }
 
 // §6.3：授权变更失效 = 版本 / epoch 递增。
@@ -417,67 +370,129 @@ func (s *AuthorizationServiceSuite) TestStaleReplicaRead_DocumentedLimitation() 
 	s.Empty(cached, "被污染写回的内容为旧集合（该键在 TTL 内持续返回旧数据）")
 }
 
-// P0 回归（外部审核问题 1）：计数器缺失/损坏时，旧生成键下的已撤销权限
-// 不得复活。基线协议：缺失 → 旁路缓存读写，数据库为准。
-func (s *AuthorizationServiceSuite) TestCounterMissing_BypassesStaleCacheEntry() {
-	// Arrange：version 计数器缺失（被淘汰），perm:v0 中残留已撤销权限。
+// P0 回归（外部审核第三轮，DB 权威版）：计数器缺失/损坏 → 从数据库回填
+// 权威值（而非重置归零），生成键取真实版本——历史陈旧条目天然不可达。
+// （本地 mock 组合，避开 SetupTest 泛型桩的先注册匹配。）
+func (s *AuthorizationServiceSuite) TestCounterMissing_RecoversFromDB() {
+	cch := cachemocks.NewMockPermissionCache(s.T())
+	counters := repositorymocks.NewMockCountersRepo(s.T())
+	sut := core.NewAuthorizationService(s.authzRepo, counters, cch, nil, core.NoopMetrics{}, time.Minute)
 	sid := "10001"
-	s.cch.On("GetInt", mock.Anything, "rbac:default:epoch").Return(int64(0), true, nil)
-	s.cch.On("GetInt", mock.Anything, versionKey(sid)).Return(int64(0), false, nil)
-	// Get(perm) 与 Set 均未注册期望：计数器缺失 ⇒ 不得读、不得写缓存。
+
+	cch.On("GetInt", mock.Anything, "rbac:default:epoch").Return(int64(0), false, nil)
+	cch.On("GetInt", mock.Anything, versionKey(sid)).Return(int64(0), false, nil)
+	counters.On("Get", mock.Anything, "default:epoch").Return(int64(2), nil).Twice()
+	counters.On("Get", mock.Anything, "default:subject:10001:version").Return(int64(5), nil).Twice()
+	cch.On("SetInt", mock.Anything, "rbac:default:epoch", int64(2)).Return(nil).Maybe()
+	cch.On("SetInt", mock.Anything, versionKey(sid), int64(5)).Return(nil).Maybe()
+	cch.On("Get", mock.Anything, mock.Anything).Return(nil, false, nil)
 	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, sid).Return(false, nil)
 	s.authzRepo.On("EffectiveRolePermissions", mock.Anything, sid).Return([]string{"user:list"}, nil)
 	s.authzRepo.On("EffectiveGrantPermissions", mock.Anything, sid, mock.AnythingOfType("time.Time")).Return(nil, nil)
 	s.authzRepo.On("NearestGrantExpiry", mock.Anything, sid, mock.AnythingOfType("time.Time")).Return(nil, nil)
-	s.cch.On("InitCounter", mock.Anything, mock.Anything).Return(false, nil)
+	cch.On("Set", mock.Anything, permKey(sid, generation(2, 5)), mock.Anything, mock.Anything).Return(nil).Maybe()
 
-	// Act：即便缓存里有 perm:v0 = [user:list, user:delete]（陈旧），
-	// 也必须以数据库聚合结果为准。
-	perms, err := s.sut.GetPermissions(s.ctx, subject1)
-
-	// Assert：来自数据库的集合（不含未写回）。
+	perms, err := sut.GetPermissions(s.ctx, subject1)
 	s.Require().NoError(err)
 	s.Equal([]string{"user:list"}, perms)
 }
 
-// P0 回归：计数器值损坏 → 缓存状态不可信 → 回源数据库且不写回。
-func (s *AuthorizationServiceSuite) TestCounterCorrupt_FailsClosedToDB() {
+// 计数器损坏：同样 DB 回退（值损坏路径先删再回填）。
+func (s *AuthorizationServiceSuite) TestCounterCorrupt_RecoversFromDB() {
+	cch := cachemocks.NewMockPermissionCache(s.T())
+	counters := repositorymocks.NewMockCountersRepo(s.T())
+	sut := core.NewAuthorizationService(s.authzRepo, counters, cch, nil, core.NoopMetrics{}, time.Minute)
 	sid := "10001"
-	s.cch.On("GetInt", mock.Anything, "rbac:default:epoch").
+
+	cch.On("GetInt", mock.Anything, "rbac:default:epoch").
 		Return(int64(0), false, errors.New("rbac/cache/redis: corrupt integer"))
+	cch.On("GetInt", mock.Anything, versionKey(sid)).
+		Return(int64(0), false, errors.New("rbac/cache/redis: corrupt integer"))
+	counters.On("Get", mock.Anything, mock.Anything).Return(int64(0), nil)
+	cch.On("Delete", mock.Anything, mock.Anything).Return(nil).Maybe()
+	cch.On("SetInt", mock.Anything, mock.Anything, mock.AnythingOfType("int64")).Return(nil).Maybe()
+	cch.On("Get", mock.Anything, mock.Anything).Return(nil, false, nil)
+	cch.On("Set", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, sid).Return(false, nil)
 	s.authzRepo.On("EffectiveRolePermissions", mock.Anything, sid).Return([]string{"user:list"}, nil)
 	s.authzRepo.On("EffectiveGrantPermissions", mock.Anything, sid, mock.AnythingOfType("time.Time")).Return(nil, nil)
 	s.authzRepo.On("NearestGrantExpiry", mock.Anything, sid, mock.AnythingOfType("time.Time")).Return(nil, nil)
 
-	perms, err := s.sut.GetPermissions(s.ctx, subject1)
+	perms, err := sut.GetPermissions(s.ctx, subject1)
 	s.Require().NoError(err)
 	s.Equal([]string{"user:list"}, perms)
 }
 
-// 第三轮审核回归：epoch 键被淘汰后经失效路径重建（而非读路径）时，
-// 重建值 1 与历史 (1, vN) 生成键碰撞——IncrEpoch 必须新建即全域清洗。
-// （SetupTest 的通用桩会先匹配遮蔽精确期望，故本组用例自建 mock 与被测对象。）
-func (s *AuthorizationServiceSuite) TestIncrEpoch_RecreationPurgesScope() {
+// 缓存整体故障 + DB 计数器也不可用：直接回源授权数据，不读缓存。
+func (s *AuthorizationServiceSuite) TestCacheError_FallsBackToDBWithoutWriteBack() {
 	cch := cachemocks.NewMockPermissionCache(s.T())
-	sut := core.NewAuthorizationService(s.authzRepo, cch, nil, core.NoopMetrics{}, time.Minute)
+	counters := repositorymocks.NewMockCountersRepo(s.T())
+	sut := core.NewAuthorizationService(s.authzRepo, counters, cch, nil, core.NoopMetrics{}, time.Minute)
+	sid := "10001"
 
-	cch.On("InitCounter", mock.Anything, "rbac:default:epoch").Return(true, nil).Once()
-	cch.On("DeleteByPattern", mock.Anything, "rbac:default:subject:*:perm:*").Return(nil).Once()
-	cch.On("Incr", mock.Anything, "rbac:default:epoch").Return(int64(1), nil).Once()
+	cch.On("GetInt", mock.Anything, "rbac:default:epoch").
+		Return(int64(0), false, errors.New("redis down"))
+	cch.On("GetInt", mock.Anything, versionKey(sid)).
+		Return(int64(0), false, errors.New("redis down"))
+	counters.On("Get", mock.Anything, mock.Anything).Return(int64(0), errors.New("db also down"))
+	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, sid).Return(false, nil)
+	s.authzRepo.On("EffectiveRolePermissions", mock.Anything, sid).Return([]string{"user:list"}, nil)
+	s.authzRepo.On("EffectiveGrantPermissions", mock.Anything, sid, mock.AnythingOfType("time.Time")).Return(nil, nil)
+	s.authzRepo.On("NearestGrantExpiry", mock.Anything, sid, mock.AnythingOfType("time.Time")).Return(nil, nil)
 
-	// DeleteByPattern 未设 .Maybe：漏清洗即失败。
+	ok, err := sut.HasPermission(s.ctx, subject1, "user:list")
+	s.Require().NoError(err)
+	s.True(ok)
+}
+
+// 写前复核（DB 权威版）：外层权威生成键 (0,0) → flight 内副本已变 (0,1)
+// → 复核不一致 → 丢弃重走；第二轮稳定。
+func (s *AuthorizationServiceSuite) TestWriteBackVerify_GenerationChanged_Retry() {
+	cch := cachemocks.NewMockPermissionCache(s.T())
+	counters := repositorymocks.NewMockCountersRepo(s.T())
+	sut := core.NewAuthorizationService(s.authzRepo, counters, cch, nil, core.NoopMetrics{}, time.Minute)
+	sid := "10001"
+	vk := versionKey(sid)
+
+	cch.On("GetInt", mock.Anything, "rbac:default:epoch").Return(int64(0), true, nil)
+	// 首读 version=0；其后（并发授权变更后）恒为 1。
+	cch.On("GetInt", mock.Anything, vk).Return(int64(0), true, nil).Once()
+	cch.On("GetInt", mock.Anything, vk).Return(int64(1), true, nil)
+	cch.On("Get", mock.Anything, mock.Anything).Return(nil, false, nil)
+	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, sid).Return(false, nil)
+	s.authzRepo.On("EffectiveRolePermissions", mock.Anything, sid).Return([]string{"user:list"}, nil)
+	s.authzRepo.On("EffectiveGrantPermissions", mock.Anything, sid, mock.AnythingOfType("time.Time")).Return(nil, nil)
+	s.authzRepo.On("NearestGrantExpiry", mock.Anything, sid, mock.AnythingOfType("time.Time")).Return(nil, nil)
+	// 仅允许写入复核通过后的 v(0,1)；写入 v(0,0)（过期生成键）即 panic。
+	cch.On("Set", mock.Anything, permKey(sid, generation(0, 1)), mock.Anything, mock.Anything).Return(nil).Maybe()
+
+	ok, err := sut.HasPermission(s.ctx, subject1, "user:list")
+	s.Require().NoError(err)
+	s.True(ok)
+}
+
+// IncrEpoch（DB 权威版）：副本同步语义——INCR 成功即可。
+func (s *AuthorizationServiceSuite) TestIncrEpoch_ReplicaSync() {
+	cch := cachemocks.NewMockPermissionCache(s.T())
+	sut := core.NewAuthorizationService(s.authzRepo, s.counters, cch, nil, core.NoopMetrics{}, time.Minute)
+	cch.On("Incr", mock.Anything, "rbac:default:epoch").Return(int64(3), nil).Once()
 	s.Require().NoError(sut.IncrEpoch(s.ctx))
 }
 
-// 对照：epoch 键在场（SETNX 非新建）时不清洗、只递增。
-func (s *AuthorizationServiceSuite) TestIncrEpoch_Existing_NoPurge() {
+// IncrEpoch 副本同步失败：删副本（迫使读路径回退 DB 权威值）后返回错误。
+func (s *AuthorizationServiceSuite) TestIncrEpoch_SyncFailureDeletesReplica() {
 	cch := cachemocks.NewMockPermissionCache(s.T())
-	sut := core.NewAuthorizationService(s.authzRepo, cch, nil, core.NoopMetrics{}, time.Minute)
+	sut := core.NewAuthorizationService(s.authzRepo, s.counters, cch, nil, core.NoopMetrics{}, time.Minute)
+	cch.On("Incr", mock.Anything, "rbac:default:epoch").Return(int64(0), errors.New("redis down")).Once()
+	cch.On("Delete", mock.Anything, "rbac:default:epoch").Return(nil).Once()
+	s.Require().Error(sut.IncrEpoch(s.ctx))
+}
 
-	cch.On("InitCounter", mock.Anything, "rbac:default:epoch").Return(false, nil).Once()
-	// DeleteByPattern 未注册：清洗即失败（正确路径不应触发）。
-	cch.On("Incr", mock.Anything, "rbac:default:epoch").Return(int64(3), nil).Once()
-
-	s.Require().NoError(sut.IncrEpoch(s.ctx))
+// IncrSubjectVersion 副本同步失败：同样删副本。
+func (s *AuthorizationServiceSuite) TestIncrSubjectVersion_SyncFailureDeletesReplica() {
+	cch := cachemocks.NewMockPermissionCache(s.T())
+	sut := core.NewAuthorizationService(s.authzRepo, s.counters, cch, nil, core.NoopMetrics{}, time.Minute)
+	cch.On("Incr", mock.Anything, versionKey("10001")).Return(int64(0), errors.New("redis down")).Once()
+	cch.On("Delete", mock.Anything, versionKey("10001")).Return(nil).Once()
+	s.Require().Error(sut.IncrSubjectVersion(s.ctx, subject1.SubjectID))
 }
