@@ -29,6 +29,19 @@
 - 矩阵门禁第 13 行：双实例共享 DB/Redis 的并发计数器恢复（P1-1）——
   从 DB 权威值收敛、无陈旧命中（真实 MySQL + Redis，3 遍稳定）
 
+### Docs（外部审核第五轮第三、四条）
+
+- **设计文档 §6 整体重写**（v0.3.0-design → v0.4.0-design）：旧版仍描述
+  "事务提交后 Redis 递增 / INCR / SETNX 基线"协议，与数据库权威实现不符。
+  新 §6：权威计数器同事务递增、Redis 忠实副本（SetIntMax 单调写唯一原语）、
+  禁止模式表（INCR / 无条件 SET / SETNX 0 及各自造成的真实缺陷）、
+  失效边界表（用户级 subject version / 角色级全域 epoch + 性能取舍声明）、
+  故障语义与一致性边界按权威协议重述
+- README 失效边界表明确化（含全域冷启动的取舍声明）
+- 审计事务性 Outbox 方案定稿（docs/phase3-evaluation.md 新增第三节）：
+  业务变更与 Outbox 事件同事务提交 + Worker 投递 + Event.ID 幂等消费；
+  P1 优先级，不阻塞缓存一致性
+
 ### Fixed（外部审核第五轮 P0）
 
 - **副本同步弃用 INCR，改用权威真值 + `SetIntMax` 单调写回（P0-1）**：
