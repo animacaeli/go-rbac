@@ -43,10 +43,11 @@ var (
 	subject = "10001"
 )
 
-// cchIncrExpect 断言版本/epoch 递增调用（需先注入 authzCacheMock）。
-func (h *serviceHarness) cchIncrExpect(key string) {
+// cchSyncExpect 断言版本/epoch 副本同步（需先注入 authzCacheMock 与 countersRepo）。
+func (h *serviceHarness) cchSyncExpect(key, dbKey string, authoritative int64) {
 	h.Require().NotNil(h.authzCacheMock, "SetupTest 需先创建 authzCacheMock")
-	h.authzCacheMock.On("Incr", mock.Anything, key).Return(int64(1), nil)
+	h.countersRepo.On("Get", mock.Anything, dbKey).Return(authoritative, nil).Once()
+	h.authzCacheMock.On("SetIntMax", mock.Anything, key, authoritative).Return(nil).Once()
 }
 
 func (h *serviceHarness) setupHarness(grantorMustHold bool) {
@@ -58,7 +59,11 @@ func (h *serviceHarness) setupHarness(grantorMustHold bool) {
 	h.grants = repositorymocks.NewMockUserGrantRepo(h.T())
 	h.authzRepo = repositorymocks.NewMockAuthorizationRepo(h.T())
 	h.countersRepo = repositorymocks.NewMockCountersRepo(h.T())
-	h.countersRepo.On("Get", mock.Anything, mock.Anything).Return(int64(0), nil).Maybe()
+	if h.authzCacheMock == nil {
+		// Simple 模式（NoopCache）：权威回退路径的兜底桩。
+		// 注入缓存 mock 的套件走精确断言（cchSyncExpect），泛型桩会先匹配遮蔽。
+		h.countersRepo.On("Get", mock.Anything, mock.Anything).Return(int64(0), nil).Maybe()
+	}
 	h.reg = registry.NewRegistry()
 
 	// 授权服务用真实实现 + mock 聚合仓储：
@@ -66,9 +71,9 @@ func (h *serviceHarness) setupHarness(grantorMustHold bool) {
 	authzCache := cache.PermissionCache(cache.NoopCache{})
 	if h.authzCacheMock != nil {
 		authzCache = h.authzCacheMock
-		// 基线协议通用桩（epoch 重建探测/清洗）；精确断言的用例自建 mock。
-		h.authzCacheMock.On("InitCounter", mock.Anything, mock.Anything).Return(false, nil).Maybe()
-		h.authzCacheMock.On("DeleteByPattern", mock.Anything, mock.Anything).Return(nil).Maybe()
+		// 注入缓存 mock 的套件走精确断言（cchSyncExpect）；
+		// 不注册泛型 SetIntMax 桩（先注册会遮蔽精确期望），仅兜底 Delete。
+		h.authzCacheMock.On("Delete", mock.Anything, mock.Anything).Return(nil).Maybe()
 	}
 	authorizer := core.NewAuthorizationService(h.authzRepo, h.countersRepo, authzCache, nil, core.NoopMetrics{}, time.Minute)
 

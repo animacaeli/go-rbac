@@ -34,10 +34,5 @@ func (NoopCache) GetInt(_ context.Context, _ string) (int64, bool, error) {
 	return 0, false, nil
 }
 
-// Incr 无操作，返回 0。
-func (NoopCache) Incr(_ context.Context, _ string) (int64, error) {
-	return 0, nil
-}
-
-// SetInt 无操作。
-func (NoopCache) SetInt(_ context.Context, _ string, _ int64) error { return nil }
+// SetIntMax 无操作。
+func (NoopCache) SetIntMax(_ context.Context, _ string, _ int64) error { return nil }

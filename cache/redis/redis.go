@@ -90,19 +90,26 @@ func (c *Cache) GetInt(ctx context.Context, key string) (int64, bool, error) {
 	return v, true, nil
 }
 
-// Incr 原子递增整数键并返回新值（键不存在时 0 → 1）。
-func (c *Cache) Incr(ctx context.Context, key string) (int64, error) {
-	v, err := c.cli.Incr(ctx, key).Result()
-	if err != nil {
-		return 0, fmt.Errorf("rbac/cache/redis: incr %s: %w", key, err)
-	}
-	return v, nil
-}
+// setIntMaxScript 原子单调写：当前值缺失 / 不可解析（损坏自愈）/ 小于
+// 新值时才写入；旧值永不覆盖新值。恢复×同步乱序并发下副本只会前进。
+var setIntMaxScript = redis.NewScript(`
+local cur = redis.call('GET', KEYS[1])
+if not cur then
+  redis.call('SET', KEYS[1], ARGV[1])
+  return 1
+end
+local curNum = tonumber(cur)
+if not curNum or curNum < tonumber(ARGV[1]) then
+  redis.call('SET', KEYS[1], ARGV[1])
+  return 1
+end
+return 0
+`)
 
-// SetInt 将整数键设置为权威值（副本回填，无 TTL——计数器键族不参与淘汰）。
-func (c *Cache) SetInt(ctx context.Context, key string, value int64) error {
-	if err := c.cli.Set(ctx, key, strconv.FormatInt(value, 10), 0).Err(); err != nil {
-		return fmt.Errorf("rbac/cache/redis: setint %s: %w", key, err)
+// SetIntMax 单调提升整数键（DB 权威版本的同步与恢复原语，§6.2）。
+func (c *Cache) SetIntMax(ctx context.Context, key string, value int64) error {
+	if err := setIntMaxScript.Run(ctx, c.cli, []string{key}, strconv.FormatInt(value, 10)).Err(); err != nil {
+		return fmt.Errorf("rbac/cache/redis: setintmax %s: %w", key, err)
 	}
 	return nil
 }

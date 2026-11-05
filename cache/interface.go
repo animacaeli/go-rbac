@@ -27,12 +27,12 @@ type PermissionCache interface {
 	// 仅在基础设施故障时返回 err。
 	GetInt(ctx context.Context, key string) (value int64, ok bool, err error)
 
-	// Incr 原子递增整数键并返回新值（键不存在时从 0 递增到 1）。
-	// 用于授权变更后的版本号 / epoch 递增（§6.3 失效矩阵）。
-	Incr(ctx context.Context, key string) (int64, error)
-
-	// SetInt 将整数键设置为指定值（DB 权威版本的缓存回填，§6.2）。
-	// 与 Incr 的关系：Incr 为常规同步（副本递增）；SetInt 仅用于
-	// 副本丢失/损坏后从权威值重建。
-	SetInt(ctx context.Context, key string, value int64) error
+	// SetIntMax 将整数键单调地提升到指定值（Lua 原子比较：仅当当前值
+	// 缺失、不可解析或小于新值时写入；旧值永不覆盖新值）。
+	//
+	// 这是 DB 权威版本号的唯一同步与恢复原语（§6.2）：同步路径提交后
+	// 读取权威真值并 SetIntMax；恢复路径同样如此——恢复与更新的并发
+	// 乱序不会使副本回退（P0：INCR 相对递增在副本被删后会从 1 重建，
+	// 与权威值产生持久偏差且读者无法察觉）。
+	SetIntMax(ctx context.Context, key string, value int64) error
 }

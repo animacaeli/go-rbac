@@ -2,6 +2,7 @@ package redis_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -99,44 +100,54 @@ func (s *CacheSuite) TestGetInt_MissingKey_ZeroNotOk() {
 	s.Zero(v)
 }
 
-func (s *CacheSuite) TestIncr_AtomicFromZero() {
-	// Act + Assert
-	v1, err := s.sut.Incr(s.ctx, "ver")
-	s.Require().NoError(err)
-	s.Equal(int64(1), v1)
+// SetIntMax（P0-1/P0-2 修复的原子原语）：单调护栏——旧值/乱序/损坏均不回退。
+func (s *CacheSuite) TestSetIntMax_MonotonicGuard() {
+	ctx := s.ctx
 
-	v2, err := s.sut.Incr(s.ctx, "ver")
-	s.Require().NoError(err)
-	s.Equal(int64(2), v2)
-
-	got, ok, err := s.sut.GetInt(s.ctx, "ver")
+	// 空键 → 写入。
+	s.Require().NoError(s.sut.SetIntMax(ctx, "k", int64(5)))
+	v, ok, err := s.sut.GetInt(ctx, "k")
 	s.Require().NoError(err)
 	s.True(ok)
-	s.Equal(int64(2), got)
+	s.Equal(int64(5), v)
+
+	// 较小值 → 不覆盖（P0-1：副本删除后旧操作的同步不得把权威值拉回）。
+	s.Require().NoError(s.sut.SetIntMax(ctx, "k", int64(3)))
+	v, _, _ = s.sut.GetInt(ctx, "k")
+	s.Equal(int64(5), v, "旧值不得覆盖新值")
+
+	// 相等 → 幂等不覆盖。
+	s.Require().NoError(s.sut.SetIntMax(ctx, "k", int64(5)))
+
+	// 更大值 → 前进。
+	s.Require().NoError(s.sut.SetIntMax(ctx, "k", int64(11)))
+	v, _, _ = s.sut.GetInt(ctx, "k")
+	s.Equal(int64(11), v)
+
+	// 损坏值（自愈）：不可解析的当前值被权威值覆盖。
+	s.srv.Set("k", "corrupt!!!")
+	s.Require().NoError(s.sut.SetIntMax(ctx, "k", int64(12)))
+	v, _, _ = s.sut.GetInt(ctx, "k")
+	s.Equal(int64(12), v, "损坏副本被权威值自愈")
 }
 
-func (s *CacheSuite) TestIncr_Concurrent() {
-	// Arrange：并发递增 100 次，结果必须是精确的 100。
-	const n = 100
-
-	// Act
-	done := make(chan struct{})
-	for i := 0; i < n; i++ {
-		go func() {
-			_, err := s.sut.Incr(s.ctx, "ver")
-			s.Require().NoError(err)
-			done <- struct{}{}
-		}()
+// P0-2 场景：恢复（真值 10）与更新同步（真值 11）乱序并发 → 副本只会前进。
+func (s *CacheSuite) TestSetIntMax_ConcurrentOutOfOrder_NoRegression() {
+	var wg sync.WaitGroup
+	order := []int64{10, 11, 9, 12, 8}
+	for _, v := range order {
+		wg.Add(1)
+		go func(val int64) {
+			defer wg.Done()
+			s.Require().NoError(s.sut.SetIntMax(s.ctx, "race", val))
+		}(v)
 	}
-	for i := 0; i < n; i++ {
-		<-done
-	}
+	wg.Wait()
 
-	// Assert
-	v, ok, err := s.sut.GetInt(s.ctx, "ver")
+	v, ok, err := s.sut.GetInt(s.ctx, "race")
 	s.Require().NoError(err)
 	s.True(ok)
-	s.Equal(int64(n), v)
+	s.Equal(int64(12), v, "乱序并发后副本 = 最大真值，永不回退")
 }
 
 func TestCache_ServerDown_ErrorSurfaces(t *testing.T) {
@@ -149,9 +160,9 @@ func TestCache_ServerDown_ErrorSurfaces(t *testing.T) {
 
 	// Act：错误必须向上抛（§6.6：鉴权路径回源、管理接口报错由上层决定）。
 	_, _, errGet := c.Get(context.Background(), "k")
-	_, errIncr := c.Incr(context.Background(), "ver")
+	errSetMax := c.SetIntMax(context.Background(), "ver", 1)
 
 	// Assert
 	require.Error(t, errGet)
-	require.Error(t, errIncr)
+	require.Error(t, errSetMax)
 }

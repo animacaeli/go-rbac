@@ -33,6 +33,7 @@ func (s *AuthorizationServiceSuite) SetupTest() {
 	s.checker = coremocks.NewMockSubjectStatusChecker(s.T())
 	s.counters = repositorymocks.NewMockCountersRepo(s.T())
 	s.counters.On("Get", mock.Anything, mock.Anything).Return(int64(0), nil).Maybe()
+	s.cch.On("SetIntMax", mock.Anything, mock.Anything, mock.AnythingOfType("int64")).Return(nil).Maybe()
 	s.sut = core.NewAuthorizationService(s.authzRepo, s.counters, s.cch, nil, core.NoopMetrics{}, 5*time.Minute)
 }
 
@@ -61,6 +62,7 @@ func (s *AuthorizationServiceSuite) expectColdRead(subject core.AuthorizationCon
 	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, sid).Return(false, nil)
 	// DB 权威计数器兜底（读路径仅在副本缺失/损坏时触达）。
 	s.counters.On("Get", mock.Anything, mock.Anything).Return(int64(0), nil).Maybe()
+	s.cch.On("SetIntMax", mock.Anything, mock.Anything, mock.AnythingOfType("int64")).Return(nil).Maybe()
 	// 快路径 + flight 内二次探测 + 写回前复核：GetInt 可能被多次调用。
 	s.cch.On("GetInt", mock.Anything, "rbac:default:epoch").Return(epoch, true, nil)
 	s.cch.On("GetInt", mock.Anything, versionKey(sid)).Return(version, true, nil)
@@ -269,20 +271,26 @@ func (s *AuthorizationServiceSuite) TestCacheTTL_CappedByNearestGrantExpiry() {
 	s.Equal([]string{"order:export"}, perms)
 }
 
-// §6.3：授权变更失效 = 版本 / epoch 递增。
-func (s *AuthorizationServiceSuite) TestInvalidate_Operations() {
-	// Arrange：INCR 成功后附带读取 epoch 并 DEL 新生成键（自愈双保险，§6.2）。
-	s.cch.On("Incr", mock.Anything, versionKey("10001")).Return(int64(1), nil)
-	s.cch.On("Incr", mock.Anything, "rbac:default:epoch").Return(int64(2), nil)
-	s.cch.On("GetInt", mock.Anything, "rbac:default:epoch").Return(int64(0), true, nil).Maybe()
-	s.cch.On("Delete", mock.Anything, mock.Anything).Return(nil).Maybe()
-	// 10002 的版本递增失败 → 批量操作整体报错（§6.6）。
-	s.cch.On("Incr", mock.Anything, versionKey("10002")).Return(int64(0), errors.New("redis down"))
+// §6.3：授权变更失效 = 副本同步（读权威真值 + SetIntMax 单调写回）。
+// 本地 mock（泛型桩会先匹配遮蔽精确失败桩）。
+func (s *AuthorizationServiceSuite) TestSync_Operations() {
+	cch := cachemocks.NewMockPermissionCache(s.T())
+	counters := repositorymocks.NewMockCountersRepo(s.T())
+	sut := core.NewAuthorizationService(s.authzRepo, counters, cch, nil, core.NoopMetrics{}, time.Minute)
 
-	// Act + Assert
-	s.Require().NoError(s.sut.IncrSubjectVersion(s.ctx, subject1.SubjectID))
-	s.Require().NoError(s.sut.IncrEpoch(s.ctx))
-	s.Require().Error(s.sut.IncrSubjectVersions(s.ctx, []string{"10001", "10002"}))
+	// 10001 被单测同步 + 批量同步各调用一次。
+	counters.On("Get", mock.Anything, "default:subject:10001:version").Return(int64(1), nil).Twice()
+	cch.On("SetIntMax", mock.Anything, versionKey("10001"), int64(1)).Return(nil).Twice()
+	counters.On("Get", mock.Anything, "default:epoch").Return(int64(1), nil).Once()
+	cch.On("SetIntMax", mock.Anything, "rbac:default:epoch", int64(1)).Return(nil).Once()
+	// 10002 的权威读取失败 → 删副本 + 批量同步整体报错（§6.6）。
+	counters.On("Get", mock.Anything, "default:subject:10002:version").
+		Return(int64(0), errors.New("db down")).Once()
+	cch.On("Delete", mock.Anything, versionKey("10002")).Return(nil).Once()
+
+	s.Require().NoError(sut.SyncSubjectVersion(s.ctx, subject1.SubjectID))
+	s.Require().NoError(sut.SyncEpoch(s.ctx))
+	s.Require().Error(sut.SyncSubjectVersions(s.ctx, []string{"10001", "10002"}))
 }
 
 // §6.8：singleflight 击穿防护——同主体并发未命中只触发一次数据库聚合。
@@ -383,8 +391,8 @@ func (s *AuthorizationServiceSuite) TestCounterMissing_RecoversFromDB() {
 	cch.On("GetInt", mock.Anything, versionKey(sid)).Return(int64(0), false, nil)
 	counters.On("Get", mock.Anything, "default:epoch").Return(int64(2), nil).Twice()
 	counters.On("Get", mock.Anything, "default:subject:10001:version").Return(int64(5), nil).Twice()
-	cch.On("SetInt", mock.Anything, "rbac:default:epoch", int64(2)).Return(nil).Maybe()
-	cch.On("SetInt", mock.Anything, versionKey(sid), int64(5)).Return(nil).Maybe()
+	cch.On("SetIntMax", mock.Anything, "rbac:default:epoch", int64(2)).Return(nil).Maybe()
+	cch.On("SetIntMax", mock.Anything, versionKey(sid), int64(5)).Return(nil).Maybe()
 	cch.On("Get", mock.Anything, mock.Anything).Return(nil, false, nil)
 	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, sid).Return(false, nil)
 	s.authzRepo.On("EffectiveRolePermissions", mock.Anything, sid).Return([]string{"user:list"}, nil)
@@ -410,7 +418,7 @@ func (s *AuthorizationServiceSuite) TestCounterCorrupt_RecoversFromDB() {
 		Return(int64(0), false, errors.New("rbac/cache/redis: corrupt integer"))
 	counters.On("Get", mock.Anything, mock.Anything).Return(int64(0), nil)
 	cch.On("Delete", mock.Anything, mock.Anything).Return(nil).Maybe()
-	cch.On("SetInt", mock.Anything, mock.Anything, mock.AnythingOfType("int64")).Return(nil).Maybe()
+	cch.On("SetIntMax", mock.Anything, mock.Anything, mock.AnythingOfType("int64")).Return(nil).Maybe()
 	cch.On("Get", mock.Anything, mock.Anything).Return(nil, false, nil)
 	cch.On("Set", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
 	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, sid).Return(false, nil)
@@ -471,28 +479,38 @@ func (s *AuthorizationServiceSuite) TestWriteBackVerify_GenerationChanged_Retry(
 	s.True(ok)
 }
 
-// IncrEpoch（DB 权威版）：副本同步语义——INCR 成功即可。
-func (s *AuthorizationServiceSuite) TestIncrEpoch_ReplicaSync() {
+// SyncSubjectVersion/SyncEpoch（DB 权威版）：读权威真值 + SetIntMax 单调写回。
+func (s *AuthorizationServiceSuite) TestSync_ReplicaSync() {
 	cch := cachemocks.NewMockPermissionCache(s.T())
-	sut := core.NewAuthorizationService(s.authzRepo, s.counters, cch, nil, core.NoopMetrics{}, time.Minute)
-	cch.On("Incr", mock.Anything, "rbac:default:epoch").Return(int64(3), nil).Once()
-	s.Require().NoError(sut.IncrEpoch(s.ctx))
+	counters := repositorymocks.NewMockCountersRepo(s.T())
+	sut := core.NewAuthorizationService(s.authzRepo, counters, cch, nil, core.NoopMetrics{}, time.Minute)
+
+	counters.On("Get", mock.Anything, "default:subject:10001:version").Return(int64(7), nil).Once()
+	cch.On("SetIntMax", mock.Anything, versionKey("10001"), int64(7)).Return(nil).Once()
+	s.Require().NoError(sut.SyncSubjectVersion(s.ctx, subject1.SubjectID))
+
+	counters.On("Get", mock.Anything, "default:epoch").Return(int64(3), nil).Once()
+	cch.On("SetIntMax", mock.Anything, "rbac:default:epoch", int64(3)).Return(nil).Once()
+	s.Require().NoError(sut.SyncEpoch(s.ctx))
 }
 
-// IncrEpoch 副本同步失败：删副本（迫使读路径回退 DB 权威值）后返回错误。
-func (s *AuthorizationServiceSuite) TestIncrEpoch_SyncFailureDeletesReplica() {
+// P0-1 回归：副本同步失败（读权威或写回任一失败）→ 删副本 → 返回错误。
+// 删除副本后，后续读取回退 DB 权威值，不会看到"在场但偏差"的计数器。
+func (s *AuthorizationServiceSuite) TestSync_FailureDeletesReplica() {
 	cch := cachemocks.NewMockPermissionCache(s.T())
-	sut := core.NewAuthorizationService(s.authzRepo, s.counters, cch, nil, core.NoopMetrics{}, time.Minute)
-	cch.On("Incr", mock.Anything, "rbac:default:epoch").Return(int64(0), errors.New("redis down")).Once()
-	cch.On("Delete", mock.Anything, "rbac:default:epoch").Return(nil).Once()
-	s.Require().Error(sut.IncrEpoch(s.ctx))
-}
+	counters := repositorymocks.NewMockCountersRepo(s.T())
+	sut := core.NewAuthorizationService(s.authzRepo, counters, cch, nil, core.NoopMetrics{}, time.Minute)
 
-// IncrSubjectVersion 副本同步失败：同样删副本。
-func (s *AuthorizationServiceSuite) TestIncrSubjectVersion_SyncFailureDeletesReplica() {
-	cch := cachemocks.NewMockPermissionCache(s.T())
-	sut := core.NewAuthorizationService(s.authzRepo, s.counters, cch, nil, core.NoopMetrics{}, time.Minute)
-	cch.On("Incr", mock.Anything, versionKey("10001")).Return(int64(0), errors.New("redis down")).Once()
+	// 写回失败路径。
+	counters.On("Get", mock.Anything, "default:subject:10001:version").Return(int64(7), nil).Once()
+	cch.On("SetIntMax", mock.Anything, versionKey("10001"), int64(7)).
+		Return(errors.New("redis down")).Once()
 	cch.On("Delete", mock.Anything, versionKey("10001")).Return(nil).Once()
-	s.Require().Error(sut.IncrSubjectVersion(s.ctx, subject1.SubjectID))
+	s.Require().Error(sut.SyncSubjectVersion(s.ctx, subject1.SubjectID))
+
+	// 读权威失败路径（epoch）。
+	counters.On("Get", mock.Anything, "default:epoch").
+		Return(int64(0), errors.New("db down")).Once()
+	cch.On("Delete", mock.Anything, "rbac:default:epoch").Return(nil).Once()
+	s.Require().Error(sut.SyncEpoch(s.ctx))
 }

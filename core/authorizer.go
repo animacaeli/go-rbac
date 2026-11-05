@@ -321,8 +321,9 @@ func (s *AuthorizationService) recoverCountersFromDB(ctx context.Context, scope,
 	if vErr != nil {
 		_ = s.cch.Delete(ctx, subjectVersionKey(scope, subject))
 	}
-	_ = s.cch.SetInt(ctx, epochKey(scope), epoch)
-	_ = s.cch.SetInt(ctx, subjectVersionKey(scope, subject), version)
+	// SetIntMax：恢复与并发同步乱序时副本只会前进，不会回退（P0-2）。
+	_ = s.cch.SetIntMax(ctx, epochKey(scope), epoch)
+	_ = s.cch.SetIntMax(ctx, subjectVersionKey(scope, subject), version)
 	return epoch, version, nil
 }
 
@@ -512,14 +513,21 @@ func scopeOf(ctx context.Context) string {
 // 适用：用户角色变更、用户额外授权 / 撤销 / 到期。
 // 调用时机：数据库事务提交成功之后（§6.2 不变性）。
 // 失败时管理接口应报错而非静默吞掉（§6.6）。
-func (s *AuthorizationService) IncrSubjectVersion(ctx context.Context, subjectID SubjectID) error {
+func (s *AuthorizationService) SyncSubjectVersion(ctx context.Context, subjectID SubjectID) error {
 	atomic.AddInt64(&s.inv.attempts, 1)
 	scope := scopeOf(ctx)
 	subject := subjectID.String()
-	// 权威版本已在变更事务内递增（rbac_counters）；此处仅同步 Redis 副本。
-	// 同步失败 → 删除副本，迫使读路径回退 DB 权威值（正确性不受影响，
-	// 该主体短暂失去缓存加速）。
-	if _, err := s.cch.Incr(ctx, subjectVersionKey(scope, subject)); err != nil {
+	// 权威版本已在变更事务内递增；此处同步副本 = 读权威真值 + 单调写回
+	// （SetIntMax）。禁止 INCR：相对递增在副本被删后会从 1 重建，与权威值
+	// 产生持久偏差且读者无法察觉（外部审核第四轮 P0-1 的并发场景）。
+	// 任何一步失败 → 删除副本，迫使读路径回退 DB 权威值。
+	version, err := s.counters.Get(ctx, dbSubjectVersionKey(scope, subject))
+	if err != nil {
+		atomic.AddInt64(&s.inv.failures, 1)
+		_ = s.cch.Delete(ctx, subjectVersionKey(scope, subject))
+		return err
+	}
+	if err := s.cch.SetIntMax(ctx, subjectVersionKey(scope, subject), version); err != nil {
 		atomic.AddInt64(&s.inv.failures, 1)
 		_ = s.cch.Delete(ctx, subjectVersionKey(scope, subject))
 		return err
@@ -529,9 +537,9 @@ func (s *AuthorizationService) IncrSubjectVersion(ctx context.Context, subjectID
 
 // IncrSubjectVersions 批量递增（角色权限变更 / 角色禁用的 fan-out，§6.3）。
 // 任一失败即返回错误，调用方可据此对管理接口整体报错。
-func (s *AuthorizationService) IncrSubjectVersions(ctx context.Context, subjectIDs []string) error {
+func (s *AuthorizationService) SyncSubjectVersions(ctx context.Context, subjectIDs []string) error {
 	for _, id := range subjectIDs {
-		if err := s.IncrSubjectVersion(ctx, SubjectID(id)); err != nil {
+		if err := s.SyncSubjectVersion(ctx, SubjectID(id)); err != nil {
 			return fmt.Errorf("rbac: invalidate subject %s: %w", id, err)
 		}
 	}
@@ -541,16 +549,21 @@ func (s *AuthorizationService) IncrSubjectVersions(ctx context.Context, subjectI
 // IncrEpoch 递增当前授权域的全局 epoch（粗糙级失效）。
 // 适用：权限禁用等低频全局事件——一次性使该域全部旧生成键不可达，
 // 代价是全员冷启动一次（§6.3）。
-func (s *AuthorizationService) IncrEpoch(ctx context.Context) error {
+func (s *AuthorizationService) SyncEpoch(ctx context.Context) error {
 	atomic.AddInt64(&s.inv.attempts, 1)
 	scope := scopeOf(ctx)
 	// 重建碰撞防护（§6.2，同 IncrSubjectVersion 的 DEL 兜底但影响面是全域）：
 	// epoch 键被淘汰后 INCR-from-missing 会重建为 1，与历史 epoch=1 时代的
 	// (1, vN) 生成键碰撞且读者信任"在场"计数器——先 SETNX 探测，新建即
 	// 清洗该域全部权限条目，再递增。清洗本身就是一次额外失效，语义安全。
-	// 权威 epoch 已在变更事务内递增；此处仅同步副本，失败即删副本
-	// （读路径回退 DB 权威值——不存在重建碰撞，DB 值只增不减）。
-	if _, err := s.cch.Incr(ctx, epochKey(scope)); err != nil {
+	// 同 SyncSubjectVersion：读权威真值 + SetIntMax 单调写回；失败删副本。
+	epoch, err := s.counters.Get(ctx, dbEpochKey(scope))
+	if err != nil {
+		atomic.AddInt64(&s.inv.failures, 1)
+		_ = s.cch.Delete(ctx, epochKey(scope))
+		return err
+	}
+	if err := s.cch.SetIntMax(ctx, epochKey(scope), epoch); err != nil {
 		atomic.AddInt64(&s.inv.failures, 1)
 		_ = s.cch.Delete(ctx, epochKey(scope))
 		return err

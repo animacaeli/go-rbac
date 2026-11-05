@@ -66,7 +66,7 @@ func (d ServiceDeps) record(ctx context.Context, e Event) error {
 // invalidateSubject / invalidateSubjects / invalidateEpoch：失效包装。
 // 数据库已提交、递增失败时返回 ErrInvalidationFailedAfterCommit（重试同一操作安全）。
 func (d ServiceDeps) invalidateSubject(ctx context.Context, subjectID SubjectID) error {
-	if err := d.Authorizer.IncrSubjectVersion(ctx, subjectID); err != nil {
+	if err := d.Authorizer.SyncSubjectVersion(ctx, subjectID); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidationFailedAfterCommit, err)
 	}
 	return nil
@@ -82,7 +82,7 @@ func (d ServiceDeps) invalidateSubjects(ctx context.Context, subjectIDs []string
 }
 
 func (d ServiceDeps) invalidateEpoch(ctx context.Context) error {
-	if err := d.Authorizer.IncrEpoch(ctx); err != nil {
+	if err := d.Authorizer.SyncEpoch(ctx); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidationFailedAfterCommit, err)
 	}
 	return nil

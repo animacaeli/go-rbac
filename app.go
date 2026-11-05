@@ -186,7 +186,7 @@ func (a *App) SyncPermissions(ctx context.Context) (registry.SyncResult, error) 
 		if err := a.repos.Permissions.ApplySync(ctx, plan); err != nil {
 			return result, fmt.Errorf("rbac: sync apply: %w", err)
 		}
-		if err := a.authorizer.IncrEpoch(ctx); err != nil {
+		if err := a.authorizer.SyncEpoch(ctx); err != nil {
 			return result, fmt.Errorf("%w: %v", core.ErrInvalidationFailedAfterCommit, err)
 		}
 		_ = a.events.Record(ctx, core.NewEvent(core.EventPermissionsSynced,
@@ -249,7 +249,7 @@ func (a *App) SeedSuperAdmin(ctx context.Context, subjectID string) error {
 	if err := a.repos.UserRoles.Assign(ctx, subjectID, role.ID); err != nil {
 		return fmt.Errorf("rbac: seed super admin subject: %w", err)
 	}
-	if err := a.authorizer.IncrSubjectVersion(ctx, core.SubjectID(subjectID)); err != nil {
+	if err := a.authorizer.SyncSubjectVersion(ctx, core.SubjectID(subjectID)); err != nil {
 		return fmt.Errorf("%w: %v", core.ErrInvalidationFailedAfterCommit, err)
 	}
 	return nil

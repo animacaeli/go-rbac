@@ -37,12 +37,7 @@ func (c *fakeFastCache) GetInt(_ context.Context, key string) (int64, bool, erro
 	return v, ok, nil
 }
 
-func (c *fakeFastCache) Incr(_ context.Context, key string) (int64, error) {
-	c.ints[key]++
-	return c.ints[key], nil
-}
-
-func (c *fakeFastCache) SetInt(_ context.Context, _ string, _ int64) error { return nil }
+func (c *fakeFastCache) SetIntMax(_ context.Context, _ string, _ int64) error { return nil }
 
 // BenchmarkHasPermission_CacheHit 测量热路径：GetInt×2 + Get 命中即返回。
 func BenchmarkHasPermission_CacheHit(b *testing.B) {

@@ -9,7 +9,9 @@ package redis_test
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -210,48 +212,74 @@ func (s *MatrixSuite) TestRow06_CounterCorrupt_NoResurrect() {
 	s.False(ok, "计数器损坏后必须回源数据库")
 }
 
-// 行 7：Redis 递增失败 → 不出现"未被识别的权限变更"（管理接口报错哨兵，
-// 数据库已提交——重试同一操作安全；本行验证哨兵与重试语义）。
-func (s *MatrixSuite) TestRow07_IncrFailure_SentinelAndRetry() {
+// 行 7（P0-1 精确场景）：副本被淘汰后，同步必须写入权威真值而非从 1 相对递增。
+// 旧 INCR 实现在此场景产生"在场但偏差"的副本（读者无法察觉）；SetIntMax 修复后
+// 副本恒等于 rbac_counters 权威值。
+func (s *MatrixSuite) TestRow07_ReplicaDeleted_SyncWritesTrueValue() {
 	s.Require().NoError(s.app.Grants().Grant(s.ctx, gateAdmin, "m07", "order:export", nil, ""))
+	// 权威版本已在授权事务内递增。
+	var dbv int64
+	s.Require().NoError(s.db.Table("rbac_counters").
+		Select("v").Where("k = ?", "default:subject:m07:version").Limit(1).Scan(&dbv).Error)
+	s.Require().Greater(dbv, int64(0))
 
-	// 故障注入：递增必败（直接破坏 INCR 命令处理——用错误脚本不可行，
-	// 改用断开连接的客户端路径：对 cache 客户端 FLUSHALL 后立刻注入
-	// 连接故障不可移植；此处用 miniredis 之外的可靠手段——重写键为
-	// 字符串类型使 INCR 报错）。
-	s.Require().NoError(s.rdb.Set(s.ctx, "rbac:default:subject:m08:version", "not-a-number", 0).Err())
-	err := s.app.Grants().Grant(s.ctx, gateAdmin, "m08", "order:export", nil, "")
-	s.Require().Error(err)
-	require.Contains(s.T(), err.Error(), "invalidation failed after commit", "必须携带提交后失效哨兵")
-
-	// 清理损坏键后重试同一操作 → 成功且失效生效。
-	s.Require().NoError(s.rdb.Del(s.ctx, "rbac:default:subject:m08:version").Err())
+	// 淘汰副本（模拟 allkeys-* 误配）→ 读 m07（触发恢复：DB 真值 + SetIntMax）
+	// → 再对 m08 授权（其同步走同一单调原语）。
+	s.Require().NoError(s.rdb.Del(s.ctx, "rbac:default:subject:m07:version").Err())
+	ok, err := s.app.Authorizer().HasPermission(s.ctx, s.ac("m07"), "order:export")
+	s.Require().NoError(err)
+	s.Require().True(ok)
 	s.Require().NoError(s.app.Grants().Grant(s.ctx, gateAdmin, "m08", "order:export", nil, ""))
+
+	replica, err := s.rdb.Get(s.ctx, "rbac:default:subject:m07:version").Result()
+	s.Require().NoError(err, "副本应已由读路径恢复或同步重建")
+	s.Require().NotEqual("1", replica, "不得从 1 相对递增（P0-1 偏差）")
+	var dbAfter int64
+	s.Require().NoError(s.db.Table("rbac_counters").
+		Select("v").Where("k = ?", "default:subject:m07:version").Limit(1).Scan(&dbAfter).Error)
+	s.Require().Equal(fmt.Sprintf("%d", dbAfter), replica, "副本必须等于权威真值")
 }
 
-// 行 8：Redis 故障恢复 → 不重新使用失效缓存（恢复后陈旧窗口经重试补失效收敛）。
-func (s *MatrixSuite) TestRow08_RedisRecovery_NoStaleRevival() {
-	s.Require().NoError(s.app.Grants().Grant(s.ctx, gateAdmin, "m09", "order:export", nil, ""))
-	ok, _ := s.app.Authorizer().HasPermission(s.ctx, s.ac("m09"), "order:export")
+// 行 8（P0-2 场景）：恢复与更新同步乱序不回退——功能级验证：
+// epoch 副本淘汰 → 变更（DB bump）→ 读（恢复 SetIntMax 真值）→ 再变更 → 读。
+// 副本全程单调前进且鉴权结果始终正确（原子乱序护栏由适配器单测覆盖）。
+func (s *MatrixSuite) TestRow08_RecoveryAndSync_NoRegression() {
+	s.subjectWithPerms("m09", "r09", "user:list")
+	ok, _ := s.app.Authorizer().HasPermission(s.ctx, s.ac("m09"), "user:list")
 	s.Require().True(ok)
 
-	// 故障窗口：INCR 失败（同行 7 手段）期间执行撤销——数据库已提交。
-	s.Require().NoError(s.rdb.Set(s.ctx, "rbac:default:subject:m09:version", "broken", 0).Err())
-	err := s.app.Grants().Revoke(s.ctx, gateAdmin, "m09", "order:export")
-	s.Require().Error(err, "故障期间撤销必须报错（不出现未识别变更）")
+	s.Require().NoError(s.rdb.Del(s.ctx, "rbac:default:epoch").Err())
+	// 变更 1：禁用权限（DB epoch 同事务 +1），读路径恢复副本为真值。
+	s.Require().NoError(s.app.Permissions().SetStatus(s.ctx, gateAdmin, "user:list", 0))
+	ok, err := s.app.Authorizer().HasPermission(s.ctx, s.ac("m09"), "user:list")
+	s.Require().NoError(err)
+	s.False(ok)
+	var e1 string
+	e1, err = s.rdb.Get(s.ctx, "rbac:default:epoch").Result()
+	s.Require().NoError(err)
 
-	// 恢复：重试撤销 → 幂等路径不可用（已无活跃行），改为重放授权-再撤销，
-	// 验证失效链路恢复后缓存收敛到数据库真相。
-	s.Require().NoError(s.rdb.Del(s.ctx, "rbac:default:subject:m09:version").Err())
-	_, err = s.app.Authorizer().HasPermission(s.ctx, s.ac("m09"), "order:export")
+	// 变更 2：重新启用 → epoch 前进；副本必须单调上升且结果正确。
+	s.Require().NoError(s.app.Permissions().SetStatus(s.ctx, gateAdmin, "user:list", 1))
+	ok, err = s.app.Authorizer().HasPermission(s.ctx, s.ac("m09"), "user:list")
 	s.Require().NoError(err)
-	// 已知窗口（§6.7）：恢复瞬间可能读到故障前的缓存（撤销已提交但未失效）。
-	// 该窗口由"重试同一操作"关闭：任何后续成功的授权变更都会重建失效链路。
-	s.Require().NoError(s.app.Grants().Grant(s.ctx, gateAdmin, "m09", "order:export", nil, ""))
-	s.Require().NoError(s.app.Grants().Revoke(s.ctx, gateAdmin, "m09", "order:export"))
-	ok, err = s.app.Authorizer().HasPermission(s.ctx, s.ac("m09"), "order:export")
+	s.True(ok)
+	var e2 string
+	e2, err = s.rdb.Get(s.ctx, "rbac:default:epoch").Result()
 	s.Require().NoError(err)
-	s.False(ok, "失效链路恢复后必须收敛")
+	s.Require().Greater(metricsCmp(e2, e1), 0, "epoch 副本必须单调前进，不得回退")
+}
+
+func metricsCmp(a, b string) int {
+	x, _ := strconv.ParseInt(a, 10, 64)
+	y, _ := strconv.ParseInt(b, 10, 64)
+	switch {
+	case x > y:
+		return 1
+	case x < y:
+		return -1
+	default:
+		return 0
+	}
 }
 
 // 行 9：临时授权到期 → 不继续放行（TTL 上限 + 查询时校验）。
