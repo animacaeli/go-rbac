@@ -143,6 +143,13 @@ func (s *SecuritySuite) TestBuiltinRole_ModificationsBlocked() {
 	s.Require().ErrorIs(s.app.Roles().Delete(s.ctx, secAdmin, superRole.ID), core.ErrBuiltinRoleProtected)
 	s.Require().ErrorIs(s.app.Roles().SetStatus(s.ctx, secAdmin, superRole.ID, model.RoleStatusDisabled), core.ErrBuiltinRoleProtected)
 	s.Require().ErrorIs(s.app.Roles().SetPermissions(s.ctx, secAdmin, superRole.ID, []string{"user:list"}), core.ErrBuiltinRoleProtected)
+	// P1-01（外部评审第七轮）：撤销超管角色绑定同样被拒。
+	s.Require().ErrorIs(s.app.UserRoles().Revoke(s.ctx, secAdmin, "sec-admin", superRole.ID), core.ErrBuiltinRoleProtected)
+
+	// 撤销被拒后超管身份不受影响。
+	isSuper, err := s.app.Authorizer().IsSuperAdministrator(s.ctx, secAdmin)
+	s.Require().NoError(err)
+	s.True(isSuper)
 }
 
 // §9.3 + §6.6：Redis 异常——鉴权路径回源数据库保持正确（不得错误放行或错误拒绝）；

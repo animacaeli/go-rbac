@@ -196,6 +196,18 @@ func (s *UserRoleService) Revoke(ctx context.Context, operator AuthorizationCont
 	if err := validateSubject(subjectID); err != nil {
 		return err
 	}
+	// 内置受保护角色不可经管理接口撤销（§7.3；Assign 同样保护，
+	// 漏检会使超管角色绑定可被移除——外部评审第七轮 P1-01）。
+	role, err := s.deps.Roles.FindByID(ctx, roleID)
+	if repository.IsNotFound(err) {
+		return fmt.Errorf("%w: id=%d", ErrRoleNotFound, roleID)
+	}
+	if err != nil {
+		return err
+	}
+	if role.IsBuiltin {
+		return fmt.Errorf("%w: builtin role %s cannot be revoked via management API", ErrBuiltinRoleProtected, role.Code)
+	}
 	if err := s.deps.UserRoles.Revoke(ctx, subjectID, roleID); err != nil {
 		return err
 	}

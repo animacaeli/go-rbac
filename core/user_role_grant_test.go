@@ -105,7 +105,9 @@ func (s *UserRoleServiceSuite) TestAssign_RoleNotFound_Rejected() {
 }
 
 func (s *UserRoleServiceSuite) TestRevoke_Idempotent() {
-	// Arrange
+	// Arrange：普通角色可撤销（幂等——未分配时无操作）。
+	normal := &model.Role{ID: 2, Code: "ops"}
+	s.roles.On("FindByID", mock.Anything, uint64(2)).Return(normal, nil)
 	s.userRoles.On("Revoke", mock.Anything, subject, uint64(2)).Return(nil)
 
 	// Act
@@ -113,6 +115,41 @@ func (s *UserRoleServiceSuite) TestRevoke_Idempotent() {
 
 	// Assert
 	s.Require().NoError(err)
+}
+
+// P1-01（外部评审第七轮）：内置角色（含超管）不可经管理接口撤销。
+func (s *UserRoleServiceSuite) TestRevoke_BuiltinRole_Protected() {
+	// Arrange
+	builtin := &model.Role{ID: 1, Code: model.BuiltinSuperAdminRoleCode, IsBuiltin: true}
+	s.roles.On("FindByID", mock.Anything, uint64(1)).Return(builtin, nil)
+
+	// Act
+	err := s.userRoleSvc.Revoke(s.ctx, operator, subject, 1)
+
+	// Assert
+	s.ErrorIs(err, core.ErrBuiltinRoleProtected)
+}
+
+func (s *UserRoleServiceSuite) TestRevoke_RoleNotFound() {
+	// Arrange
+	s.roles.On("FindByID", mock.Anything, uint64(99)).Return(nil, repository.ErrRecordNotFound)
+
+	// Act
+	err := s.userRoleSvc.Revoke(s.ctx, operator, subject, 99)
+
+	// Assert
+	s.ErrorIs(err, core.ErrRoleNotFound)
+}
+
+func (s *UserRoleServiceSuite) TestRevoke_CrossTenantRole_Rejected() {
+	// Arrange：acme 域内查 beta 角色 → 域过滤不可见（tenant 隔离仓储）。
+	s.roles.On("FindByID", mock.Anything, uint64(7)).Return(nil, repository.ErrRecordNotFound)
+
+	// Act
+	err := s.userRoleSvc.Revoke(s.ctx, core.AuthorizationContext{TenantID: "acme", SubjectID: "op"}, subject, 7)
+
+	// Assert
+	s.ErrorIs(err, core.ErrRoleNotFound, "跨域角色在域内不可见即拒绝")
 }
 
 // ---- GrantService ----
