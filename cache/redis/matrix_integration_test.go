@@ -213,31 +213,31 @@ func (s *MatrixSuite) TestRow06_CounterCorrupt_NoResurrect() {
 }
 
 // 行 7（P0-1 精确场景）：副本被淘汰后，同步必须写入权威真值而非从 1 相对递增。
-// 旧 INCR 实现在此场景产生"在场但偏差"的副本（读者无法察觉）；SetIntMax 修复后
-// 副本恒等于 rbac_counters 权威值。
+// 场景构造：同一主体两次授权 → 权威=2；副本在两次之间删除。
+// 旧 INCR 实现：第二次同步 INCR-from-missing 重建副本为 1（偏差，读者无法察觉）；
+// SetIntMax 实现：副本 == 权威真值 == 2。
 func (s *MatrixSuite) TestRow07_ReplicaDeleted_SyncWritesTrueValue() {
+	// 授权 1：权威 0→1，读路径同步副本。
 	s.Require().NoError(s.app.Grants().Grant(s.ctx, gateAdmin, "m07", "order:export", nil, ""))
-	// 权威版本已在授权事务内递增。
-	var dbv int64
-	s.Require().NoError(s.db.Table("rbac_counters").
-		Select("v").Where("k = ?", "default:subject:m07:version").Limit(1).Scan(&dbv).Error)
-	s.Require().Greater(dbv, int64(0))
-
-	// 淘汰副本（模拟 allkeys-* 误配）→ 读 m07（触发恢复：DB 真值 + SetIntMax）
-	// → 再对 m08 授权（其同步走同一单调原语）。
-	s.Require().NoError(s.rdb.Del(s.ctx, "rbac:default:subject:m07:version").Err())
 	ok, err := s.app.Authorizer().HasPermission(s.ctx, s.ac("m07"), "order:export")
 	s.Require().NoError(err)
 	s.Require().True(ok)
-	s.Require().NoError(s.app.Grants().Grant(s.ctx, gateAdmin, "m08", "order:export", nil, ""))
 
+	// 淘汰副本（模拟 allkeys-* 误配 / 竞态删除）。
+	s.Require().NoError(s.rdb.Del(s.ctx, "rbac:default:subject:m07:version").Err())
+
+	// 授权 2（重授权：撤销旧行+插新行）：权威 1→2，提交后同步副本。
+	s.Require().NoError(s.app.Grants().Grant(s.ctx, gateAdmin, "m07", "order:export", nil, "重授权"))
+
+	// 断言：副本必须等于权威真值（2），不得从 1 相对递增。
 	replica, err := s.rdb.Get(s.ctx, "rbac:default:subject:m07:version").Result()
-	s.Require().NoError(err, "副本应已由读路径恢复或同步重建")
-	s.Require().NotEqual("1", replica, "不得从 1 相对递增（P0-1 偏差）")
+	s.Require().NoError(err, "副本应已由同步重建")
 	var dbAfter int64
 	s.Require().NoError(s.db.Table("rbac_counters").
 		Select("v").Where("k = ?", "default:subject:m07:version").Limit(1).Scan(&dbAfter).Error)
-	s.Require().Equal(fmt.Sprintf("%d", dbAfter), replica, "副本必须等于权威真值")
+	s.Require().GreaterOrEqual(dbAfter, int64(2), "两次授权后权威应 ≥2")
+	s.Require().Equal(fmt.Sprintf("%d", dbAfter), replica,
+		"副本必须等于权威真值（P0-1：INCR-from-missing 会重建为 1 造成持久偏差）")
 }
 
 // 行 8（P0-2 场景）：恢复与更新同步乱序不回退——功能级验证：
