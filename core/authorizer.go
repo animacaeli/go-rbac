@@ -562,7 +562,23 @@ func (s *AuthorizationService) IncrSubjectVersions(ctx context.Context, subjectI
 // 代价是全员冷启动一次（§6.3）。
 func (s *AuthorizationService) IncrEpoch(ctx context.Context) error {
 	atomic.AddInt64(&s.inv.attempts, 1)
-	if _, err := s.cch.Incr(ctx, epochKey(scopeOf(ctx))); err != nil {
+	scope := scopeOf(ctx)
+	// 重建碰撞防护（§6.2，同 IncrSubjectVersion 的 DEL 兜底但影响面是全域）：
+	// epoch 键被淘汰后 INCR-from-missing 会重建为 1，与历史 epoch=1 时代的
+	// (1, vN) 生成键碰撞且读者信任"在场"计数器——先 SETNX 探测，新建即
+	// 清洗该域全部权限条目，再递增。清洗本身就是一次额外失效，语义安全。
+	created, err := s.cch.InitCounter(ctx, epochKey(scope))
+	if err != nil {
+		atomic.AddInt64(&s.inv.failures, 1)
+		return err
+	}
+	if created {
+		if err := s.cch.DeleteByPattern(ctx, "rbac:"+scope+":subject:*:perm:*"); err != nil {
+			atomic.AddInt64(&s.inv.failures, 1)
+			return err
+		}
+	}
+	if _, err := s.cch.Incr(ctx, epochKey(scope)); err != nil {
 		atomic.AddInt64(&s.inv.failures, 1)
 		return err
 	}

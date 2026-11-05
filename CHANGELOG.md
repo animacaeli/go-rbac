@@ -7,6 +7,14 @@
 
 ## [Unreleased]
 
+### Fixed（第三轮自审）
+
+- `IncrEpoch` 重建碰撞洞（第三轮审核发现）：epoch 键被淘汰后经**失效路径**
+  （而非读路径）重建时，INCR-from-missing 得 1 与历史 epoch=1 时代的
+  (1, vN) 生成键碰撞且读者信任在场计数器——修复为先 SETNX 探测、
+  新建即全域清洗再递增（读路径的重建清洗无法覆盖此入口）；
+  回归测试覆盖新建清洗与在场不清洗两分支
+
 ### Security（外部审核问题 1，P0）
 
 - **Redis 计数器丢失/损坏不再导致旧权限复活**：三层修复——
@@ -42,6 +50,9 @@
 
 ### Changed（Breaking，pre-1.0 收口）
 
+- `cache.PermissionCache` 接口扩展：新增 `InitCounter`（返回是否新建）与
+  `DeleteByPattern`——基线恢复协议所需。**自定义缓存实现需补齐这两个方法**
+  （内置 NoopCache / Redis 适配器已实现）
 - `repository/` 迁移至 `internal/repository/`：以 Go 语言机制强制 §3.4
   "Repository 接口 v1 保持内部"的冻结决策（外部无法导入实现）；
   `App.PermissionsRepository` / `App.ReplaceRepositories` 保留导出，

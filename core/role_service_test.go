@@ -63,6 +63,9 @@ func (h *serviceHarness) setupHarness(grantorMustHold bool) {
 	authzCache := cache.PermissionCache(cache.NoopCache{})
 	if h.authzCacheMock != nil {
 		authzCache = h.authzCacheMock
+		// 基线协议通用桩（epoch 重建探测/清洗）；精确断言的用例自建 mock。
+		h.authzCacheMock.On("InitCounter", mock.Anything, mock.Anything).Return(false, nil).Maybe()
+		h.authzCacheMock.On("DeleteByPattern", mock.Anything, mock.Anything).Return(nil).Maybe()
 	}
 	authorizer := core.NewAuthorizationService(h.authzRepo, authzCache, nil, core.NoopMetrics{}, time.Minute)
 

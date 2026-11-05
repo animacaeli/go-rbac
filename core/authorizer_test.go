@@ -454,3 +454,30 @@ func (s *AuthorizationServiceSuite) TestCounterCorrupt_FailsClosedToDB() {
 	s.Require().NoError(err)
 	s.Equal([]string{"user:list"}, perms)
 }
+
+// 第三轮审核回归：epoch 键被淘汰后经失效路径重建（而非读路径）时，
+// 重建值 1 与历史 (1, vN) 生成键碰撞——IncrEpoch 必须新建即全域清洗。
+// （SetupTest 的通用桩会先匹配遮蔽精确期望，故本组用例自建 mock 与被测对象。）
+func (s *AuthorizationServiceSuite) TestIncrEpoch_RecreationPurgesScope() {
+	cch := cachemocks.NewMockPermissionCache(s.T())
+	sut := core.NewAuthorizationService(s.authzRepo, cch, nil, core.NoopMetrics{}, time.Minute)
+
+	cch.On("InitCounter", mock.Anything, "rbac:default:epoch").Return(true, nil).Once()
+	cch.On("DeleteByPattern", mock.Anything, "rbac:default:subject:*:perm:*").Return(nil).Once()
+	cch.On("Incr", mock.Anything, "rbac:default:epoch").Return(int64(1), nil).Once()
+
+	// DeleteByPattern 未设 .Maybe：漏清洗即失败。
+	s.Require().NoError(sut.IncrEpoch(s.ctx))
+}
+
+// 对照：epoch 键在场（SETNX 非新建）时不清洗、只递增。
+func (s *AuthorizationServiceSuite) TestIncrEpoch_Existing_NoPurge() {
+	cch := cachemocks.NewMockPermissionCache(s.T())
+	sut := core.NewAuthorizationService(s.authzRepo, cch, nil, core.NoopMetrics{}, time.Minute)
+
+	cch.On("InitCounter", mock.Anything, "rbac:default:epoch").Return(false, nil).Once()
+	// DeleteByPattern 未注册：清洗即失败（正确路径不应触发）。
+	cch.On("Incr", mock.Anything, "rbac:default:epoch").Return(int64(3), nil).Once()
+
+	s.Require().NoError(sut.IncrEpoch(s.ctx))
+}
