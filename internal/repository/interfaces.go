@@ -20,6 +20,31 @@ import (
 	"github.com/animacaeli/go-rbac/registry"
 )
 
+// tenantCtxKey 是请求上下文中的租户槽位（§2.9）：服务层写路径从 operator
+// AuthorizationContext 注入，授权读路径从 ac 注入；仓储层的权威计数器键
+// 以此派生授权域前缀（与 Redis 键同构）。槽位定义在此处以避免 core 反向依赖。
+type tenantCtxKey struct{}
+
+// WithTenant 将租户标识写入 ctx（空串 = default 域）。core.ContextWithTenant 委托本函数。
+func WithTenant(ctx context.Context, tenantID string) context.Context {
+	return context.WithValue(ctx, tenantCtxKey{}, tenantID)
+}
+
+// TenantFromContext 读取租户标识。core.TenantFromContext 委托本函数。
+func TenantFromContext(ctx context.Context) (string, bool) {
+	v, ok := ctx.Value(tenantCtxKey{}).(string)
+	return v, ok
+}
+
+// TenantScope 返回计数器键使用的授权域前缀：ctx 携带非空租户即租户域，
+// 否则 default 域。
+func TenantScope(ctx context.Context) string {
+	if t, ok := TenantFromContext(ctx); ok && t != "" {
+		return t
+	}
+	return "default"
+}
+
 // ErrRecordNotFound 表示目标记录不存在（由各实现统一翻译）。
 var ErrRecordNotFound = errors.New("rbac: record not found")
 

@@ -8,6 +8,7 @@ import (
 
 	"github.com/animacaeli/go-rbac/core"
 	"github.com/animacaeli/go-rbac/internal/repository"
+	gormrepo "github.com/animacaeli/go-rbac/internal/repository/gormrepo"
 	"github.com/animacaeli/go-rbac/model"
 	"gorm.io/gorm"
 )
@@ -51,6 +52,14 @@ func (r *Repos) writer(ctx context.Context) (*gorm.DB, string, error) {
 }
 
 func nowUTC() time.Time { return time.Now().UTC() }
+
+// scopeKey 归一计数器键前缀：空租户（平台域）→ default。
+func scopeKey(tenant, subject string) string {
+	if tenant == "" {
+		tenant = "default"
+	}
+	return tenant + ":subject:" + subject + ":version"
+}
 
 // runWithDeadlockRetry：共享实现（internal/repository.DeadlockRetry）。
 var runWithDeadlockRetry = repository.DeadlockRetry
@@ -237,12 +246,21 @@ func (x userRoleRepo) Assign(ctx context.Context, subjectID string, roleID uint6
 	if err := x.roleTenantOf(db, roleID, t); err != nil {
 		return err
 	}
-	// INSERT IGNORE：唯一键 (tenant_id, subject_id, role_id) 下的幂等分配
-	//（map 式 Create 无法配 OnConflict 子句，MySQL 原生语义更直接）。
-	return db.Exec(
-		"INSERT IGNORE INTO rbac_user_roles (tenant_id, subject_id, role_id, created_at) VALUES (?, ?, ?, ?)",
-		t, subjectID, roleID, nowUTC(),
-	).Error
+	// INSERT IGNORE：唯一键 (tenant_id, subject_id, role_id) 下的幂等分配；
+	// 实际新建时同事务递增该域主体版本（权威计数器，P0 修复）。
+	return db.Transaction(func(tx *gorm.DB) error {
+		res := tx.Exec(
+			"INSERT IGNORE INTO rbac_user_roles (tenant_id, subject_id, role_id, created_at) VALUES (?, ?, ?, ?)",
+			t, subjectID, roleID, nowUTC(),
+		)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected > 0 {
+			return gormrepo.BumpCounterTx(tx, scopeKey(t, subjectID))
+		}
+		return nil
+	})
 }
 
 func (x userRoleRepo) Revoke(ctx context.Context, subjectID string, roleID uint64) error {
@@ -250,9 +268,18 @@ func (x userRoleRepo) Revoke(ctx context.Context, subjectID string, roleID uint6
 	if err != nil {
 		return err
 	}
-	return db.Table("rbac_user_roles").
-		Where("subject_id = ? AND role_id = ? AND tenant_id = ?", subjectID, roleID, t).
-		Delete(nil).Error
+	return db.Transaction(func(tx *gorm.DB) error {
+		res := tx.Table("rbac_user_roles").
+			Where("subject_id = ? AND role_id = ? AND tenant_id = ?", subjectID, roleID, t).
+			Delete(nil)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected > 0 {
+			return gormrepo.BumpCounterTx(tx, scopeKey(t, subjectID))
+		}
+		return nil
+	})
 }
 
 func (x userRoleRepo) ListBySubject(ctx context.Context, subjectID string) ([]model.UserRole, error) {
@@ -318,7 +345,7 @@ func (x grantRepo) Grant(ctx context.Context, g model.UserGrant, now time.Time) 
 				Updates(map[string]any{"revoked_at": now, "revoked_by": g.CreatedBy}).Error; err != nil {
 				return err
 			}
-			return tx.Table("rbac_user_grants").Create(map[string]any{
+			if err := tx.Table("rbac_user_grants").Create(map[string]any{
 				"tenant_id":     t,
 				"subject_id":    g.SubjectID,
 				"permission_id": g.PermissionID,
@@ -326,7 +353,10 @@ func (x grantRepo) Grant(ctx context.Context, g model.UserGrant, now time.Time) 
 				"reason":        g.Reason,
 				"created_by":    g.CreatedBy,
 				"created_at":    now,
-			}).Error
+			}).Error; err != nil {
+				return err
+			}
+			return gormrepo.BumpCounterTx(tx, scopeKey(t, g.SubjectID))
 		})
 	})
 }
@@ -339,11 +369,19 @@ func (x grantRepo) Revoke(ctx context.Context, subjectID string, permissionID ui
 	// 同 base 仓储：UPDATE 幂等，RR 间隙锁死锁有界重试。
 	var affected int64
 	err = runWithDeadlockRetry(func() error {
-		res := db.Table("rbac_user_grants").
-			Where("tenant_id = ? AND subject_id = ? AND permission_id = ? AND revoked_at IS NULL", t, subjectID, permissionID).
-			Updates(map[string]any{"revoked_at": now, "revoked_by": revokedBy})
-		affected = res.RowsAffected
-		return res.Error
+		return db.Transaction(func(tx *gorm.DB) error {
+			res := tx.Table("rbac_user_grants").
+				Where("tenant_id = ? AND subject_id = ? AND permission_id = ? AND revoked_at IS NULL", t, subjectID, permissionID).
+				Updates(map[string]any{"revoked_at": now, "revoked_by": revokedBy})
+			if res.Error != nil {
+				return res.Error
+			}
+			affected = res.RowsAffected
+			if affected > 0 {
+				return gormrepo.BumpCounterTx(tx, scopeKey(t, subjectID))
+			}
+			return nil
+		})
 	})
 	return affected, err
 }

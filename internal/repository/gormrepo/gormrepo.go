@@ -84,7 +84,7 @@ func (x roleRepo) SetStatus(ctx context.Context, id uint64, status uint8) error 
 			return res.Error
 		}
 		if res.RowsAffected > 0 {
-			return BumpCounterTx(tx, "default:epoch")
+			return BumpCounterTx(tx, repository.TenantScope(ctx)+":epoch")
 		}
 		return nil
 	})
@@ -100,7 +100,7 @@ func (x roleRepo) DeleteWithAssociations(ctx context.Context, id uint64) error {
 		if err := tx.Where("role_id = ?", id).Delete(&model.RolePermission{}).Error; err != nil {
 			return err
 		}
-		if err := BumpCounterTx(tx, "default:epoch"); err != nil {
+		if err := BumpCounterTx(tx, repository.TenantScope(ctx)+":epoch"); err != nil {
 			return err
 		}
 		res := tx.Delete(&model.Role{}, "id = ?", id)
@@ -186,7 +186,7 @@ func (x permissionRepo) SetStatus(ctx context.Context, id uint64, status uint8) 
 			return res.Error
 		}
 		if res.RowsAffected > 0 {
-			return BumpCounterTx(tx, "default:epoch")
+			return BumpCounterTx(tx, repository.TenantScope(ctx)+":epoch")
 		}
 		return nil
 	})
@@ -200,7 +200,7 @@ func (x permissionRepo) ApplySync(ctx context.Context, plan registry.SyncPlan) e
 	return x.r.writer(ctx).Transaction(func(tx *gorm.DB) error {
 		if plan.Changed() {
 			// 权限集变化影响全域：epoch 同事务递增（P0-2）。
-			if err := BumpCounterTx(tx, "default:epoch"); err != nil {
+			if err := BumpCounterTx(tx, repository.TenantScope(ctx)+":epoch"); err != nil {
 				return err
 			}
 		}
@@ -251,7 +251,7 @@ func (x userRoleRepo) Assign(ctx context.Context, subjectID string, roleID uint6
 			return err
 		}
 		if ur.ID != 0 {
-			return BumpCounterTx(tx, "default:subject:"+subjectID+":version")
+			return BumpCounterTx(tx, repository.TenantScope(ctx)+":subject:"+subjectID+":version")
 		}
 		return nil
 	})
@@ -265,7 +265,7 @@ func (x userRoleRepo) Revoke(ctx context.Context, subjectID string, roleID uint6
 			return res.Error
 		}
 		if res.RowsAffected > 0 {
-			return BumpCounterTx(tx, "default:subject:"+subjectID+":version")
+			return BumpCounterTx(tx, repository.TenantScope(ctx)+":subject:"+subjectID+":version")
 		}
 		return nil
 	})
@@ -357,7 +357,7 @@ func (x rolePermissionRepo) SetPermissions(ctx context.Context, roleID uint64, p
 				}
 			}
 			if removed > 0 || len(add) > 0 {
-				return BumpCounterTx(tx, "default:epoch")
+				return BumpCounterTx(tx, repository.TenantScope(ctx)+":epoch")
 			}
 			return nil
 		})
@@ -422,7 +422,7 @@ func (x userGrantRepo) Grant(ctx context.Context, g model.UserGrant, now time.Ti
 				return err
 			}
 			// 权威版本号与变更同事务递增（P0-1 第一阶段）。
-			return BumpCounterTx(tx, "default:subject:"+g.SubjectID+":version")
+			return BumpCounterTx(tx, repository.TenantScope(ctx)+":subject:"+g.SubjectID+":version")
 		})
 	})
 }
@@ -445,7 +445,7 @@ func (x userGrantRepo) Revoke(ctx context.Context, subjectID string, permissionI
 			affected = res.RowsAffected
 			if affected > 0 {
 				// 权威版本号与变更同事务递增（P0-1 第一阶段）。
-				return BumpCounterTx(tx, "default:subject:"+subjectID+":version")
+				return BumpCounterTx(tx, repository.TenantScope(ctx)+":subject:"+subjectID+":version")
 			}
 			return nil
 		})

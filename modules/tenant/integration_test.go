@@ -398,3 +398,31 @@ func (s *IsolationSuite) TestManagementSurface_TenantFiltered() {
 	err = s.app.Grants().Revoke(s.tenantCtx("acme"), acmeAdmin, "10001", "user:list")
 	s.ErrorIs(err, core.ErrGrantNotFound, "acme 域内的撤销不得影响 beta 域数据")
 }
+
+// 第四轮审核回归：租户域的权威计数器必须在变更事务内递增（键含租户前缀）。
+// 修复前：base bump 硬编码 default:，tenant 覆写无 bump → 租户权威永不前进，
+// 副本丢失后从 DB 恢复会把生成键回退到陈旧值（旧权限复活条件成立）。
+func (s *IsolationSuite) TestTenantAuthorityCounters_BumpPerScope() {
+	// Arrange：acme 域内授权（走 tenant 仓储覆写）。
+	acmeAdmin := s.ac("acme", "acme-admin")
+	s.Require().NoError(s.app.Grants().Grant(s.tenantCtx("acme"), acmeAdmin, "99001", "order:export", nil, ""))
+
+	// Assert：rbac_counters 必须出现 acme 前缀的主体版本键，值 ≥1。
+	var v int64
+	err := s.db.Table("rbac_counters").
+		Select("v").
+		Where("k = ?", "acme:subject:99001:version").
+		Limit(1).
+		Scan(&v).Error
+	s.Require().NoError(err)
+	s.GreaterOrEqual(v, int64(1), "租户域授权必须在同事务递增 acme: 主体版本（修复前此键不存在）")
+
+	// 角色级操作（走共享 base SetPermissions，scope 取自 ctx）递增 acme:epoch。
+	role, err := s.app.Roles().Create(s.tenantCtx("acme"), acmeAdmin, "cnt_role", "C", "")
+	s.Require().NoError(err)
+	s.Require().NoError(s.app.Roles().SetPermissions(s.tenantCtx("acme"), acmeAdmin, role.ID, []string{"order:export"}))
+	var e int64
+	s.Require().NoError(s.db.Table("rbac_counters").
+		Select("v").Where("k = ?", "acme:epoch").Limit(1).Scan(&e).Error)
+	s.GreaterOrEqual(e, int64(1), "租户域角色级变更必须递增 acme:epoch")
+}
