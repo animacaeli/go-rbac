@@ -166,3 +166,34 @@ func TestCache_ServerDown_ErrorSurfaces(t *testing.T) {
 	require.Error(t, errGet)
 	require.Error(t, errSetMax)
 }
+
+// §4 专项（外部评审第六轮）：损坏值自愈必须是 Lua 原子操作——
+// 不允许"先删再写"两步（删除与回填之间的并发同步会看到空键，
+// INCR-from-missing 类偏差理论上可注入）。
+func (s *CacheSuite) TestSetIntMax_CorruptValue_AtomicSelfHeal() {
+	// Arrange：键为损坏字符串。
+	s.srv.Set("k", "corrupt!!!")
+
+	// Act：SetIntMax 原子替换（无 Delete 前置）。
+	s.Require().NoError(s.sut.SetIntMax(s.ctx, "k", int64(7)))
+
+	// Assert：副本 = 权威真值；整个过程无空键窗口。
+	v, ok, err := s.sut.GetInt(s.ctx, "k")
+	s.Require().NoError(err)
+	s.True(ok)
+	s.Equal(int64(7), v)
+
+	// 并发乱序：损坏键被两个不同真值先后写入 → 最大值胜出。
+	s.srv.Set("k2", "broken")
+	var wg sync.WaitGroup
+	for _, val := range []int64{5, 9} {
+		wg.Add(1)
+		go func(v int64) {
+			defer wg.Done()
+			_ = s.sut.SetIntMax(s.ctx, "k2", v)
+		}(val)
+	}
+	wg.Wait()
+	v2, _, _ := s.sut.GetInt(s.ctx, "k2")
+	s.Equal(int64(9), v2, "损坏键上的并发写入收敛到最大真值")
+}

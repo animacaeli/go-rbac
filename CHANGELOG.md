@@ -29,6 +29,22 @@
 - 矩阵门禁第 13 行：双实例共享 DB/Redis 的并发计数器恢复（P1-1）——
   从 DB 权威值收敛、无陈旧命中（真实 MySQL + Redis，3 遍稳定）
 
+### Fixed（外部评审第六轮）
+
+- **P0 三项主张核实结果：均不成立**（当前 HEAD `562d42d` 编译/vet 通过，
+  方法名已全量更名 Sync*，Redis 适配器已实现 SetIntMax Lua 脚本）——
+  评审者看的是第五轮修复前的旧快照
+- **§4 采纳**：`recoverCountersFromDB` 的"先删再写"两步竞态（删除与回填
+  之间的并发同步可看到空键）——已删除 Delete 前置步骤，Lua 的
+  `tonumber(cur)` 解析失败分支本身就是原子的损坏值替换；新增专项测试
+  `TestSetIntMax_CorruptValue_AtomicSelfHeal`（损坏键上的并发写入收敛到
+  最大真值）
+- **§6 采纳**：README 残留"提交后才递增"旧措辞已更正为"同事务递增"；
+  设计文档 §6 开头新增组件职责表（MySQL 权威 / Redis 单调副本 /
+  SyncSubjectVersion / SyncEpoch / SetIntMax 六行）
+- **§5 核实**：七操作同事务验证通过（grep 证据：base 10 处 +
+  tenant 4 处 BumpCounterTx 全部在 `tx` 闭包内）
+
 ### Fixed（第六轮自审）
 
 - **Simple 模式查询放大**：DB 权威协议落地后，NoopCache 的 GetInt 恒返回

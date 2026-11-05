@@ -325,14 +325,9 @@ func (s *AuthorizationService) recoverCountersFromDB(ctx context.Context, scope,
 	if err != nil {
 		return 0, 0, fmt.Errorf("rbac: recover subject version from db: %w", err)
 	}
-	// 值损坏（eErr/vErr）时先删再写，避免类型错误阻塞 SetInt。
-	if eErr != nil {
-		_ = s.cch.Delete(ctx, epochKey(scope))
-	}
-	if vErr != nil {
-		_ = s.cch.Delete(ctx, subjectVersionKey(scope, subject))
-	}
-	// SetIntMax：恢复与并发同步乱序时副本只会前进，不会回退（P0-2）。
+	// SetIntMax 单调回填（不先删）：Lua 脚本原子处理损坏值
+	// （tonumber(cur) 解析失败即视为不可信，原子替换为权威值），
+	// 消除"删除与回填之间的并发同步"竞态窗口（§6.2，外部评审第六轮）。
 	_ = s.cch.SetIntMax(ctx, epochKey(scope), epoch)
 	_ = s.cch.SetIntMax(ctx, subjectVersionKey(scope, subject), version)
 	return epoch, version, nil

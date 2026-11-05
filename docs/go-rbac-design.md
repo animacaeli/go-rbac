@@ -1026,6 +1026,17 @@ v1 无 tenant_id 是刻意决策（永不启用多租户的项目不付成本）
 >
 > 定位声明（v0.4.0-design 起）：**版本号权威来源是数据库**。Redis 只缓存权限集合与版本号副本；TTL 是垃圾回收机制，不承担正确性。
 
+**组件职责表**：
+
+| 组件 | 职责 |
+|---|---|
+| MySQL `rbac_counters` | 权威版本号（与授权变更同事务递增） |
+| Redis Counter | 权威版本号的单调副本（SetIntMax 原子写入） |
+| Redis Permission Cache | 权限集合缓存（生成键寻址） |
+| `SyncSubjectVersion` | 将 DB 权威主体版本同步到 Redis 副本 |
+| `SyncEpoch` | 将 DB 权威 epoch 同步到 Redis 副本 |
+| `SetIntMax` | Lua 原子单调写入（唯一允许的计数器写原语）|
+
 ## 6.1 缓存内容与 Key
 
 缓存用户**最终有效权限集合**（不缓存中间查询）。Key 格式（scope 槽位 v1 定死，多租户上线只改取值不改形状）：
