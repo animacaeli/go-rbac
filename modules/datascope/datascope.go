@@ -135,6 +135,9 @@ func (m *Module) Migrations() []rbac.Migration {
 
 // SetRoleScope 设置（替换式）某角色在某资源上的数据范围。幂等。
 // 内置超管角色的数据范围无意义（解析恒为 ScopeAll），设置将被拒绝以免误导。
+//
+// 多租户：角色必须属于 operator 的授权域，否则返回 NotFound——角色 ID 全局
+// 唯一，缺此校验时 A 租户可按 ID 改写 B 租户角色的数据范围（§2.9）。
 func (m *Module) SetRoleScope(ctx context.Context, operator core.AuthorizationContext, roleID uint64, resource string, scope Scope) error {
 	if m.app == nil {
 		return fmt.Errorf("rbac/modules/datascope: module not registered")
@@ -145,17 +148,28 @@ func (m *Module) SetRoleScope(ctx context.Context, operator core.AuthorizationCo
 	if resource == "" || len(resource) > model.RoleCodeMaxLength {
 		return fmt.Errorf("rbac/modules/datascope: invalid resource %q", resource)
 	}
+	if m.app.TenancyEnabled() {
+		if operator.TenantID == "" {
+			return core.ErrTenantRequired
+		}
+		if !core.ValidTenantID(operator.TenantID) {
+			return fmt.Errorf("%w: %q", core.ErrInvalidTenantID, operator.TenantID)
+		}
+	}
 	ctx = core.ContextWithTenant(ctx, operator.TenantID)
 
 	var role struct {
 		ID        uint64
 		IsBuiltin bool
 	}
-	if err := m.db().WithContext(ctx).
+	roleQuery := m.db().WithContext(ctx).
 		Table("rbac_roles").
 		Select("id, is_builtin").
-		Where("id = ?", roleID).
-		Scan(&role).Error; err != nil {
+		Where("id = ?", roleID)
+	if m.app.TenancyEnabled() {
+		roleQuery = roleQuery.Where("tenant_id = ?", operator.TenantID)
+	}
+	if err := roleQuery.Scan(&role).Error; err != nil {
 		return err
 	}
 	if role.ID == 0 {
@@ -185,19 +199,47 @@ func (m *Module) SetRoleScope(ctx context.Context, operator core.AuthorizationCo
 }
 
 // RemoveRoleScope 清除角色的资源数据范围（回落到默认 ScopeSelf）。
-func (m *Module) RemoveRoleScope(ctx context.Context, resource string, roleID uint64) error {
+// 多租户下先校验角色属于 ctx（由调用方经 core.ContextWithTenant 注入）的授权域。
+func (m *Module) RemoveRoleScope(ctx context.Context, roleID uint64, resource string) error {
 	if m.app == nil {
 		return fmt.Errorf("rbac/modules/datascope: module not registered")
+	}
+	if err := m.requireRoleInScope(ctx, roleID); err != nil {
+		return err
 	}
 	return m.db().WithContext(ctx).
 		Where("role_id = ? AND resource = ?", roleID, resource).
 		Delete(&roleDataScope{}).Error
 }
 
+// requireRoleInScope 校验角色存在且（启用多租户时）属于 ctx 的授权域。
+func (m *Module) requireRoleInScope(ctx context.Context, roleID uint64) error {
+	q := m.db().WithContext(ctx).Table("rbac_roles").Where("id = ?", roleID)
+	if m.app.TenancyEnabled() {
+		tenant, ok := core.TenantFromContext(ctx)
+		if !ok {
+			return fmt.Errorf("rbac/modules/datascope: tenant scope missing in context (fail closed)")
+		}
+		q = q.Where("tenant_id = ?", tenant)
+	}
+	var n int64
+	if err := q.Count(&n).Error; err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("%w: role id=%d", repository.ErrRecordNotFound, roleID)
+	}
+	return nil
+}
+
 // RoleScopes 返回角色在各资源上的数据范围（管理界面展示用）。
+// 多租户下先校验角色属于 ctx 的授权域。
 func (m *Module) RoleScopes(ctx context.Context, roleID uint64) (map[string]Scope, error) {
 	if m.app == nil {
 		return nil, fmt.Errorf("rbac/modules/datascope: module not registered")
+	}
+	if err := m.requireRoleInScope(ctx, roleID); err != nil {
+		return nil, err
 	}
 	var rows []roleDataScope
 	if err := m.db().WithContext(ctx).
@@ -237,15 +279,19 @@ func (m *Module) ResolveDataScope(ctx context.Context, ac core.AuthorizationCont
 	}
 
 	// 主体全部启用角色中，该资源上配置的最宽范围。
+	// 多租户：同一 subject_id 可存在于多个租户，必须按授权域过滤 ur/r，
+	// 否则 A 租户配置的宽范围会泄漏给 B 租户的同名主体（§2.9）。
 	var widest *Scope
 	var rows []roleDataScope
-	if err := m.db().WithContext(ctx).
+	scopeQuery := m.db().WithContext(ctx).
 		Table("rbac_role_data_scopes AS rds").
 		Joins("JOIN rbac_user_roles ur ON ur.role_id = rds.role_id").
 		Joins("JOIN rbac_roles r ON r.id = ur.role_id AND r.status = ?", model.RoleStatusEnabled).
-		Where("ur.subject_id = ? AND rds.resource = ?", ac.SubjectID.String(), resource).
-		Select("rds.scope").
-		Scan(&rows).Error; err != nil {
+		Where("ur.subject_id = ? AND rds.resource = ?", ac.SubjectID.String(), resource)
+	if m.app.TenancyEnabled() {
+		scopeQuery = scopeQuery.Where("ur.tenant_id = ? AND r.tenant_id = ?", ac.TenantID, ac.TenantID)
+	}
+	if err := scopeQuery.Select("rds.scope").Scan(&rows).Error; err != nil {
 		return 0, err
 	}
 	for _, r := range rows {

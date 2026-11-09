@@ -15,7 +15,9 @@
 //	    // rbac.WithModules(audit.New(audit.WithLogOnly())),  // 审计降级为日志
 //	)
 //	// app.Migrate 会自动包含 audit 模块迁移（Core → 模块注册顺序）
-//	logs, _ := app.Module(...)  // 或自行持有 audit.New() 返回的实例调用 Query
+//	auditM := audit.New()
+//	app, _ := rbac.New(..., rbac.WithModules(auditM))
+//	logs, _ := audit.NewQuery(auditM).List(ctx, audit.Filter{})
 package audit
 
 import (
@@ -49,6 +51,7 @@ type Module struct {
 	policy FailPolicy
 	logger *slog.Logger
 	db     *gorm.DB
+	app    *rbac.App
 }
 
 var (
@@ -84,6 +87,7 @@ func (m *Module) Dependencies() []string { return nil }
 
 // Register 注入事件实现并捕获数据库句柄。只做注册，不触库（§3.3）。
 func (m *Module) Register(app *rbac.App) error {
+	m.app = app
 	m.db = app.DB()
 	app.SetEventSink(m)
 	return nil
@@ -143,26 +147,64 @@ func (m *Module) RecordEvent(ctx context.Context, e core.Event) error {
 
 // Filter 是审计查询条件。
 type Filter struct {
-	Operator string    // 精确匹配操作人
-	Type     string    // 精确匹配事件类型
-	Subject  string    // target 精确匹配（被操作对象）
-	Since    time.Time // created_at >=
-	Until    time.Time // created_at <（零值忽略）
-	Offset   int
-	Limit    int // <=0 默认 100，上限 1000
+	Operator string // 精确匹配操作人
+	Type     string // 精确匹配事件类型
+	Subject  string // target 精确匹配（被操作对象）
+	// Tenant 显式指定授权域（含平台域的空串）。nil = 由 ctx 的租户槽位决定：
+	// 多租户模式下 ctx 缺租户会报错（fail closed）；显式传入空串可查询平台域
+	// 事件（如权限同步）。仅在调用方已完成授权的前提下使用。
+	Tenant *string
+	Since  time.Time // created_at >=
+	Until  time.Time // created_at <（零值忽略）
+	Offset int
+	Limit  int // <=0 默认 100，上限 1000
 }
 
 // Query 审计查询服务。
 type Query struct {
-	db *gorm.DB
+	db      *gorm.DB
+	tenancy func() bool
 }
 
 // NewQuery 以模块实例构造查询服务（需已 Register）。
-func NewQuery(m *Module) *Query { return &Query{db: m.db} }
+// 未注册时返回的 Query 在 List 中报错而非 panic。
+func NewQuery(m *Module) *Query {
+	q := &Query{db: m.db}
+	if m != nil && m.app != nil {
+		q.tenancy = m.app.TenancyEnabled
+	}
+	return q
+}
 
 // List 按条件查询审计记录，按时间倒序。
+//
+// 多租户：ctx 中存在租户槽位（core.ContextWithTenant / 适配器解析结果）时
+// 强制按该租户过滤——审计表记录 tenant_id，查询侧必须同样隔离，否则持有
+// rbac:audit:read 的租户管理员可以读到其它租户的审计记录。单租户部署
+// 不注入租户槽位，行为与旧版一致。
 func (q *Query) List(ctx context.Context, f Filter) ([]AuditLog, error) {
+	if q == nil || q.db == nil {
+		return nil, fmt.Errorf("rbac/modules/audit: query used before module Register")
+	}
 	query := q.db.WithContext(ctx).Model(&AuditLog{})
+	switch {
+	case f.Tenant != nil:
+		// 显式指定（含平台域 ""）：调用方已鉴权，按其声明过滤。
+		query = query.Where("tenant_id = ?", *f.Tenant)
+	case q.tenancy != nil && q.tenancy():
+		// 启用多租户：审计查询必须显式指定授权域（fail closed）。缺租户时
+		// 返回错误而不是退化为"查全部租户"，避免跨租户审计信息泄漏。
+		tenant, ok := core.TenantFromContext(ctx)
+		if !ok || tenant == "" {
+			return nil, fmt.Errorf("%w: audit query requires tenant context in multi-tenant mode", core.ErrTenantRequired)
+		}
+		query = query.Where("tenant_id = ?", tenant)
+	default:
+		if tenant, ok := core.TenantFromContext(ctx); ok {
+			// 单租户部署：ctx 若显式携带授权域仍按域过滤（防御性）。
+			query = query.Where("tenant_id = ?", tenant)
+		}
+	}
 	if f.Operator != "" {
 		query = query.Where("operator_id = ?", f.Operator)
 	}
@@ -185,8 +227,12 @@ func (q *Query) List(ctx context.Context, f Filter) ([]AuditLog, error) {
 	if limit > 1000 {
 		limit = 1000
 	}
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
 	var logs []AuditLog
-	if err := query.Order("id DESC").Offset(f.Offset).Limit(limit).Find(&logs).Error; err != nil {
+	if err := query.Order("id DESC").Offset(offset).Limit(limit).Find(&logs).Error; err != nil {
 		return nil, fmt.Errorf("rbac/modules/audit: list: %w", err)
 	}
 	return logs, nil

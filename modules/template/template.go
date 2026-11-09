@@ -31,8 +31,9 @@ import (
 // Module 是角色模板模块（实现 rbac.Module）。
 // 服务经 app 惰性获取：tenant 等模块可能在 Register 期替换仓储与服务。
 type Module struct {
-	templates map[string]Definition
-	app       *rbac.App
+	templates  map[string]Definition
+	duplicates []string
+	app        *rbac.App
 }
 
 var _ rbac.Module = (*Module)(nil)
@@ -50,10 +51,17 @@ func Define(code, name, description string, permissionCodes ...string) Definitio
 	return Definition{Code: code, Name: name, Description: description, PermissionCodes: permissionCodes}
 }
 
-// New 构造模板模块。
+// New 构造模板模块。模板定义在构造期完成校验与深拷贝：
+// 调用方后续修改传入的切片不会再影响已注册模板。
 func New(defs ...Definition) *Module {
 	m := &Module{templates: make(map[string]Definition, len(defs))}
 	for _, d := range defs {
+		d.PermissionCodes = append([]string(nil), d.PermissionCodes...)
+		if prev, dup := m.templates[d.Code]; dup && (prev.Name != d.Name || strings.Join(prev.PermissionCodes, ",") != strings.Join(d.PermissionCodes, ",")) {
+			// 同名模板重复声明且内容不同：静默 last-wins 会让"模板内容取决于
+			// 声明顺序"，在 Register 期报错。
+			m.duplicates = append(m.duplicates, d.Code)
+		}
 		m.templates[d.Code] = d
 	}
 	return m
@@ -70,7 +78,16 @@ func (m *Module) Dependencies() []string { return nil }
 func (m *Module) Register(app *rbac.App) error {
 	m.app = app
 	reg := app.Registry()
+	if len(m.templates) == 0 {
+		return fmt.Errorf("rbac/modules/template: no templates defined")
+	}
+	if len(m.duplicates) > 0 {
+		return fmt.Errorf("rbac/modules/template: template code declared twice with different definitions: %v", m.duplicates)
+	}
 	for code, def := range m.templates {
+		if strings.TrimSpace(code) == "" {
+			return fmt.Errorf("rbac/modules/template: template code must not be empty")
+		}
 		if strings.TrimSpace(def.Name) == "" {
 			return fmt.Errorf("rbac/modules/template: template %s missing name", code)
 		}
@@ -91,6 +108,9 @@ func (m *Module) Migrations() []rbac.Migration { return nil }
 // 复制发生在创建时刻：后续模板变化不影响该角色。
 // 授权者持权约束照常生效：operator 必须持有模板全部权限（超管除外）。
 func (m *Module) CreateFromTemplate(ctx context.Context, operator core.AuthorizationContext, templateCode, roleCode, roleName string) (*model.Role, error) {
+	if m.app == nil {
+		return nil, fmt.Errorf("rbac/modules/template: module not registered")
+	}
 	tpl, ok := m.templates[templateCode]
 	if !ok {
 		return nil, fmt.Errorf("rbac/modules/template: unknown template %s", templateCode)
@@ -113,10 +133,11 @@ func (m *Module) CreateFromTemplate(ctx context.Context, operator core.Authoriza
 	return role, nil
 }
 
-// Templates 返回全部模板定义（按 code 排序）。
+// Templates 返回全部模板定义（按 code 排序，切片为深拷贝）。
 func (m *Module) Templates() []Definition {
 	out := make([]Definition, 0, len(m.templates))
 	for _, def := range m.templates {
+		def.PermissionCodes = append([]string(nil), def.PermissionCodes...)
 		out = append(out, def)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Code < out[j].Code })

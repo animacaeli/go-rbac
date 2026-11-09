@@ -1,6 +1,7 @@
 package menu
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -27,4 +28,13 @@ func TestBuildTree_ParentPromotionAndOrdering(t *testing.T) {
 		[]string{roots[0].Code, roots[1].Code, roots[2].Code, roots[3].Code})
 	require.Len(t, roots[2].Children, 1)
 	assert.Equal(t, "grandchild", roots[2].Children[0].Code)
+}
+
+// 自引用会形成环（菜单从根不可达、静默消失）：声明期直接拒绝。
+func TestDeclare_SelfParentRejected(t *testing.T) {
+	m := New()
+	err := m.Declare(context.Background(), Item{
+		Code: "a", Parent: "a", Name: "A", Type: TypeDirectory,
+	})
+	require.ErrorIs(t, err, ErrMenuCycle)
 }

@@ -134,44 +134,82 @@ func (m *Module) Migrations() []rbac.Migration {
 	}
 }
 
+// ErrMenuCycle 表示菜单父子关系存在环（声明或历史数据错误）。
+var ErrMenuCycle = errors.New("rbac/modules/menu: menu hierarchy contains a cycle")
+
 // Declare 以声明方式幂等 upsert 菜单：按 Code 定位，新增或更新元数据与权限关联。
 // 声明式接入与 Registry 的哲学一致：菜单结构由代码定义，数据库只是存储。
+//
+// 整个声明在单事务内完成：父菜单不存在、权限缺失或出现父子环时整体回滚
+// （不会留下"菜单已建、权限关联失败"的半成品）。
 func (m *Module) Declare(ctx context.Context, items ...Item) error {
-	if m.app == nil {
-		return fmt.Errorf("rbac/modules/menu: module not registered")
-	}
-	// 先全部落菜单行（父先于子处理依赖）。
-	byCode := make(map[string]uint64, len(items))
 	for _, it := range items {
 		if err := validateCode(it.Code); err != nil {
 			return err
 		}
-		if it.Parent != "" {
-			if _, ok := byCode[it.Parent]; !ok {
-				// 父可能是已存在的菜单，也可能是本轮稍后声明——先查库。
-				var parentID uint64
-				err := m.db().WithContext(ctx).
-					Table("rbac_menus").Where("code = ?", it.Parent).
-					Select("id").Scan(&parentID).Error
-				if err != nil {
-					return err
+		if it.Parent != "" && strings.EqualFold(it.Parent, it.Code) {
+			return fmt.Errorf("%w: menu %q cannot be its own parent", ErrMenuCycle, it.Code)
+		}
+	}
+	if m.app == nil {
+		return fmt.Errorf("rbac/modules/menu: module not registered")
+	}
+	return m.db().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		byCode := make(map[string]uint64, len(items))
+		for _, it := range items {
+			if it.Parent != "" {
+				if _, ok := byCode[it.Parent]; !ok {
+					var parentID uint64
+					if err := tx.Table("rbac_menus").Where("code = ?", it.Parent).Select("id").Scan(&parentID).Error; err != nil {
+						return err
+					}
+					if parentID == 0 {
+						return fmt.Errorf("rbac/modules/menu: parent %s not found for %s (declare parents first)", it.Parent, it.Code)
+					}
+					byCode[it.Parent] = parentID
 				}
-				if parentID == 0 {
-					return fmt.Errorf("rbac/modules/menu: parent %s not found for %s (declare parents first)", it.Parent, it.Code)
-				}
-				byCode[it.Parent] = parentID
+			}
+			menu, err := m.upsert(tx, it, byCode[it.Parent])
+			if err != nil {
+				return err
+			}
+			byCode[it.Code] = menu.ID
+		}
+		for _, it := range items {
+			if err := m.setPermissions(tx, ctx, byCode[it.Code], it.Permissions); err != nil {
+				return err
 			}
 		}
-		menu, err := m.upsert(ctx, it, byCode[it.Parent])
-		if err != nil {
-			return err
-		}
-		byCode[it.Code] = menu.ID
+		return checkMenuCycle(tx)
+	})
+}
+
+// checkMenuCycle 检测菜单父子关系环（历史数据可能由早期版本或手工导入产生）。
+func checkMenuCycle(db *gorm.DB) error {
+	var edges []struct {
+		ID       uint64
+		ParentID uint64
 	}
-	// 再处理权限关联（依赖菜单行已存在）。
-	for _, it := range items {
-		if err := m.setPermissions(ctx, byCode[it.Code], it.Permissions); err != nil {
-			return err
+	if err := db.Table("rbac_menus").Select("id, parent_id").Scan(&edges).Error; err != nil {
+		return err
+	}
+	parent := make(map[uint64]uint64, len(edges))
+	ids := make(map[uint64]struct{}, len(edges))
+	for _, e := range edges {
+		parent[e.ID] = e.ParentID
+		ids[e.ID] = struct{}{}
+	}
+	for id := range ids {
+		seen := make(map[uint64]struct{})
+		for cur := id; cur != 0; {
+			if _, dup := seen[cur]; dup {
+				return fmt.Errorf("%w: menu id=%d", ErrMenuCycle, id)
+			}
+			seen[cur] = struct{}{}
+			if _, ok := ids[cur]; !ok {
+				break // 悬空父节点按根处理（兼容历史数据）
+			}
+			cur = parent[cur]
 		}
 	}
 	return nil
@@ -184,7 +222,7 @@ func validateCode(code string) error {
 	return nil
 }
 
-func (m *Module) upsert(ctx context.Context, it Item, parentID uint64) (*Menu, error) {
+func (m *Module) upsert(tx *gorm.DB, it Item, parentID uint64) (*Menu, error) {
 	if strings.TrimSpace(it.Name) == "" || len(it.Name) > model.NameMaxLength {
 		return nil, fmt.Errorf("rbac/modules/menu: menu %s requires name (1-%d chars)", it.Code, model.NameMaxLength)
 	}
@@ -192,7 +230,7 @@ func (m *Module) upsert(ctx context.Context, it Item, parentID uint64) (*Menu, e
 		return nil, fmt.Errorf("rbac/modules/menu: menu %s invalid type %d", it.Code, it.Type)
 	}
 	var existing Menu
-	err := m.db().WithContext(ctx).Where("code = ?", it.Code).First(&existing).Error
+	err := tx.Where("code = ?", it.Code).First(&existing).Error
 	switch err {
 	case nil:
 		existing.ParentID = parentID
@@ -202,7 +240,7 @@ func (m *Module) upsert(ctx context.Context, it Item, parentID uint64) (*Menu, e
 		existing.Component = it.Component
 		existing.Icon = it.Icon
 		existing.Sort = it.Sort
-		if err := m.db().WithContext(ctx).Save(&existing).Error; err != nil {
+		if err := tx.Save(&existing).Error; err != nil {
 			return nil, err
 		}
 		return &existing, nil
@@ -215,7 +253,7 @@ func (m *Module) upsert(ctx context.Context, it Item, parentID uint64) (*Menu, e
 			Path: it.Path, Component: it.Component, Icon: it.Icon, Sort: it.Sort,
 			Status: model.RoleStatusEnabled,
 		}
-		if err := m.db().WithContext(ctx).Create(&created).Error; err != nil {
+		if err := tx.Create(&created).Error; err != nil {
 			return nil, err
 		}
 		return &created, nil
@@ -223,11 +261,9 @@ func (m *Module) upsert(ctx context.Context, it Item, parentID uint64) (*Menu, e
 }
 
 // setPermissions 替换式设置菜单权限关联；空清单 = 清除关联（菜单对所有人可见）。
-func (m *Module) setPermissions(ctx context.Context, menuID uint64, codes []string) error {
+func (m *Module) setPermissions(tx *gorm.DB, ctx context.Context, menuID uint64, codes []string) error {
 	if len(codes) == 0 {
-		return m.db().WithContext(ctx).
-			Where("menu_id = ?", menuID).
-			Delete(&MenuPermission{}).Error
+		return tx.Where("menu_id = ?", menuID).Delete(&MenuPermission{}).Error
 	}
 	distinct := make([]string, 0, len(codes))
 	seen := make(map[string]struct{}, len(codes))
@@ -249,16 +285,14 @@ func (m *Module) setPermissions(ctx context.Context, menuID uint64, codes []stri
 		return fmt.Errorf("rbac/modules/menu: some permissions missing from database (run SyncPermissions first)")
 	}
 
-	return m.db().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("menu_id = ?", menuID).Delete(&MenuPermission{}).Error; err != nil {
-			return err
-		}
-		rows := make([]MenuPermission, 0, len(perms))
-		for _, p := range perms {
-			rows = append(rows, MenuPermission{MenuID: menuID, PermissionID: p.ID})
-		}
-		return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&rows).Error
-	})
+	if err := tx.Where("menu_id = ?", menuID).Delete(&MenuPermission{}).Error; err != nil {
+		return err
+	}
+	rows := make([]MenuPermission, 0, len(perms))
+	for _, p := range perms {
+		rows = append(rows, MenuPermission{MenuID: menuID, PermissionID: p.ID})
+	}
+	return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&rows).Error
 }
 
 // SetStatus 启用/禁用菜单。
@@ -278,20 +312,49 @@ func (m *Module) SetStatus(ctx context.Context, code string, status uint8) error
 
 // ResolveVisibleMenus 返回主体可见的启用菜单树（§2.7 OR 语义）：
 // 超级管理员可见全部；其余主体：无权限关联的菜单可见，有关联的需持有
-// 任一关联权限。禁用菜单及其子树不返回。
+// 任一**启用**关联权限。禁用菜单及其子树不返回。
+//
+// 关联语义是 fail closed 的：只要菜单存在任何权限关联（无论关联的权限是否
+// 已禁用/废弃），就必须持有其中一条启用权限才可见。否则权限下线（SyncPermissions
+// 会把下线权限标为废弃）会让"曾受控"的菜单退化为全员可见。
 func (m *Module) ResolveVisibleMenus(ctx context.Context, ac core.AuthorizationContext) ([]*Node, error) {
 	if m.app == nil {
 		return nil, fmt.Errorf("rbac/modules/menu: module not registered")
 	}
+	// 读取全部菜单（含禁用）：需要据此剔除"祖先被禁用"的整棵子树。
 	var menus []Menu
-	if err := m.db().WithContext(ctx).
-		Where("status = ?", model.RoleStatusEnabled).
-		Order("sort ASC, id ASC").
-		Find(&menus).Error; err != nil {
+	if err := m.db().WithContext(ctx).Order("sort ASC, id ASC").Find(&menus).Error; err != nil {
 		return nil, err
 	}
 	if len(menus) == 0 {
 		return nil, nil
+	}
+	if err := checkMenuCycle(m.db().WithContext(ctx)); err != nil {
+		return nil, err
+	}
+	byID := make(map[uint64]Menu, len(menus))
+	for _, mu := range menus {
+		byID[mu.ID] = mu
+	}
+	// 有效禁用 = 自身禁用，或任一祖先禁用（§2.7：禁用菜单及其子树不返回）。
+	memo := make(map[uint64]bool, len(menus))
+	var effectivelyDisabled func(id uint64) bool
+	effectivelyDisabled = func(id uint64) bool {
+		if v, ok := memo[id]; ok {
+			return v
+		}
+		mu, ok := byID[id]
+		if !ok {
+			return true
+		}
+		disabled := mu.Status != model.RoleStatusEnabled
+		if !disabled && mu.ParentID != 0 {
+			if _, hasParent := byID[mu.ParentID]; hasParent {
+				disabled = effectivelyDisabled(mu.ParentID)
+			}
+		}
+		memo[id] = disabled
+		return disabled
 	}
 
 	isSuper, err := m.authz().IsSuperAdministrator(ctx, ac)
@@ -299,7 +362,23 @@ func (m *Module) ResolveVisibleMenus(ctx context.Context, ac core.AuthorizationC
 		return nil, err
 	}
 
-	// 菜单 → 关联的启用权限码。
+	// 关联总数（含禁用/废弃权限）：决定菜单是否"受控"。
+	var totals []struct {
+		MenuID uint64
+		C      int64
+	}
+	if err := m.db().WithContext(ctx).
+		Table("rbac_menu_permissions").
+		Select("menu_id, COUNT(*) AS c").
+		Group("menu_id").
+		Scan(&totals).Error; err != nil {
+		return nil, err
+	}
+	linkTotal := make(map[uint64]int64, len(totals))
+	for _, t := range totals {
+		linkTotal[t.MenuID] = t.C
+	}
+	// 关联的启用权限码：只有它们能授予可见性。
 	type mpRow struct {
 		MenuID uint64
 		Code   string
@@ -312,9 +391,9 @@ func (m *Module) ResolveVisibleMenus(ctx context.Context, ac core.AuthorizationC
 		Scan(&rows).Error; err != nil {
 		return nil, err
 	}
-	menuPerms := make(map[uint64][]string, len(rows))
+	enabledPerms := make(map[uint64][]string, len(rows))
 	for _, r := range rows {
-		menuPerms[r.MenuID] = append(menuPerms[r.MenuID], r.Code)
+		enabledPerms[r.MenuID] = append(enabledPerms[r.MenuID], r.Code)
 	}
 
 	held := map[string]struct{}{}
@@ -331,19 +410,21 @@ func (m *Module) ResolveVisibleMenus(ctx context.Context, ac core.AuthorizationC
 	visible := make(map[uint64]*Node, len(menus))
 	for i := range menus {
 		mu := menus[i]
-		if !isSuper {
-			required, ok := menuPerms[mu.ID]
-			if ok && len(required) > 0 {
-				any := false
-				for _, code := range required {
-					if _, has := held[code]; has {
-						any = true
-						break
-					}
+		if effectivelyDisabled(mu.ID) {
+			continue
+		}
+		if !isSuper && linkTotal[mu.ID] > 0 {
+			// 受控菜单：必须持有至少一条启用关联权限；全部关联权限被禁用时
+			// 对非超管一律不可见（fail closed）。
+			any := false
+			for _, code := range enabledPerms[mu.ID] {
+				if _, has := held[code]; has {
+					any = true
+					break
 				}
-				if !any {
-					continue
-				}
+			}
+			if !any {
+				continue
 			}
 		}
 		visible[mu.ID] = &Node{Menu: mu}

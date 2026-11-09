@@ -1,11 +1,14 @@
 package template_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/animacaeli/go-rbac"
+	"github.com/animacaeli/go-rbac/core"
 	"github.com/animacaeli/go-rbac/modules/template"
 	"github.com/animacaeli/go-rbac/registry"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
@@ -48,4 +51,24 @@ func TestModule_Register_ValidTemplates_Succeeds(t *testing.T) {
 
 func TestModule_Name(t *testing.T) {
 	require.Equal(t, "template", template.New().Name())
+}
+
+// 模板定义深拷贝：调用方后续修改传入/返回的切片不得影响已注册快照。
+func TestTemplates_DeepCopy(t *testing.T) {
+	codes := []string{"user:list"}
+	m := template.New(template.Define("ops", "运营", "", codes...))
+
+	codes[0] = "mutated:code"
+	got := m.Templates()
+	require.Len(t, got, 1)
+	assert.Equal(t, []string{"user:list"}, got[0].PermissionCodes)
+
+	got[0].PermissionCodes[0] = "mutated:returned"
+	assert.Equal(t, []string{"user:list"}, m.Templates()[0].PermissionCodes)
+}
+
+func TestCreateFromTemplate_UnregisteredModuleFailsClosed(t *testing.T) {
+	m := template.New(template.Define("ops", "运营", "", "user:list"))
+	_, err := m.CreateFromTemplate(context.Background(), core.AuthorizationContext{SubjectID: "op"}, "ops", "role", "R")
+	require.Error(t, err)
 }
