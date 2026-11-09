@@ -24,8 +24,10 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/animacaeli/go-rbac"
@@ -160,18 +162,38 @@ type Filter struct {
 	Limit  int // <=0 默认 100，上限 1000
 }
 
+// ErrTenantScopeViolation 表示显式指定的审计授权域越过了当前请求的租户边界。
+var ErrTenantScopeViolation = errors.New("rbac/modules/audit: explicit tenant is outside the request scope")
+
 // Query 审计查询服务。
 type Query struct {
-	db      *gorm.DB
-	tenancy func() bool
+	db          *gorm.DB
+	tenancy     func() bool
+	crossTenant bool
 }
+
+// QueryOption 定制审计查询的访问边界。
+type QueryOption func(*Query)
+
+// WithCrossTenantAccess 允许显式跨租户 / 平台域查询。
+//
+// 该能力必须只挂在**平台级授权**（如平台超管）的管理端点上：审计模块不鉴权
+// 调用者，无法判断"当前 operator 是否有权查看其它租户"。默认关闭时，
+// Filter.Tenant 只能等于当前请求上下文的租户；跨租户/平台域查询一律拒绝。
+func WithCrossTenantAccess() QueryOption { return func(q *Query) { q.crossTenant = true } }
 
 // NewQuery 以模块实例构造查询服务（需已 Register）。
 // 未注册时返回的 Query 在 List 中报错而非 panic。
-func NewQuery(m *Module) *Query {
+func NewQuery(m *Module, opts ...QueryOption) *Query {
+	if m == nil {
+		return &Query{}
+	}
 	q := &Query{db: m.db}
-	if m != nil && m.app != nil {
+	if m.app != nil {
 		q.tenancy = m.app.TenancyEnabled
+	}
+	for _, opt := range opts {
+		opt(q)
 	}
 	return q
 }
@@ -187,22 +209,27 @@ func (q *Query) List(ctx context.Context, f Filter) ([]AuditLog, error) {
 		return nil, fmt.Errorf("rbac/modules/audit: query used before module Register")
 	}
 	query := q.db.WithContext(ctx).Model(&AuditLog{})
+	ctxTenant, hasCtxTenant := core.TenantFromContext(ctx)
 	switch {
 	case f.Tenant != nil:
-		// 显式指定（含平台域 ""）：调用方已鉴权，按其声明过滤。
+		// 显式指定授权域：默认只允许与请求上下文一致；越界查询必须显式
+		// 使用 WithCrossTenantAccess（平台级授权端点的专用构造）。
+		if !q.crossTenant && (!hasCtxTenant || !strings.EqualFold(*f.Tenant, ctxTenant)) {
+			return nil, fmt.Errorf("%w: filter tenant %q, context tenant %q",
+				ErrTenantScopeViolation, *f.Tenant, ctxTenant)
+		}
 		query = query.Where("tenant_id = ?", *f.Tenant)
 	case q.tenancy != nil && q.tenancy():
 		// 启用多租户：审计查询必须显式指定授权域（fail closed）。缺租户时
 		// 返回错误而不是退化为"查全部租户"，避免跨租户审计信息泄漏。
-		tenant, ok := core.TenantFromContext(ctx)
-		if !ok || tenant == "" {
+		if !hasCtxTenant || ctxTenant == "" {
 			return nil, fmt.Errorf("%w: audit query requires tenant context in multi-tenant mode", core.ErrTenantRequired)
 		}
-		query = query.Where("tenant_id = ?", tenant)
+		query = query.Where("tenant_id = ?", ctxTenant)
 	default:
-		if tenant, ok := core.TenantFromContext(ctx); ok {
+		if hasCtxTenant {
 			// 单租户部署：ctx 若显式携带授权域仍按域过滤（防御性）。
-			query = query.Where("tenant_id = ?", tenant)
+			query = query.Where("tenant_id = ?", ctxTenant)
 		}
 	}
 	if f.Operator != "" {
