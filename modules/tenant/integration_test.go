@@ -236,9 +236,12 @@ func (s *MigrationContractSuite) TestContract_ConcurrentMigrate_Serialized() {
 // IsolationSuite 双租户隔离验证（§2.9 承担项）。
 type IsolationSuite struct {
 	suite.Suite
-	ctx     context.Context
-	db      *gorm.DB
+	ctx context.Context
+	db  *gorm.DB
+	// mr 仅在未提供 RBAC_TEST_REDIS_ADDR（本地快速运行）时使用；
+	// CI/集成环境优先使用真实 Redis（DB 2，与 cache/redis 套件的 DB 0 隔离）。
 	mr      *miniredis.Miniredis
+	rdb     *redis.Client
 	app     *rbac.App
 	tenantM *tenant.Module
 	ds      *datascope.Module
@@ -263,7 +266,19 @@ func (s *IsolationSuite) SetupSuite() {
 	}
 	s.db = db
 
-	mr := miniredis.RunT(s.T())
+	var cacheClient *redis.Client
+	if addr := os.Getenv("RBAC_TEST_REDIS_ADDR"); addr != "" {
+		// 真实 Redis：独立 DB 2，避免与 cache/redis 集成套件（DB 0）并行互清。
+		cacheClient = redis.NewClient(&redis.Options{Addr: addr, DB: 2})
+		require.NoError(s.T(), cacheClient.Ping(s.ctx).Err(), "真实 Redis 不可达（RBAC_TEST_REDIS_ADDR）")
+		require.NoError(s.T(), cacheClient.FlushDB(s.ctx).Err())
+		s.rdb = cacheClient
+		s.T().Cleanup(func() { _ = cacheClient.Close() })
+	} else {
+		mr := miniredis.RunT(s.T())
+		s.mr = mr
+		cacheClient = redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	}
 	reg := registry.NewRegistry()
 	require.NoError(s.T(), reg.Register(
 		registry.New("user:list", "用户列表", "用户管理"),
@@ -275,12 +290,11 @@ func (s *IsolationSuite) SetupSuite() {
 	app, err := rbac.New(
 		rbac.WithDB(db),
 		rbac.WithPermissionRegistry(reg),
-		rbac.WithCache(rediscache.New(redis.NewClient(&redis.Options{Addr: mr.Addr()}))),
+		rbac.WithCache(rediscache.New(cacheClient)),
 		rbac.WithModules(s.tenantM, s.ds, s.auditM), // tenant 建议首位（迁移顺序）
 	)
 	require.NoError(s.T(), err)
 	s.app = app
-	s.mr = mr
 
 	require.NoError(s.T(), app.Migrate(s.ctx))
 	_, err = app.SyncPermissions(s.ctx)
@@ -354,8 +368,8 @@ func (s *IsolationSuite) TestSameCodeAndSubject_IsolatedPerTenant() {
 	s.Require().NoError(err)
 	_, err = s.app.Authorizer().GetPermissions(s.ctx, s.ac("beta", "10001"))
 	s.Require().NoError(err)
-	acmeKeys := keysWithPrefix(s.mr, "rbac:acme:subject:10001:perm:")
-	betaKeys := keysWithPrefix(s.mr, "rbac:beta:subject:10001:perm:")
+	acmeKeys := s.cacheKeys("rbac:acme:subject:10001:perm:")
+	betaKeys := s.cacheKeys("rbac:beta:subject:10001:perm:")
 	s.Len(acmeKeys, 1)
 	s.Len(betaKeys, 1)
 }
@@ -431,6 +445,24 @@ func (s *IsolationSuite) TestGrantRevocation_ScopedImmediate() {
 	ok, err := s.app.Authorizer().HasPermission(s.ctx, s.ac("beta", "40001"), "order:export")
 	s.Require().NoError(err)
 	s.False(ok)
+}
+
+// cacheKeys 返回指定前缀的缓存键：真实 Redis 用 SCAN，miniredis 用全量过滤。
+func (s *IsolationSuite) cacheKeys(fullPrefix string) []string {
+	if s.rdb != nil {
+		var out []string
+		var cursor uint64
+		for {
+			keys, next, err := s.rdb.Scan(s.ctx, cursor, fullPrefix+"*", 200).Result()
+			s.Require().NoError(err)
+			out = append(out, keys...)
+			cursor = next
+			if cursor == 0 {
+				return out
+			}
+		}
+	}
+	return keysWithPrefix(s.mr, fullPrefix)
 }
 
 // keysWithPrefix 过滤 miniredis 全量 key（其 Keys() 不支持通配参数）。

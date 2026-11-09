@@ -86,11 +86,24 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Run integration tests (MySQL + Redis consistency + tenant suites)
+      - name: Run integration tests (MySQL + real Redis matrix/tenant suites)
         env:
           RBAC_TEST_MYSQL_DSN: root:rootpass@tcp(127.0.0.1:3306)/go_rbac_test?parseTime=true&loc=UTC&charset=utf8mb4
           RBAC_TEST_REDIS_ADDR: 127.0.0.1:6380
         run: go test -race -v ./internal/repository/gormrepo/ ./cache/redis/ ./modules/tenant/
+
+      # 显式门禁：真实 Redis 原语套件（Lua SetIntMax / MGET / 故障语义）不得被
+      # 静默跳过——上面的服务启动与 RBAC_TEST_REDIS_ADDR 必须真正被使用。
+      - name: Real Redis primitives (guard against silent skip)
+        env:
+          RBAC_TEST_REDIS_ADDR: 127.0.0.1:6380
+        run: |
+          set -o pipefail
+          go test -race -count=1 -run 'TestRealRedisSuite' -v ./cache/redis/ | tee /tmp/real-redis.log
+          if grep -q -- '--- SKIP' /tmp/real-redis.log; then
+            echo "real Redis primitive suite was skipped; RBAC_TEST_REDIS_ADDR not wired" >&2
+            exit 1
+          fi
 
   vuln:
     name: Vulnerabilities (govulncheck)
