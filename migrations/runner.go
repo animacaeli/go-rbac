@@ -2,6 +2,7 @@ package migrations
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"sort"
 
@@ -18,6 +19,20 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     PRIMARY KEY (module, version)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 `
+
+// 迁移串行化：多实例（滚动发布、多副本启动）同时执行迁移时，GET_LOCK
+// 保证只有一个执行者；后来者等待锁而不是重复执行 DDL。
+//
+// 锁名按当前数据库名隔离：MySQL 的 GET_LOCK 是**服务器级**的，若同一实例上
+// 有多个库（多租户 SaaS、开发机多套库），共用锁名会让不同库的迁移互相阻塞。
+const (
+	migrationLockPrefix  = "rbac:migrate:"
+	migrationLockTimeout = 30 // seconds
+)
+
+// migrationLockSQL 返回锁名表达式：服务器级锁 + 库名隔离，长度截断到
+// MySQL 的 64 字符上限（库名本身最多 64 字符）。
+const migrationLockSQL = "LEFT(CONCAT('" + migrationLockPrefix + "', COALESCE(DATABASE(), '')), 64)"
 
 type appliedRecord struct {
 	Module  string `gorm:"column:module"`
@@ -64,41 +79,71 @@ func Plan(all []Migration) []Migration {
 	return plan
 }
 
-// Apply 执行迁移：确保 schema_migrations 存在，按计划逐条应用未执行的版本。
-// 每个迁移内的语句逐条执行（MySQL DDL 隐式提交，无法整体回滚，§5.7），
-// 全部语句成功后才写入版本记录；任一失败立即返回错误。
+// Apply 执行迁移：获取迁移锁 → 确保 schema_migrations 存在 → 按计划逐条应用
+// 未执行的版本。
+//
+// 执行约束（§5.7）：
+//   - 整个流程固定在**单条数据库连接**上：GET_LOCK 与动态 DDL 使用的会话变量
+//     （@has_xxx / @ddl）都是连接级状态，连接池漂移会使锁失效、PREPARE 读到空变量；
+//   - 每条语句执行后立即检查错误；同一迁移的全部语句成功后才写入版本记录；
+//   - 迁移 SQL 必须是可重入的（本库的迁移用 information_schema + 动态 DDL 实现
+//     "对象已存在则跳过"）：MySQL DDL 隐式提交，部分失败后重跑不能依赖回滚。
 func Apply(ctx context.Context, db *gorm.DB, all []Migration) error {
-	if err := db.WithContext(ctx).Exec(schemaMigrationsDDL).Error; err != nil {
-		return fmt.Errorf("rbac/migrations: create schema_migrations: %w", err)
-	}
-
-	applied, err := appliedVersions(ctx, db)
-	if err != nil {
-		return err
-	}
-
-	for _, m := range Plan(all) {
-		if _, ok := applied[m.ID()]; ok {
-			continue
+	plan := Plan(all)
+	return db.WithContext(ctx).Connection(func(conn *gorm.DB) error {
+		if err := acquireLock(conn); err != nil {
+			return err
 		}
-		for _, stmt := range splitStatements(m.SQL) {
-			if err := db.WithContext(ctx).Exec(stmt).Error; err != nil {
-				return fmt.Errorf("rbac/migrations: apply %s statement failed: %w", m.ID(), err)
+		defer releaseLock(ctx, conn)
+
+		if err := conn.Exec(schemaMigrationsDDL).Error; err != nil {
+			return fmt.Errorf("rbac/migrations: create schema_migrations: %w", err)
+		}
+		applied, err := appliedVersions(conn)
+		if err != nil {
+			return err
+		}
+		for _, m := range plan {
+			if _, ok := applied[m.ID()]; ok {
+				continue
+			}
+			for _, stmt := range splitStatements(m.SQL) {
+				if err := conn.Exec(stmt).Error; err != nil {
+					return fmt.Errorf("rbac/migrations: apply %s statement failed: %w", m.ID(), err)
+				}
+			}
+			if err := conn.Exec(
+				"INSERT INTO schema_migrations (module, version, name, applied_at) VALUES (?, ?, ?, UTC_TIMESTAMP(3))",
+				m.Module, m.Version, m.Name,
+			).Error; err != nil {
+				return fmt.Errorf("rbac/migrations: record %s: %w", m.ID(), err)
 			}
 		}
-		if err := db.WithContext(ctx).Exec(
-			"INSERT INTO schema_migrations (module, version, name, applied_at) VALUES (?, ?, ?, UTC_TIMESTAMP(3))",
-			m.Module, m.Version, m.Name,
-		).Error; err != nil {
-			return fmt.Errorf("rbac/migrations: record %s: %w", m.ID(), err)
-		}
+		return nil
+	})
+}
+
+// acquireLock 获取迁移互斥锁（连接级）。超时返回错误而不是无限等待。
+func acquireLock(conn *gorm.DB) error {
+	var got sql.NullInt64
+	if err := conn.Raw("SELECT GET_LOCK("+migrationLockSQL+", ?)", migrationLockTimeout).Row().Scan(&got); err != nil {
+		return fmt.Errorf("rbac/migrations: acquire lock: %w", err)
+	}
+	if !got.Valid || got.Int64 != 1 {
+		return fmt.Errorf("rbac/migrations: another instance is running migrations (lock wait timeout)")
 	}
 	return nil
 }
 
-func appliedVersions(ctx context.Context, db *gorm.DB) (map[string]struct{}, error) {
+// releaseLock 释放迁移锁。使用 WithoutCancel：请求 ctx 被取消也必须释放。
+func releaseLock(ctx context.Context, conn *gorm.DB) {
+	// Row() 不污染 GORM 的 Statement 状态（Scan 到 struct 会把表名解析成 null_int64）。
+	_ = conn.WithContext(context.WithoutCancel(ctx)).Raw("SELECT RELEASE_LOCK(" + migrationLockSQL + ")").Row().Scan(new(sql.NullInt64))
+}
+
+func appliedVersions(conn *gorm.DB) (map[string]struct{}, error) {
 	var rows []appliedRecord
-	if err := db.WithContext(ctx).Find(&rows).Error; err != nil {
+	if err := conn.Table("schema_migrations").Find(&rows).Error; err != nil {
 		return nil, fmt.Errorf("rbac/migrations: read schema_migrations: %w", err)
 	}
 	out := make(map[string]struct{}, len(rows))
