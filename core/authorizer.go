@@ -209,7 +209,11 @@ func validateCounters(cv counterValues) error {
 	if cv.subjectVersion < 0 || cv.subjectVersion > maxSubjectVersion {
 		return fmt.Errorf("%w: subject version %d (max %d)", ErrCounterOverflow, cv.subjectVersion, maxSubjectVersion)
 	}
-	if cv.epoch < 0 || cv.globalEpoch < 0 || cv.epoch+cv.globalEpoch > maxEpochSum {
+	// 先做单项范围检查，再用减法做安全求和：epoch+global 直接相加在
+	// MaxInt64 附近会溢出为负数，从而绕过上限判断（第九轮复审 P2）。
+	if cv.epoch < 0 || cv.globalEpoch < 0 ||
+		cv.epoch > maxEpochSum || cv.globalEpoch > maxEpochSum ||
+		cv.epoch > maxEpochSum-cv.globalEpoch {
 		return fmt.Errorf("%w: epoch %d + global epoch %d (max %d)",
 			ErrCounterOverflow, cv.epoch, cv.globalEpoch, maxEpochSum)
 	}
