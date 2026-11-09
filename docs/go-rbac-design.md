@@ -1034,7 +1034,8 @@ v1 无 tenant_id 是刻意决策（永不启用多租户的项目不付成本）
 | Redis Counter | 权威版本号的单调副本（SetIntMax 原子写入） |
 | Redis Permission Cache | 权限集合缓存（生成键寻址） |
 | `SyncSubjectVersion` | 将 DB 权威主体版本同步到 Redis 副本 |
-| `SyncEpoch` | 将 DB 权威 epoch 同步到 Redis 副本 |
+| `SyncEpoch` | 将 DB 权威授权域 epoch 同步到 Redis 副本 |
+| `SyncGlobalEpoch` | 将 DB 权威全局 epoch 同步到 Redis 副本（权限表是全局定义）|
 | `SetIntMax` | Lua 原子单调写入（唯一允许的计数器写原语）|
 
 ## 6.1 缓存内容与 Key
@@ -1043,15 +1044,26 @@ v1 无 tenant_id 是刻意决策（永不启用多租户的项目不付成本）
 
 ```text
 rbac:{scope}:epoch                          # 授权域 epoch 副本（权威值在数据库）
+rbac:!global:epoch                          # 全局 epoch 副本（权限表为全局定义）
 rbac:{scope}:subject:{subject_id}:version   # 主体权限版本号副本（权威值在数据库）
 rbac:{scope}:subject:{subject_id}:perm:v{generation}
 ```
 
-单租户模式 `scope = default`；多租户模式 `scope = {tenant_id}`。
-`generation = epoch<<32 | subject_version`（两计数器合并进单一生成键）。
+单租户模式 `scope = default`；多租户模式 `scope = {tenant_id}`。租户标识与
+主体标识在键中统一小写（`strings.ToLower`）：库表排序规则大小写不敏感，
+缓存/计数器域必须与之一致，否则同一身份的不同拼写各持一份版本副本，会出现
+"只同步了一种拼写"导致的陈旧缓存。
+`generation = (epoch + global_epoch)<<32 | subject_version`（三个计数器合并进
+单一生成键；三者均单调不减，任一递增都严格增大生成键）。
 
-**权威计数器存储**（迁移 0002）：数据库表 `rbac_counters(k, v)`，键与 Redis 键同构：
-`{scope}:epoch`、`{scope}:subject:{subject_id}:version`。
+保留 scope `!global`（`!` 不在合法租户字符集内，见 §2.9）承载全局 epoch：
+`rbac_permissions` 是全局表，权限禁用/启用与权限同步必须让**全部**租户域的
+旧生成键不可达——单租户 epoch 无法表达跨租户失效（第八轮审核 P0）。
+
+**计数器列宽**（迁移 0003）：`rbac_counters.k` 为 `VARCHAR(255)`——主体版本键
+最长约 `64 + 9 + 128 + 8 = 209` 字符，191 会在长租户 + 长主体时触发 1406
+并回滚整个授权变更事务。：数据库表 `rbac_counters(k, v)`，键与 Redis 键同构：
+`{scope}:epoch`、`!global:epoch`、`{scope}:subject:{subject_id}:version`。
 
 ## 6.2 版本号机制（数据库权威）
 
@@ -1063,7 +1075,9 @@ rbac:{scope}:subject:{subject_id}:perm:v{generation}
 
 **读取流程：**
 
-1. 读取 Redis 的 epoch 与版本号副本，得到生成键 G。
+1. 读取 Redis 的授权域 epoch、全局 epoch 与主体版本副本（Redis 实现经
+   `IntBatchReader` 用一次 MGET 完成；Cluster 下跨 slot 失败时自动退回逐键），
+   得到生成键 G。
 2. 副本缺失 / 损坏 / Redis 故障 → **从数据库读取权威值**并以 SetIntMax 回填副本
    （回填的是真实版本而非重置归零——不存在"重建值碰撞历史生成键"问题），
    随后照常继续。
@@ -1094,16 +1108,18 @@ rbac:{scope}:subject:{subject_id}:perm:v{generation}
 |---|---|---|
 | 用户角色变更 | 该主体 subject version（同事务递增） | 精确 |
 | 用户额外授权 / 撤销 / 到期 | 该主体 subject version（同事务递增） | 精确 |
-| 角色权限变更 | 授权域 epoch（同事务递增） | 全域 |
-| 角色禁用 / 删除 | 授权域 epoch（同事务递增） | 全域 |
-| 权限禁用 / 启用 | 授权域 epoch（同事务递增） | 全域 |
-| 权限同步（有差量） | 授权域 epoch（同事务递增） | 全域 |
+| 角色权限变更 | 授权域 epoch（同事务递增） | 该授权域 |
+| 角色禁用 / 删除 | 授权域 epoch（同事务递增） | 该授权域 |
+| 权限禁用 / 启用 | **全局 epoch**（同事务递增） | 全部租户域 |
+| 权限同步（有差量） | **全局 epoch**（同事务递增） | 全部租户域 |
 
 **两级失效机制：**
 
 - **精确级**（subject version）：用户级变更，影响面明确，只失效该主体。
-- **粗糙级**（epoch）：角色级 / 权限级变更。一次角色权限修改使整个授权域
-  （单租户 = default 域；多租户 = 该租户域）权限缓存冷启动。
+- **粗糙级**（epoch）：角色级变更走授权域 epoch（单租户 = default 域；
+  多租户 = 该租户域），一次角色权限修改使该域权限缓存冷启动。权限表是
+  全局定义，其状态变更与同步走全局 epoch，所有租户域一起冷启动
+  （跨租户一致性优先于局部命中率）。
   **这是刻意的性能取舍而非正确性问题**：角色级变更是低频管理操作，
   消除逐用户 fan-out 的部分成功窗口（30/100 用户失效成功、70 个未失效）
   换取一次全域冷启动，对典型 DevOps 平台完全可接受。

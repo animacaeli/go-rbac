@@ -7,6 +7,80 @@
 
 ## [Unreleased]
 
+### Fixed（第八轮外部审核）
+
+安全/一致性（均已用真实 MySQL + Redis 复现并补回归测试）：
+
+- **Gin 适配器在自定义错误处理器下 fail open**：`resolve` / `finish` 只写响应
+  不 `Abort`，而 Gin 的 `Next()` 循环仅由 `Abort` 中断——自定义 handler（如
+  `c.Status(403)`）会让受保护的业务处理器继续执行。现在 Guard 在调用任何
+  响应处理器前统一 `Abort`，并在文档与测试中固化该契约
+- **多租户禁用角色不失效**：tenant 仓储的 `SetStatus` / `DeleteWithAssociations`
+  缺少 epoch 同事务递增，`SyncEpoch` 只是复制未变化的权威值——禁用角色后旧
+  权限仍从缓存放行至 TTL。已补齐同事务递增并新增租户套件回归
+- **权限表失效只作用于单租户**：`rbac_permissions` 是全局定义表，权限禁用/
+  启用与 `SyncPermissions` 原先只递增 operator 所在域的 epoch，其它租户继续
+  放行已禁用权限。新增**全局 epoch**（保留 scope `!global`，参与生成键合成
+  `(epoch+globalEpoch)<<32|version`）与 `SyncGlobalEpoch`，权限表写路径改为
+  同事务递增全局 epoch
+- **DataScope 未做租户隔离**：`ResolveDataScope` 的 JOIN 没有租户条件（同一
+  subject_id 跨租户时会取到别家的最宽范围）；`SetRoleScope` / `RoleScopes` /
+  `RemoveRoleScope` 按全局 role_id 操作，可跨租户改写。三处全部按授权域过滤，
+  `RemoveRoleScope` 参数顺序调整为 `(ctx, roleID, resource)`
+- **菜单可见性 fail open**：关联权限被禁用/废弃后，联表丢行导致"曾受控"菜单
+  退化为全员可见。改为按"关联总数（含禁用）> 0 即受控、须持有至少一条启用
+  关联权限"，并对禁用父菜单的整棵子树做剔除
+
+正确性/健壮性：
+
+- 迁移器在单连接上使用 `GET_LOCK` 串行化（多实例并发启动安全）；tenant 迁移
+  与新增 core 迁移改为 `information_schema` + 动态 DDL 的幂等实现，部分失败
+  后直接重跑即可（此前会永久卡在 1060 duplicate column）
+- 新增 core 迁移 0003：`rbac_counters.k` 191 → 255（长租户 + 长主体的主体版本
+  键可达 209 字符，原列宽会 1406 回滚整个授权变更）；新增授权到期覆盖索引
+  `idx_subject_expires`
+- 仓储"记录不存在"只翻译 `gorm.ErrRecordNotFound`：数据库故障/超时不再被
+  伪装成 404；`UpdateProfile` / `SetStatus` 的 0 行更新会复核存在性
+- 角色删除的"未被使用"复核移入事务（返回 `ErrRoleInUse`），消除服务层
+  先查后删的 TOCTOU；`rbac_role_data_scopes` 之外的关联清理保持原语义
+- `AssignBatch` / `AssignRoleToSubjects` 改为仓储层单事务（全成或全败），
+  版本递增与写入同事务；`Assign` 用 `RowsAffected` 而非 `LastInsertId` 判断新建
+- 审计查询在 ctx 携带租户槽位时强制按 `tenant_id` 过滤；`NewQuery` 在模块未
+  注册时返回错误而非 nil panic；Offset 负数归零
+- `singleflight` 改为 `DoChan` + `context.WithoutCancel`：首个调用者的取消不再
+  拖垮所有等待者，调用方仍可自行放弃
+- `SyncPermissions` 的审计事件不再静默丢弃（Strict 传播 `ErrAuditFailedAfterCommit`），
+  并按 ctx 注入租户
+- 超管种子仅接受 `is_builtin=1` 载体角色；`RoleService.Create` 拒绝保留 code
+  `super_admin`；tenant 种子改走租户仓储（版本递增同事务）并同步缓存副本
+- 权限码大小写冲突检测：库表排序规则大小写不敏感而匹配是精确的，冲突数据
+  会让 `SyncPermissions` 陷入"插入被吞 + 永久废弃"死循环，现在显式报错
+- 租户标识结构性校验：长度 1..64、字符集 `[A-Za-z0-9_.-]`、保留名
+  `default` / `!global` 不可用（防止缓存/计数器键注入与跨域共享）
+- 管理服务在启用 tenant 后强制要求 `operator.TenantID`（空租户会静默写入
+  平台域）；单租户模式拒绝非空租户，与 Authorizer 语义对齐
+- Redis 批量计数器读（MGET）在 Cluster 跨 slot 失败时自动退回逐键读取，
+  避免 Cached 模式在 Cluster 部署下退化为每次鉴权 3 次数据库读
+- 缓存/计数器键对 `subject_id` 与 `tenant_id` 做小写规范化：库表排序规则
+  大小写不敏感，旧的"两种拼写各自持有版本副本"会让只同步一种拼写的撤销
+  在另一种拼写下陈旧到 TTL（矩阵新增第 14 行回归）
+- 迁移锁按数据库名隔离（MySQL GET_LOCK 为服务器级，同实例多库不再互相阻塞）
+- 列表查询硬上限、`CountersRepo.Bump` 死代码清理（计数器表/Redis 计数器的
+  无 TTL 与增长属已知边界：删除计数器会让旧生成键复活，需 tombstone/保留期
+  设计，见 README）
+
+### API 调整（pre-1.0）
+
+- `UserRoleRepo` 新增 `AssignMany` / `AssignRoleToSubjects`；移除未使用的
+  `CountersRepo.Bump`
+- `datascope.RemoveRoleScope` 参数顺序改为 `(ctx, roleID, resource)`
+- 新增公开接口 `cache.IntBatchReader`（可选，Redis 适配器实现 MGET 批量读）
+- 根包补齐 `ErrTenantRequired` / `ErrInvalidTenantID` /
+  `ErrInvalidationFailedAfterCommit` / `ErrAuditFailedAfterCommit` 别名
+- 新增 `App.TenancyEnabled` / `App.SyncSubjectVersion`（扩展模块用）
+- `CacheDiagnostics` 增加全局 epoch 字段
+
+
 ### Changed（Breaking，DB 权威版本号——外部审核第三轮 P0）
 
 - **版本号权威来源从 Redis 迁移到数据库**（`rbac_counters` 表，迁移 0002）：

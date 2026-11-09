@@ -79,7 +79,7 @@ func main() {
 		rbac.WithDB(db),
 		rbac.WithPermissionRegistry(permissions),
 		// rbac.WithSubjectStatusChecker(myChecker),  // 可选：账号状态检查
-		// rbac.WithCache(redisCache),                // 可选：Phase 2 起提供 Redis 实现
+		// rbac.WithCache(rediscache.New(cli)),        // 可选：cache/redis 实现 Cached 模式
 	)
 	if err != nil {
 		slog.Error("rbac init failed", "err", err)

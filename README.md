@@ -133,18 +133,22 @@ Redis 中的 epoch / 主体版本只是该权威值的**缓存副本**：
 | 变更操作 | 失效方式 | 粒度 |
 |---|---|---|
 | 用户角色变更 / 额外授权 / 撤销 / 到期 | 该主体 subject version | 精确 |
-| 角色权限变更 / 角色禁用删除 / 权限禁用 / 同步 | 授权域 epoch | 全域冷启动 |
+| 角色权限变更 / 角色禁用删除 | 该授权域 epoch | 该域冷启动 |
+| 权限禁用/启用 / 权限同步 | **全局 epoch（跨全部租户）** | 全系统冷启动 |
 
-epoch 失效意味着一次角色权限修改使整个授权域（单租户 = 全系统，多租户 = 该租户）权限缓存冷启动——**这是刻意的性能取舍而非正确性问题**：低频管理操作换取消除逐用户 fan-out 的部分成功窗口，对典型 DevOps 平台可接受。单域缓存规模使冷启动代价不可接受时再引入角色级版本号（设计文档 §6.3 触发条件）
+角色级 epoch 失效意味着一次角色权限修改使整个授权域（单租户 = 全系统，多租户 = 该租户）权限缓存冷启动——**这是刻意的性能取舍而非正确性问题**：低频管理操作换取消除逐用户 fan-out 的部分成功窗口，对典型 DevOps 平台可接受。单域缓存规模使冷启动代价不可接受时再引入角色级版本号（设计文档 §6.3 触发条件）。
+
+`rbac_permissions` 是**全局定义表**（不随租户隔离），因此权限禁用/启用与权限同步使用全局 epoch：任一租户禁用某权限后，所有租户的旧生成键同时不可达。单租户 epoch 只能让本域失效，会让其它租户继续从缓存放行已禁用权限（第八轮审核 P0）。全局 epoch 参与生成键合成 `epoch + globalEpoch`，两者均单调不减，任一递增都会严格增大生成键。
 
 已知边界：Redis 可读但不可写的窄窗口内（如只读副本），副本可能落后于
 权威值直至 TTL；`ErrInvalidationFailedAfterCommit` 语义见下文重试分级。
 
 机制要点（详见设计文档 §6）：
 
-- **两级失效**：用户级版本号递增（授权变更精确失效）+ 全局 epoch 递增
-  （权限禁用等低频全局事件，全员冷启动一次）；权限码字面进入生成键
-  `perm:v{epoch<<32|version}`，旧数据只可能落在旧生成键下，新读者不可达
+- **两级失效**：用户级版本号递增（授权变更精确失效）+ epoch 递增
+  （角色级事件走授权域 epoch、权限表事件走全局 epoch）；生成键为
+  `perm:v{(epoch+globalEpoch)<<32|version}`，旧数据只可能落在旧生成键下，
+  新读者不可达
 - **不变性（承重墙）**：权威版本号与授权变更在**同一数据库事务**内递增（原子）；
   Redis 副本只允许经 `SetIntMax` 单调前进，永不回退、永不相对递增
 - **写前复核**：回填缓存前复核生成键未变，已变则丢弃结果重走流程
@@ -163,14 +167,17 @@ epoch 失效意味着一次角色权限修改使整个授权域（单租户 = �
 （计数器丢失→旁路缓存+重建时清洗全域条目，见 §6.2 实现），但重建窗口
 （毫秒级）内存在理论上的陈旧读取，不应依赖。
 
-**缓存诊断**：`app.CacheDiagnostics(ctx, ac)` 返回运行模式、epoch/版本计数器
-状态、当前生成键与权限条目存在性、本进程失效递增尝试/失败计数——排障
-"为什么权限没失效"的第一现场。命中率/耗时经 `core.CountingMetrics` 注入采集。
+**缓存诊断**：`app.CacheDiagnostics(ctx, ac)` 返回运行模式、授权域 epoch /
+全局 epoch / 版本计数器状态、当前生成键与权限条目存在性、本进程失效递增
+尝试/失败计数——排障"为什么权限没失效"的第一现场。命中率/耗时经
+`core.CountingMetrics` 注入采集。批量化读取（Redis `MGET`）由可选的
+`cache.IntBatchReader` 接口提供，未实现时自动退回逐键读取。
 
-大小写语义：MySQL 排序规则（utf8mb4_0900_ai_ci）下 `subject_id` 不区分大小写，
-缓存 key 区分——同一身份的不同拼写会得到一致的授权结果，但缓存条目各自独立
-（仅冗余，无正确性影响）；权限码由注册中心校验拒绝大写，无此问题。业务侧
-建议 subject_id 统一小写。
+大小写语义：MySQL 排序规则（utf8mb4_0900_ai_ci）下 `subject_id` 与 `tenant_id`
+不区分大小写。缓存 key 与权威计数器键**同样按小写规范化**（`canonicalSubject`
+/ `Scope()` / `repository.TenantScope`），保证同一身份/租户的不同拼写共享
+同一份版本与缓存条目——否则"只同步了其中一种拼写"会让另一种拼写的旧缓存
+存活到 TTL（陈旧权限放行）。权限码由注册中心校验拒绝大写，无此问题。
 
 ## 可选模块
 
@@ -226,7 +233,18 @@ tree, _ := menuM.ResolveVisibleMenus(ctx, ac) // 主体可见菜单树
 // 数据范围：多角色取最宽；未配置默认 SELF（deny-by-default）；超管恒 ALL
 _ = ds.SetRoleScope(ctx, operator, roleID, "order", datascope.ScopeDepartmentAndChildren)
 scope, _ := ds.ResolveDataScope(ctx, ac, "order") // 业务自行应用到查询
+_ = ds.RemoveRoleScope(ctx, roleID, "order")      // 清除（回落 SELF）
 ```
+
+菜单与数据范围在多租户下的隔离语义：
+
+- 菜单是**全局定义**（前端导航），可见性按主体在**当前租户**持有的权限解析
+- 数据范围按租户隔离：`ResolveDataScope` 只聚合当前授权域的角色，`SetRoleScope`
+  只允许改写本域角色（跨租户引用返回 NotFound）
+- 受控菜单是 fail-closed 的：只要菜单存在任何权限关联（即使关联权限已被禁用/
+  废弃），非超管就必须持有其中一条**启用**权限才可见；权限下线不会让菜单
+  退化为全员可见
+- `Declare` 在单事务内完成 upsert + 权限关联，父子环与自引用在声明期拒绝
 
 前端隐藏菜单只是体验优化，后端必须独立鉴权（§2.7）。
 
@@ -250,6 +268,11 @@ _ = tenantMod.SeedSuperAdminInTenant(ctx, "acme", "acme-admin")
 跨租户角色引用被结构性拒绝；缓存 key 按授权域隔离；
 平台超管以任意租户上下文恒真，租户超管仅本域。
 
+租户标识格式受结构性校验（`core.ValidTenantID` / `tenant.TenantOf`）：
+长度 1..64、字符集 `[A-Za-z0-9_.-]`，且不得使用保留名 `default`（平台域）
+与 `!global`（全局计数器域）。非法标识在校验入口即 fail closed——字符集
+限制同时保护 `rbac:{scope}:subject:...` 键结构不被注入。
+
 ## 错误语义（§2.6）
 
 | 情况 | HTTP 状态 |
@@ -268,6 +291,9 @@ _ = tenantMod.SeedSuperAdminInTenant(ctx, "acme", "acme-admin")
   `rbac_role_permissions` / `rbac_user_grants`（v1 冻结稿，见设计文档 §5.2）
 - 表前缀固定 `rbac_`；v1 无 tenant_id（多租户为 Phase 3 可选模块，核心已预留授权域）
 - `app.Migrate(ctx)` 执行 Core → 扩展模块注册顺序的版本化迁移；生产环境建议在发布流程统一执行
+- 迁移器在单连接上持有 MySQL `GET_LOCK`（多实例并发启动自动串行化），
+  所有迁移 SQL 用 `information_schema` + 动态 DDL 实现可重入：部分失败后
+  直接重跑即可，不需要手工清理
 
 ### 操作重试语义分级
 
@@ -278,6 +304,7 @@ _ = tenantMod.SeedSuperAdminInTenant(ctx, "acme", "acme-admin")
 | SetPermissions / SetStatus / Assign / AssignBatch | **幂等**：重试安全，结果一致 |
 | Grant | 非幂等但安全：撤销旧行+插入新行——重试增加历史记录与审计事件条数，授权结果一致 |
 | Revoke（额外授权撤销） | 首次可能已成功（错误仅来自失效同步）→ 重试返回 `ErrGrantNotFound` 即表示此前已生效 |
+| Create / Delete（角色） | **不可盲目重试**：变更已提交时 Create 返回 `ErrRoleCodeExists`、Delete 返回 `ErrRoleNotFound`；收到 `ErrAuditFailedAfterCommit` 应按"已生效但审计缺失"处理 |
 
 权威版本随变更事务递增，任何情况下重试不影响缓存正确性。
 
@@ -293,9 +320,21 @@ api.POST("/admin/roles", guard.Require("rbac:role:create"), roleHandler.Create)
 ```
 
 `SeedSuperAdmin` / `tenant.SeedSuperAdminInTenant` 同样不鉴权，只能用于可信
-初始化流程（部署脚本/初始化 Job），绝不可暴露给业务请求。
+初始化流程（部署脚本/初始化 Job），绝不可暴露给业务请求。多租户下管理**读**
+接口（`Get/List/...`）从 `ctx` 读取授权域：HTTP 适配器已把解析结果写入
+request context，内部 Job 需自行 `core.ContextWithTenant`，缺失即 fail closed。
 
-**发布门禁**：`cache/redis` 的失效矩阵套件（12 行场景：角色/权限/用户禁用、
+启用 tenant 模块后，管理服务的 `operator.TenantID` 是**必填**的：空租户会
+静默落到平台域（误改平台角色/绑定），因此服务层直接返回 `ErrTenantRequired`；
+单租户模式传入非空租户返回 `ErrTenantNotSupported`。这与 `Authorizer` 的
+授权域校验语义一致，且防止计数器键被非法 scope 前缀污染。两者都只接受
+`is_builtin=1` 的超管载体角色：库中存在同名非内置角色时直接报错，不会
+静默把普通角色当成超管种子。
+
+审计查询（`audit.NewQuery(...).List`）在 ctx 携带租户槽位时强制按租户过滤；
+HTTP 适配器在解析租户后已把槽位写入 request context，下游可直接使用。
+
+**发布门禁**：`cache/redis` 的失效矩阵套件（14 行场景：角色/权限/用户禁用、
 计数器淘汰与损坏、递增失败与恢复、临时授权到期、并发编辑、租户隔离、
 超管边界）在真实 MySQL + 真实 Redis 上运行，CI 与 release 流水线均以此为门禁。
 
