@@ -374,3 +374,14 @@ func (s *RoleServiceSuite) TestSetPermissions_ConstraintDisabled_GrantorNeedNotH
 	// Assert
 	s.Require().NoError(err)
 }
+
+// 并发删除的竞态错误必须翻译为领域哨兵，不得泄漏 internal/repository 错误。
+func (s *RoleServiceSuite) TestSetStatus_ConcurrentDelete_MapsToRoleNotFound() {
+	s.roles.On("FindByID", mock.Anything, uint64(42)).Return(&model.Role{ID: 42, Code: "r", Status: model.RoleStatusEnabled}, nil)
+	s.roles.On("SetStatus", mock.Anything, uint64(42), model.RoleStatusDisabled).
+		Return(repository.ErrRecordNotFound)
+
+	err := s.roleSvc.SetStatus(s.ctx, operator, 42, model.RoleStatusDisabled)
+
+	s.ErrorIs(err, core.ErrRoleNotFound)
+}

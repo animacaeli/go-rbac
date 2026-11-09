@@ -36,3 +36,12 @@ type PermissionCache interface {
 	// 与权威值产生持久偏差且读者无法察觉）。
 	SetIntMax(ctx context.Context, key string, value int64) error
 }
+
+// IntBatchReader 是 PermissionCache 的可选批量读扩展：授权热路径需要同时读取
+// 授权域 epoch、全局 epoch 与主体版本，实现该接口可将三次往返合并为一次
+// （Redis MGET）。未实现时 Core 退回逐键 GetInt，语义完全一致。
+type IntBatchReader interface {
+	// GetInts 批量读取整数键。missing 与 keys 等长：true 表示键存在。
+	// 任一键损坏返回错误（调用方按"缓存状态不可信"回退数据库权威值）。
+	GetInts(ctx context.Context, keys []string) (values []int64, found []bool, err error)
+}

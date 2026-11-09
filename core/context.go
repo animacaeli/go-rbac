@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"strings"
 
 	"github.com/animacaeli/go-rbac/internal/repository"
 )
@@ -63,9 +64,13 @@ func (ac AuthorizationContext) Validate(maxSubjectIDLen int) error {
 }
 
 // Scope 返回授权域名（§6.1）。v1 恒为 default。
+//
+// 租户标识统一小写：库表排序规则（utf8mb4_0900_ai_ci）把仅大小写不同的
+// 租户视为同一租户，缓存/计数器域必须与之一致，否则同一租户的两种拼写
+// 会各自持有版本副本，导致一侧的变更无法失效另一侧的缓存。
 func (ac AuthorizationContext) Scope() string {
 	if ac.TenantID == "" {
 		return DefaultScope
 	}
-	return ac.TenantID
+	return strings.ToLower(ac.TenantID)
 }

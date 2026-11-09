@@ -33,6 +33,14 @@ func validateSubject(subjectID string) error {
 	return nil
 }
 
+// mapWriteError 把仓储写路径的 NotFound（并发删除的角色）翻译为领域哨兵。
+func (d ServiceDeps) mapWriteError(err error, roleID uint64) error {
+	if repository.IsNotFound(err) {
+		return fmt.Errorf("%w: id=%d", ErrRoleNotFound, roleID)
+	}
+	return err
+}
+
 // Assign 为用户分配角色（幂等）。
 //
 // 校验链（§7.3 / §2.2）：
@@ -42,6 +50,9 @@ func validateSubject(subjectID string) error {
 //
 // 提交成功后递增该用户版本号（§6.3）。
 func (s *UserRoleService) Assign(ctx context.Context, operator AuthorizationContext, subjectID string, roleID uint64) error {
+	if err := s.deps.requireOperatorScope(operator); err != nil {
+		return err
+	}
 	ctx = ContextWithTenant(ctx, operator.TenantID)
 
 	if err := validateSubject(subjectID); err != nil {
@@ -67,7 +78,7 @@ func (s *UserRoleService) Assign(ctx context.Context, operator AuthorizationCont
 	}
 
 	if err := s.deps.UserRoles.Assign(ctx, subjectID, roleID); err != nil {
-		return err
+		return s.deps.mapWriteError(err, roleID)
 	}
 	if err := s.deps.invalidateSubject(ctx, SubjectID(subjectID)); err != nil {
 		return err
@@ -79,8 +90,12 @@ func (s *UserRoleService) Assign(ctx context.Context, operator AuthorizationCont
 }
 
 // AssignBatch 为一个用户批量分配多个角色：逐个校验内置保护，
-// 授权者约束按全部角色的启用权限并集校验一次；提交后递增一次版本号。
+// 授权者约束按全部角色的启用权限并集校验一次；落库为单事务（全成或全败），
+// 提交后递增一次版本号。
 func (s *UserRoleService) AssignBatch(ctx context.Context, operator AuthorizationContext, subjectID string, roleIDs []uint64) error {
+	if err := s.deps.requireOperatorScope(operator); err != nil {
+		return err
+	}
 	ctx = ContextWithTenant(ctx, operator.TenantID)
 
 	if len(roleIDs) == 0 {
@@ -128,10 +143,9 @@ func (s *UserRoleService) AssignBatch(ctx context.Context, operator Authorizatio
 		return err
 	}
 
-	for _, roleID := range roleIDs {
-		if err := s.deps.UserRoles.Assign(ctx, subjectID, roleID); err != nil {
-			return err
-		}
+	// 单事务批量落库：全成或全败，版本递增与写入同事务（§6.3）。
+	if err := s.deps.UserRoles.AssignMany(ctx, subjectID, roleIDs); err != nil {
+		return err
 	}
 	if err := s.deps.invalidateSubject(ctx, SubjectID(subjectID)); err != nil {
 		return err
@@ -143,8 +157,12 @@ func (s *UserRoleService) AssignBatch(ctx context.Context, operator Authorizatio
 }
 
 // AssignRoleToSubjects 将一个角色批量分配给多个用户。
-// 授权者约束按该角色校验一次；提交后递增每个用户版本号。
+// 授权者约束按该角色校验一次；落库为单事务（全成或全败），
+// 提交后递增每个用户版本号。
 func (s *UserRoleService) AssignRoleToSubjects(ctx context.Context, operator AuthorizationContext, roleID uint64, subjectIDs []string) error {
+	if err := s.deps.requireOperatorScope(operator); err != nil {
+		return err
+	}
 	ctx = ContextWithTenant(ctx, operator.TenantID)
 
 	if len(subjectIDs) == 0 {
@@ -174,10 +192,9 @@ func (s *UserRoleService) AssignRoleToSubjects(ctx context.Context, operator Aut
 		return err
 	}
 
-	for _, subjectID := range subjectIDs {
-		if err := s.deps.UserRoles.Assign(ctx, subjectID, roleID); err != nil {
-			return err
-		}
+	// 单事务批量落库：全成或全败，每个新建主体的版本递增与写入同事务（§6.3）。
+	if err := s.deps.UserRoles.AssignRoleToSubjects(ctx, roleID, subjectIDs); err != nil {
+		return s.deps.mapWriteError(err, roleID)
 	}
 	if err := s.deps.invalidateSubjects(ctx, subjectIDs); err != nil {
 		return err
@@ -191,6 +208,9 @@ func (s *UserRoleService) AssignRoleToSubjects(ctx context.Context, operator Aut
 
 // Revoke 回收用户角色（幂等：未分配时无操作）。
 func (s *UserRoleService) Revoke(ctx context.Context, operator AuthorizationContext, subjectID string, roleID uint64) error {
+	if err := s.deps.requireOperatorScope(operator); err != nil {
+		return err
+	}
 	ctx = ContextWithTenant(ctx, operator.TenantID)
 
 	if err := validateSubject(subjectID); err != nil {

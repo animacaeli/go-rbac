@@ -51,7 +51,8 @@ func (c *Cache) Get(ctx context.Context, key string) ([]string, bool, error) {
 	return perms, true, nil
 }
 
-// Set 写入权限集合，带 TTL。
+// Set 写入权限集合，带 TTL。ttl <= 0 表示永不过期（go-redis 语义）；权限
+// 条目必须带 TTL，调用方应始终传正值（Core 的写回路径保证如此）。
 func (c *Cache) Set(ctx context.Context, key string, permissions []string, ttl time.Duration) error {
 	raw, err := json.Marshal(permissions)
 	if err != nil {
@@ -88,6 +89,32 @@ func (c *Cache) GetInt(ctx context.Context, key string) (int64, bool, error) {
 		return 0, false, fmt.Errorf("rbac/cache/redis: corrupt integer at %s: %w", key, err)
 	}
 	return v, true, nil
+}
+
+// GetInts 以 MGET 批量读取整数键（cache.IntBatchReader）。
+// 缺失键返回 found=false；任一值损坏返回错误（缓存状态不可信，由调用方回退）。
+func (c *Cache) GetInts(ctx context.Context, keys []string) ([]int64, []bool, error) {
+	raws, err := c.cli.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, nil, fmt.Errorf("rbac/cache/redis: mget: %w", err)
+	}
+	values := make([]int64, len(keys))
+	found := make([]bool, len(keys))
+	for i, raw := range raws {
+		if raw == nil {
+			continue
+		}
+		str, ok := raw.(string)
+		if !ok {
+			return nil, nil, fmt.Errorf("rbac/cache/redis: mget %s: unexpected value type %T", keys[i], raw)
+		}
+		v, perr := strconv.ParseInt(str, 10, 64)
+		if perr != nil {
+			return nil, nil, fmt.Errorf("rbac/cache/redis: corrupt integer at %s: %w", keys[i], perr)
+		}
+		values[i], found[i] = v, true
+	}
+	return values, found, nil
 }
 
 // setIntMaxScript 原子单调写：当前值缺失 / 不可解析（损坏自愈）/ 小于

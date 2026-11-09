@@ -1,8 +1,17 @@
 package registry
 
 import (
+	"errors"
+	"fmt"
+	"strings"
+
 	"github.com/animacaeli/go-rbac/model"
 )
+
+// ErrCodeConflict 表示数据库中的权限码与注册中心仅大小写不同（库表排序规则
+// 大小写不敏感，唯一键会命中同一行，而匹配逻辑是精确的）。这类数据必须由
+// 运维显式修正，不能静默"插入失败 + 废弃"。
+var ErrCodeConflict = errors.New("rbac: permission code case conflict between database and registry")
 
 // SyncResult 汇报一次权限同步的差量结果。
 type SyncResult struct {
@@ -14,6 +23,10 @@ type SyncResult struct {
 	Reactivated int
 	// Deprecated 被标记为"已废弃"的权限数（数据库存在但代码不再注册）。
 	Deprecated int
+	// Conflicts 记录库表与注册中心仅大小写不同的权限码（库表排序规则大小写
+	// 不敏感，会导致"唯一键命中旧行 + 精确匹配认为不存在"的死循环）。
+	// 非空时 SyncPermissions 返回错误，要求运维修正数据。
+	Conflicts []string
 }
 
 // Changed 报告本次同步是否产生任何差量。
@@ -94,11 +107,29 @@ func Diff(reg *Registry, existing []model.Permission) (SyncResult, SyncPlan) {
 		}
 	}
 
+	// 大小写冲突检测：existing 命中不了 seen（精确匹配），但碰巧与某个已注册
+	// code 仅大小写不同。此时 INSERT 会被唯一键静默吞掉、同时旧行被废弃，
+	// 结果是权限永远不可用——必须显式报错。
+	registeredLower := make(map[string]string, len(registered))
+	for _, def := range registered {
+		registeredLower[strings.ToLower(def.Code)] = def.Code
+	}
+	var conflicts []string
+	for _, p := range existing {
+		if _, registered := seen[p.Code]; registered {
+			continue
+		}
+		if canonical, ok := registeredLower[strings.ToLower(p.Code)]; ok && canonical != p.Code {
+			conflicts = append(conflicts, fmt.Sprintf("%q (db) vs %q (registry)", p.Code, canonical))
+		}
+	}
+
 	result := SyncResult{
 		Created:     len(plan.Inserts),
 		Updated:     len(plan.MetadataUpdates),
 		Reactivated: len(plan.ReactivateIDs),
 		Deprecated:  len(plan.DeprecateIDs),
+		Conflicts:   conflicts,
 	}
 	return result, plan
 }

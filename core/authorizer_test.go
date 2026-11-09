@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	coremocks "github.com/animacaeli/go-rbac/test/mocks/core"
 	repositorymocks "github.com/animacaeli/go-rbac/test/mocks/repository"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -36,6 +38,8 @@ func (s *AuthorizationServiceSuite) SetupTest() {
 	s.counters = repositorymocks.NewMockCountersRepo(s.T())
 	s.counters.On("Get", mock.Anything, mock.Anything).Return(int64(0), nil).Maybe()
 	s.cch.On("SetIntMax", mock.Anything, mock.Anything, mock.AnythingOfType("int64")).Return(nil).Maybe()
+	// 全局 epoch 副本（权限表全局失效用）；本套件不涉及，恒为 0。
+	s.cch.On("GetInt", mock.Anything, "rbac:!global:epoch").Return(int64(0), true, nil).Maybe()
 	s.sut = core.NewAuthorizationService(s.authzRepo, s.counters, s.cch, nil, core.NoopMetrics{}, 5*time.Minute)
 }
 
@@ -67,6 +71,7 @@ func (s *AuthorizationServiceSuite) expectColdRead(subject core.AuthorizationCon
 	s.cch.On("SetIntMax", mock.Anything, mock.Anything, mock.AnythingOfType("int64")).Return(nil).Maybe()
 	// 快路径 + flight 内二次探测 + 写回前复核：GetInt 可能被多次调用。
 	s.cch.On("GetInt", mock.Anything, "rbac:default:epoch").Return(epoch, true, nil)
+	s.cch.On("GetInt", mock.Anything, "rbac:!global:epoch").Return(int64(0), true, nil).Maybe()
 	s.cch.On("GetInt", mock.Anything, versionKey(sid)).Return(version, true, nil)
 	s.cch.On("Get", mock.Anything, permKey(sid, generation(epoch, version))).Return(nil, false, nil)
 	s.authzRepo.On("EffectiveRolePermissions", mock.Anything, sid).Return(rolePerms, nil)
@@ -390,11 +395,12 @@ func (s *AuthorizationServiceSuite) TestCounterMissing_RecoversFromDB() {
 	sid := "10001"
 
 	cch.On("GetInt", mock.Anything, "rbac:default:epoch").Return(int64(0), false, nil)
-	cch.On("GetInt", mock.Anything, versionKey(sid)).Return(int64(0), false, nil)
+	cch.On("GetInt", mock.Anything, "rbac:!global:epoch").Return(int64(0), false, nil).Maybe()
+	cch.On("GetInt", mock.Anything, versionKey(sid)).Return(int64(0), false, nil).Maybe()
 	counters.On("Get", mock.Anything, "default:epoch").Return(int64(2), nil).Twice()
+	counters.On("Get", mock.Anything, "!global:epoch").Return(int64(0), nil).Twice()
 	counters.On("Get", mock.Anything, "default:subject:10001:version").Return(int64(5), nil).Twice()
-	cch.On("SetIntMax", mock.Anything, "rbac:default:epoch", int64(2)).Return(nil).Maybe()
-	cch.On("SetIntMax", mock.Anything, versionKey(sid), int64(5)).Return(nil).Maybe()
+	cch.On("SetIntMax", mock.Anything, mock.Anything, mock.AnythingOfType("int64")).Return(nil).Maybe()
 	cch.On("Get", mock.Anything, mock.Anything).Return(nil, false, nil)
 	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, sid).Return(false, nil)
 	s.authzRepo.On("EffectiveRolePermissions", mock.Anything, sid).Return([]string{"user:list"}, nil)
@@ -416,8 +422,10 @@ func (s *AuthorizationServiceSuite) TestCounterCorrupt_RecoversFromDB() {
 
 	cch.On("GetInt", mock.Anything, "rbac:default:epoch").
 		Return(int64(0), false, errors.New("rbac/cache/redis: corrupt integer"))
+	cch.On("GetInt", mock.Anything, "rbac:!global:epoch").
+		Return(int64(0), false, errors.New("rbac/cache/redis: corrupt integer")).Maybe()
 	cch.On("GetInt", mock.Anything, versionKey(sid)).
-		Return(int64(0), false, errors.New("rbac/cache/redis: corrupt integer"))
+		Return(int64(0), false, errors.New("rbac/cache/redis: corrupt integer")).Maybe()
 	counters.On("Get", mock.Anything, mock.Anything).Return(int64(0), nil)
 	cch.On("Delete", mock.Anything, mock.Anything).Return(nil).Maybe()
 	cch.On("SetIntMax", mock.Anything, mock.Anything, mock.AnythingOfType("int64")).Return(nil).Maybe()
@@ -442,8 +450,10 @@ func (s *AuthorizationServiceSuite) TestCacheError_FallsBackToDBWithoutWriteBack
 
 	cch.On("GetInt", mock.Anything, "rbac:default:epoch").
 		Return(int64(0), false, errors.New("redis down"))
+	cch.On("GetInt", mock.Anything, "rbac:!global:epoch").
+		Return(int64(0), false, errors.New("redis down")).Maybe()
 	cch.On("GetInt", mock.Anything, versionKey(sid)).
-		Return(int64(0), false, errors.New("redis down"))
+		Return(int64(0), false, errors.New("redis down")).Maybe()
 	counters.On("Get", mock.Anything, mock.Anything).Return(int64(0), errors.New("db also down"))
 	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, sid).Return(false, nil)
 	s.authzRepo.On("EffectiveRolePermissions", mock.Anything, sid).Return([]string{"user:list"}, nil)
@@ -465,6 +475,7 @@ func (s *AuthorizationServiceSuite) TestWriteBackVerify_GenerationChanged_Retry(
 	vk := versionKey(sid)
 
 	cch.On("GetInt", mock.Anything, "rbac:default:epoch").Return(int64(0), true, nil)
+	cch.On("GetInt", mock.Anything, "rbac:!global:epoch").Return(int64(0), true, nil)
 	// 首读 version=0；其后（并发授权变更后）恒为 1。
 	cch.On("GetInt", mock.Anything, vk).Return(int64(0), true, nil).Once()
 	cch.On("GetInt", mock.Anything, vk).Return(int64(1), true, nil)
@@ -530,4 +541,93 @@ func (s *AuthorizationServiceSuite) TestSimpleMode_SkipsCounterProtocol() {
 	ok, err := sut.HasPermission(s.ctx, subject1, "user:list")
 	s.Require().NoError(err)
 	s.True(ok)
+}
+
+// 租户标识的结构性校验：字符集/长度/保留名不合法时 fail closed
+// （字符集非法会破坏 rbac:{scope}:subject:... 键结构）。
+func (s *AuthorizationServiceSuite) TestValidTenantID() {
+	cases := []struct {
+		id string
+		ok bool
+	}{
+		{"acme", true},
+		{"tenant-01.eu", true},
+		{"Tenant_9", true},
+		{"", false},
+		{"default", false},
+		{"!global", false},
+		{"has:colon", false},
+		{"has space", false},
+		{"has/slash", false},
+		{strings.Repeat("a", 65), false},
+	}
+	for _, c := range cases {
+		s.Equal(c.ok, core.ValidTenantID(c.id), "id=%q", c.id)
+	}
+}
+
+func (s *AuthorizationServiceSuite) TestValidateAC_RejectsInvalidTenant() {
+	sut := core.NewAuthorizationService(nil, nil, cache.NoopCache{}, nil, core.NoopMetrics{}, time.Minute)
+	sut.SetTenantScopeRequired(true)
+
+	_, err := sut.HasPermission(s.ctx, core.AuthorizationContext{SubjectID: "u1", TenantID: "bad:tenant"}, "x:y")
+	s.Require().ErrorIs(err, core.ErrInvalidTenantID)
+
+	_, err = sut.HasPermission(s.ctx, core.AuthorizationContext{SubjectID: "u1", TenantID: "default"}, "x:y")
+	s.Require().ErrorIs(err, core.ErrInvalidTenantID)
+}
+
+// batchErrCache 实现 cache.PermissionCache 与 IntBatchReader：批量读失败、
+// 单键读正常——模拟 Redis Cluster 的 CROSSSLOT。
+type batchErrCache struct{}
+
+func (batchErrCache) Get(context.Context, string) ([]string, bool, error) { return nil, false, nil }
+func (batchErrCache) Set(context.Context, string, []string, time.Duration) error {
+	return nil
+}
+func (batchErrCache) Delete(context.Context, string) error                { return nil }
+func (batchErrCache) GetInt(context.Context, string) (int64, bool, error) { return 0, true, nil }
+func (batchErrCache) SetIntMax(context.Context, string, int64) error      { return nil }
+func (batchErrCache) GetInts(context.Context, []string) ([]int64, []bool, error) {
+	return nil, nil, errors.New("CROSSSLOT Keys in request don't hash to the same slot")
+}
+
+// 批量计数器读失败（如 Cluster 跨 slot）必须退回逐键读取，而不是把鉴权
+// 降级为数据库回源。
+func (s *AuthorizationServiceSuite) TestReadCounters_BatchErrorFallsBackToPerKey() {
+	cch := batchErrCache{}
+	sut := core.NewAuthorizationService(s.authzRepo, s.counters, cch, nil, core.NoopMetrics{}, time.Minute)
+	s.authzRepo.On("HasBuiltinSuperAdminRole", mock.Anything, "10001").Return(false, nil)
+	s.authzRepo.On("EffectiveRolePermissions", mock.Anything, "10001").Return([]string{"user:list"}, nil)
+	s.authzRepo.On("EffectiveGrantPermissions", mock.Anything, "10001", mock.AnythingOfType("time.Time")).Return(nil, nil)
+	s.authzRepo.On("NearestGrantExpiry", mock.Anything, "10001", mock.AnythingOfType("time.Time")).Return(nil, nil)
+
+	ok, err := sut.HasPermission(s.ctx, subject1, "user:list")
+	s.Require().NoError(err)
+	s.True(ok, "批量读失败不应影响鉴权（逐键回退）")
+}
+
+// 管理服务授权域校验：启用多租户后空租户 operator 必须 fail closed，
+// 否则会静默写入平台域；单租户模式拒绝非空租户。
+func TestServiceDeps_RequireOperatorScope(t *testing.T) {
+	multi := core.NewRoleService(core.ServiceDeps{TenancyRequired: true})
+	_, err := multi.Create(context.Background(), core.AuthorizationContext{SubjectID: "op"}, "c", "n", "")
+	require.ErrorIs(t, err, core.ErrTenantRequired, "多租户下空租户 operator 必须拒绝")
+
+	_, err = multi.Create(context.Background(), core.AuthorizationContext{SubjectID: "op", TenantID: "bad:tenant"}, "c", "n", "")
+	require.ErrorIs(t, err, core.ErrInvalidTenantID)
+
+	single := core.NewRoleService(core.ServiceDeps{})
+	_, err = single.Create(context.Background(), core.AuthorizationContext{SubjectID: "op", TenantID: "acme"}, "c", "n", "")
+	require.ErrorIs(t, err, core.ErrTenantNotSupported)
+}
+
+// 授权域大小写规范化：与库表 ci 排序规则一致，保留名按大小写不敏感拒绝。
+func (s *AuthorizationServiceSuite) TestScope_CanonicalizesCaseAndReservedNames() {
+	s.Equal("default", (core.AuthorizationContext{}).Scope())
+	s.Equal("acme", (core.AuthorizationContext{TenantID: "Acme"}).Scope())
+	s.Equal("acme", (core.AuthorizationContext{TenantID: "ACME"}).Scope())
+
+	s.False(core.ValidTenantID("Default"))
+	s.False(core.ValidTenantID("!GLOBAL"))
 }

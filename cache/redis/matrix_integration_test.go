@@ -167,7 +167,7 @@ func (s *MatrixSuite) TestRow03_RoleDisabled_FanOut() {
 	s.False(ok)
 }
 
-// 行 4：权限被禁用 → 全局 epoch 失效。
+// 行 4：权限被禁用 → 全局（跨租户）epoch 失效。
 func (s *MatrixSuite) TestRow04_PermissionDisabled_Epoch() {
 	s.subjectWithPerms("m04", "r04", "user:list")
 	ok, _ := s.app.Authorizer().HasPermission(s.ctx, s.ac("m04"), "user:list")
@@ -178,6 +178,11 @@ func (s *MatrixSuite) TestRow04_PermissionDisabled_Epoch() {
 	ok, err := s.app.Authorizer().HasPermission(s.ctx, s.ac("m04"), "user:list")
 	s.Require().NoError(err)
 	s.False(ok)
+
+	// 权限表是全局定义：失效必须走全局 epoch（单租户 epoch 只能让本域失效）。
+	globalEpoch, err := s.rdb.Get(s.ctx, "rbac:!global:epoch").Result()
+	s.Require().NoError(err)
+	s.NotEqual("0", globalEpoch, "全局 epoch 副本必须被同步")
 }
 
 // 行 5：Redis 版本/epoch 键丢失 → 不允许命中旧权限（基线协议 + 清洗）。
@@ -241,21 +246,21 @@ func (s *MatrixSuite) TestRow07_ReplicaDeleted_SyncWritesTrueValue() {
 }
 
 // 行 8（P0-2 场景）：恢复与更新同步乱序不回退——功能级验证：
-// epoch 副本淘汰 → 变更（DB bump）→ 读（恢复 SetIntMax 真值）→ 再变更 → 读。
+// 全局 epoch 副本淘汰 → 变更（DB bump）→ 读（恢复 SetIntMax 真值）→ 再变更 → 读。
 // 副本全程单调前进且鉴权结果始终正确（原子乱序护栏由适配器单测覆盖）。
 func (s *MatrixSuite) TestRow08_RecoveryAndSync_NoRegression() {
 	s.subjectWithPerms("m09", "r09", "user:list")
 	ok, _ := s.app.Authorizer().HasPermission(s.ctx, s.ac("m09"), "user:list")
 	s.Require().True(ok)
 
-	s.Require().NoError(s.rdb.Del(s.ctx, "rbac:default:epoch").Err())
-	// 变更 1：禁用权限（DB epoch 同事务 +1），读路径恢复副本为真值。
+	s.Require().NoError(s.rdb.Del(s.ctx, "rbac:!global:epoch").Err())
+	// 变更 1：禁用权限（DB 全局 epoch 同事务 +1），读路径恢复副本为真值。
 	s.Require().NoError(s.app.Permissions().SetStatus(s.ctx, gateAdmin, "user:list", 0))
 	ok, err := s.app.Authorizer().HasPermission(s.ctx, s.ac("m09"), "user:list")
 	s.Require().NoError(err)
 	s.False(ok)
 	var e1 string
-	e1, err = s.rdb.Get(s.ctx, "rbac:default:epoch").Result()
+	e1, err = s.rdb.Get(s.ctx, "rbac:!global:epoch").Result()
 	s.Require().NoError(err)
 
 	// 变更 2：重新启用 → epoch 前进；副本必须单调上升且结果正确。
@@ -264,9 +269,9 @@ func (s *MatrixSuite) TestRow08_RecoveryAndSync_NoRegression() {
 	s.Require().NoError(err)
 	s.True(ok)
 	var e2 string
-	e2, err = s.rdb.Get(s.ctx, "rbac:default:epoch").Result()
+	e2, err = s.rdb.Get(s.ctx, "rbac:!global:epoch").Result()
 	s.Require().NoError(err)
-	s.Require().Greater(metricsCmp(e2, e1), 0, "epoch 副本必须单调前进，不得回退")
+	s.Require().Greater(metricsCmp(e2, e1), 0, "全局 epoch 副本必须单调前进，不得回退")
 }
 
 func metricsCmp(a, b string) int {
@@ -369,4 +374,23 @@ func (s *MatrixSuite) TestRow13_MultiInstanceConcurrentRecovery() {
 	diag, err := m1.CacheDiagnostics(ctx, s.ac("m13"))
 	s.Require().NoError(err)
 	s.True(diag.EpochExists, "副本已从 DB 回填")
+}
+
+// 行 14：subject_id / tenant_id 大小写规范化——库表排序规则大小写不敏感，
+// 缓存/计数器键必须同样规范化，否则"只同步了一种拼写"会让另一种拼写的
+// 旧缓存存活到 TTL（陈旧权限放行）。
+func (s *MatrixSuite) TestRow14_SubjectCaseCanonicalized() {
+	s.subjectWithPerms("CaseUser", "r14", "user:list")
+	ok, err := s.app.Authorizer().HasPermission(s.ctx, s.ac("CaseUser"), "user:list")
+	s.Require().NoError(err)
+	s.Require().True(ok, "预热（大写拼写）")
+
+	role, err := s.app.Roles().FindByCode(s.ctx, "r14")
+	s.Require().NoError(err)
+	// 用小写拼写撤销：DB 命中同一行，缓存/计数器域也必须命中同一份。
+	s.Require().NoError(s.app.UserRoles().Revoke(s.ctx, gateAdmin, "caseuser", role.ID))
+
+	ok, err = s.app.Authorizer().HasPermission(s.ctx, s.ac("CaseUser"), "user:list")
+	s.Require().NoError(err)
+	s.False(ok, "大小写不同的同一 subject 必须共享失效结果")
 }

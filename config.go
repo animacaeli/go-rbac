@@ -31,8 +31,8 @@ type Option func(*config)
 // parseTime=true&loc=UTC（§5.1：DATETIME(3) + 应用层 UTC）。
 func WithDB(db *gorm.DB) Option { return func(c *config) { c.db = db } }
 
-// WithCache 注入权限缓存实现（可选，默认 NoopCache）。
-// v1 内置仅 NoopCache；Redis 实现于 Phase 2 提供。
+// WithCache 注入权限缓存实现（可选，默认 NoopCache → Simple 模式）。
+// 内置实现：cache.NoopCache 与 cache/redis（Cached 模式）。
 func WithCache(cch cache.PermissionCache) Option { return func(c *config) { c.cch = cch } }
 
 // WithPermissionRegistry 注入业务声明的权限注册中心（可选，默认空注册中心；

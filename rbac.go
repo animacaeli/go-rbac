@@ -37,6 +37,7 @@ var (
 	ErrInvalidSubjectID     = core.ErrInvalidSubjectID
 	ErrSubjectInactive      = core.ErrSubjectInactive
 	ErrTenantNotSupported   = core.ErrTenantNotSupported
+	ErrTenantRequired       = core.ErrTenantRequired
 	ErrNoPermissionDeclared = core.ErrNoPermissionDeclared
 
 	// 管理服务。
@@ -51,10 +52,16 @@ var (
 	ErrInvalidGrantExpiry      = core.ErrInvalidGrantExpiry
 	ErrGrantorPermissionDenied = core.ErrGrantorPermissionDenied
 
+	// 提交后失败（数据库已提交，后续失效/审计步骤失败）。重试语义按操作分级，
+	// 见 README「操作重试语义分级」。
+	ErrInvalidationFailedAfterCommit = core.ErrInvalidationFailedAfterCommit
+	ErrAuditFailedAfterCommit        = core.ErrAuditFailedAfterCommit
+
 	// 注册中心。
 	ErrInvalidPermissionCode = registry.ErrInvalidPermissionCode
 	ErrDuplicateRegistration = registry.ErrDuplicateRegistration
 	ErrInvalidPermissionDef  = registry.ErrInvalidPermissionDef
+	ErrCodeConflict          = registry.ErrCodeConflict
 )
 
 // 公开数据形状的类型别名：底层类型位于 internal（§3.4），别名让外部

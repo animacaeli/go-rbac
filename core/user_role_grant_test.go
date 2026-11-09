@@ -143,6 +143,8 @@ func (s *UserRoleServiceSuite) TestRevoke_RoleNotFound() {
 
 func (s *UserRoleServiceSuite) TestRevoke_CrossTenantRole_Rejected() {
 	// Arrange：acme 域内查 beta 角色 → 域过滤不可见（tenant 隔离仓储）。
+	s.deps.TenancyRequired = true
+	s.userRoleSvc = core.NewUserRoleService(s.deps)
 	s.roles.On("FindByID", mock.Anything, uint64(7)).Return(nil, repository.ErrRecordNotFound)
 
 	// Act

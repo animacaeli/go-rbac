@@ -27,6 +27,28 @@ type ServiceDeps struct {
 	Events *EventBus
 	// GrantorMustHold 默认开启；关闭用于"权限管理员不需要持有全部业务权限"的场景。
 	GrantorMustHold bool
+	// TenancyRequired 由 App 在启用 tenant 模块后置为 true：管理服务据此
+	// 拒绝空租户的 operator（否则会静默落到平台域，误改平台角色/绑定）。
+	TenancyRequired bool
+}
+
+// requireOperatorScope 校验管理操作 operator 的授权域：
+//   - 启用多租户：TenantID 必须提供且符合 core.ValidTenantID（fail closed）；
+//   - 单租户：TenantID 必须为空（与 Authorizer 的语义一致，避免写入错域的计数器）。
+func (d ServiceDeps) requireOperatorScope(operator AuthorizationContext) error {
+	if d.TenancyRequired {
+		if operator.TenantID == "" {
+			return ErrTenantRequired
+		}
+		if !ValidTenantID(operator.TenantID) {
+			return fmt.Errorf("%w: %q", ErrInvalidTenantID, operator.TenantID)
+		}
+		return nil
+	}
+	if operator.TenantID != "" {
+		return ErrTenantNotSupported
+	}
+	return nil
 }
 
 // grantorAllowed 校验授权者约束：operator 必须持有全部拟授予权限码，
@@ -58,16 +80,31 @@ func (d ServiceDeps) record(ctx context.Context, e Event) error {
 		return nil
 	}
 	if err := d.Events.Record(ctx, e); err != nil {
-		return fmt.Errorf("%w: %v", ErrAuditFailedAfterCommit, err)
+		return fmt.Errorf("%w: %w", ErrAuditFailedAfterCommit, err)
 	}
 	return nil
 }
 
 // invalidateSubject / invalidateSubjects / invalidateEpoch：失效包装。
 // 数据库已提交、递增失败时返回 ErrInvalidationFailedAfterCommit（重试同一操作安全）。
+// mapRoleWriteError 把仓储写路径的领域错误翻译为服务层哨兵：
+// 并发删除导致的 NotFound 不应以 internal/repository 的错误泄漏给调用方。
+func (d ServiceDeps) mapRoleWriteError(err error, id uint64) error {
+	switch {
+	case err == nil:
+		return nil
+	case repository.IsNotFound(err):
+		return fmt.Errorf("%w: id=%d", ErrRoleNotFound, id)
+	case errors.Is(err, repository.ErrRoleInUse):
+		return fmt.Errorf("%w: %w", ErrRoleInUse, err)
+	default:
+		return err
+	}
+}
+
 func (d ServiceDeps) invalidateSubject(ctx context.Context, subjectID SubjectID) error {
 	if err := d.Authorizer.SyncSubjectVersion(ctx, subjectID); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidationFailedAfterCommit, err)
+		return fmt.Errorf("%w: %w", ErrInvalidationFailedAfterCommit, err)
 	}
 	return nil
 }
@@ -83,7 +120,15 @@ func (d ServiceDeps) invalidateSubjects(ctx context.Context, subjectIDs []string
 
 func (d ServiceDeps) invalidateEpoch(ctx context.Context) error {
 	if err := d.Authorizer.SyncEpoch(ctx); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidationFailedAfterCommit, err)
+		return fmt.Errorf("%w: %w", ErrInvalidationFailedAfterCommit, err)
+	}
+	return nil
+}
+
+// invalidateGlobalEpoch：权限表（全局定义）变更后的失效包装。
+func (d ServiceDeps) invalidateGlobalEpoch(ctx context.Context) error {
+	if err := d.Authorizer.SyncGlobalEpoch(ctx); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidationFailedAfterCommit, err)
 	}
 	return nil
 }
@@ -104,11 +149,17 @@ func NewRoleService(deps ServiceDeps) *RoleService { return &RoleService{deps: d
 
 // Create 创建角色（启用状态，非内置）。
 func (s *RoleService) Create(ctx context.Context, operator AuthorizationContext, code, name, description string) (*model.Role, error) {
+	if err := s.deps.requireOperatorScope(operator); err != nil {
+		return nil, err
+	}
 	ctx = ContextWithTenant(ctx, operator.TenantID)
 
 	code = strings.TrimSpace(code)
 	if code == "" || len(code) > model.RoleCodeMaxLength {
 		return nil, fmt.Errorf("%w: %q", ErrInvalidRoleCode, code)
+	}
+	if strings.EqualFold(code, model.BuiltinSuperAdminRoleCode) {
+		return nil, fmt.Errorf("%w: %q is reserved for the builtin super administrator", ErrInvalidRoleCode, code)
 	}
 	if strings.TrimSpace(name) == "" || len(name) > model.NameMaxLength {
 		return nil, fmt.Errorf("%w: name required (1-%d chars)", ErrInvalidPermissionDef, model.NameMaxLength)
@@ -170,6 +221,9 @@ func (s *RoleService) List(ctx context.Context, f repository.RoleFilter) ([]mode
 // Update 修改角色展示元数据（name/description）。code 与 status 不可经此修改。
 // 内置角色允许更新展示信息，但不可删除/禁用（§2.4）。
 func (s *RoleService) Update(ctx context.Context, operator AuthorizationContext, id uint64, name, description string) error {
+	if err := s.deps.requireOperatorScope(operator); err != nil {
+		return err
+	}
 	ctx = ContextWithTenant(ctx, operator.TenantID)
 
 	role, err := s.Get(ctx, id)
@@ -183,7 +237,7 @@ func (s *RoleService) Update(ctx context.Context, operator AuthorizationContext,
 		return fmt.Errorf("%w: description too long (max %d chars)", ErrInvalidPermissionDef, model.DescMaxLength)
 	}
 	if err := s.deps.Roles.UpdateProfile(ctx, id, name, description); err != nil {
-		return err
+		return s.deps.mapRoleWriteError(err, id)
 	}
 	return s.deps.record(ctx, NewEvent(EventRoleUpdated, operator, role.Code, map[string]string{
 		"role_id": strconv.FormatUint(id, 10),
@@ -194,6 +248,9 @@ func (s *RoleService) Update(ctx context.Context, operator AuthorizationContext,
 // SetStatus 启用/禁用角色。内置角色受保护（§7.3）。
 // 状态变化后批量递增关联用户版本号（§6.3 失效矩阵）。
 func (s *RoleService) SetStatus(ctx context.Context, operator AuthorizationContext, id uint64, status uint8) error {
+	if err := s.deps.requireOperatorScope(operator); err != nil {
+		return err
+	}
 	ctx = ContextWithTenant(ctx, operator.TenantID)
 
 	role, err := s.Get(ctx, id)
@@ -210,7 +267,7 @@ func (s *RoleService) SetStatus(ctx context.Context, operator AuthorizationConte
 		return nil // 幂等：状态未变化
 	}
 	if err := s.deps.Roles.SetStatus(ctx, id, status); err != nil {
-		return err
+		return s.deps.mapRoleWriteError(err, id)
 	}
 	if err := s.deps.invalidateEpoch(ctx); err != nil {
 		return err
@@ -225,6 +282,9 @@ func (s *RoleService) SetStatus(ctx context.Context, operator AuthorizationConte
 // Delete 删除角色：内置角色受保护；正在被分配给用户的角色拒绝删除（§2.4）。
 // 删除时在同一事务清理关联行（§5.3）。
 func (s *RoleService) Delete(ctx context.Context, operator AuthorizationContext, id uint64) error {
+	if err := s.deps.requireOperatorScope(operator); err != nil {
+		return err
+	}
 	ctx = ContextWithTenant(ctx, operator.TenantID)
 
 	role, err := s.Get(ctx, id)
@@ -242,7 +302,7 @@ func (s *RoleService) Delete(ctx context.Context, operator AuthorizationContext,
 		return fmt.Errorf("%w: %d subject(s)", ErrRoleInUse, n)
 	}
 	if err := s.deps.Roles.DeleteWithAssociations(ctx, id); err != nil {
-		return err
+		return s.deps.mapRoleWriteError(err, id)
 	}
 	return s.deps.record(ctx, NewEvent(EventRoleDeleted, operator, role.Code, map[string]string{
 		"role_id": strconv.FormatUint(id, 10),
@@ -262,6 +322,9 @@ func (s *RoleService) Delete(ctx context.Context, operator AuthorizationContext,
 //
 // 提交成功后批量递增拥有该角色的用户版本号（§6.3）。
 func (s *RoleService) SetPermissions(ctx context.Context, operator AuthorizationContext, roleID uint64, permissionCodes []string) error {
+	if err := s.deps.requireOperatorScope(operator); err != nil {
+		return err
+	}
 	ctx = ContextWithTenant(ctx, operator.TenantID)
 
 	role, err := s.Get(ctx, roleID)

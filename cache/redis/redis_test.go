@@ -197,3 +197,20 @@ func (s *CacheSuite) TestSetIntMax_CorruptValue_AtomicSelfHeal() {
 	v2, _, _ := s.sut.GetInt(s.ctx, "k2")
 	s.Equal(int64(9), v2, "损坏键上的并发写入收敛到最大真值")
 }
+
+// GetInts（批量读）：一次 MGET 区分"缺失"与"值"，损坏值必须报错
+// （缓存状态不可信 → 调用方回退数据库权威值）。
+func (s *CacheSuite) TestGetInts_BatchSemantics() {
+	ctx := s.ctx
+	s.Require().NoError(s.sut.SetIntMax(ctx, "a", int64(7)))
+	s.Require().NoError(s.sut.SetIntMax(ctx, "c", int64(0)))
+
+	vals, found, err := s.sut.GetInts(ctx, []string{"a", "b", "c"})
+	s.Require().NoError(err)
+	s.Equal([]int64{7, 0, 0}, vals)
+	s.Equal([]bool{true, false, true}, found, "缺失键必须与零值区分")
+
+	s.Require().NoError(s.srv.Set("bad", "not-a-number"))
+	_, _, err = s.sut.GetInts(ctx, []string{"a", "bad"})
+	s.Require().Error(err, "损坏值必须报错，不得当作未命中")
+}

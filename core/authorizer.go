@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -74,10 +75,37 @@ func (s *AuthorizationService) validateAC(ac AuthorizationContext) error {
 		if ac.TenantID == "" {
 			return ErrTenantRequired
 		}
+		if !ValidTenantID(ac.TenantID) {
+			return fmt.Errorf("%w: %q", ErrInvalidTenantID, ac.TenantID)
+		}
 	} else if ac.TenantID != "" {
 		return ErrTenantNotSupported
 	}
 	return nil
+}
+
+// TenantIDMaxLength 与 tenant 迁移的列宽（VARCHAR(64)）一致。
+const TenantIDMaxLength = 64
+
+// ValidTenantID 校验授权域标识：长度 <= 64、字符集 [A-Za-z0-9_.-]，
+// 且不占用保留 scope（"default" 平台域、"!global" 全局计数器）。
+// 字符集限制是缓存/计数器键（"rbac:{scope}:subject:..."）的结构性保护。
+func ValidTenantID(tenantID string) bool {
+	if tenantID == "" || len(tenantID) > TenantIDMaxLength {
+		return false
+	}
+	if strings.EqualFold(tenantID, DefaultScope) || strings.EqualFold(tenantID, repository.GlobalScope) {
+		return false
+	}
+	for _, r := range tenantID {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '_' || r == '-' || r == '.':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 var _ Authorizer = (*AuthorizationService)(nil)
@@ -103,6 +131,22 @@ func NewAuthorizationService(
 	return &AuthorizationService{repo: repo, counters: counters, cch: cch, checker: checker, metrics: metrics, ttl: ttl}
 }
 
+// noopMarker 是"无缓存"实现的可选标记（cache.NoopCache 及其包装）。
+type noopMarker interface{ IsNoop() bool }
+
+// isNoopCache 判断缓存实现是否等价于 NoopCache。
+func isNoopCache(c cache.PermissionCache) bool {
+	if _, ok := c.(noopMarker); ok {
+		return true
+	}
+	switch c.(type) {
+	case cache.NoopCache, *cache.NoopCache:
+		return true
+	default:
+		return false
+	}
+}
+
 // loaded 是一次授权状态装载的结果。
 type loaded struct {
 	permissions map[string]struct{}
@@ -115,19 +159,83 @@ func epochKey(scope string) string {
 	return "rbac:" + scope + ":epoch"
 }
 
+// globalEpochKey 是全局（跨租户）epoch 的缓存键：权限定义表是全局的，
+// 权限禁用/同步必须使所有授权域的生成键失效（§6.3）。
+func globalEpochKey() string {
+	return "rbac:" + repository.GlobalScope + ":epoch"
+}
+
+// canonicalSubject 是缓存/计数器键中的主体规范化形式。
+//
+// 库表排序规则（utf8mb4_0900_ai_ci）下 subject_id 不区分大小写，同一身份
+// 的不同拼写命中同一行数据与同一个权威计数器；缓存键必须同样规范化，否则
+// 两种拼写各持一份版本副本，"只同步了其中一种拼写"会让另一种的旧缓存
+// 一直存活到 TTL（陈旧权限放行）。
+func canonicalSubject(subjectID string) string {
+	return strings.ToLower(subjectID)
+}
+
 func subjectVersionKey(scope, subjectID string) string {
-	return "rbac:" + scope + ":subject:" + subjectID + ":version"
+	return "rbac:" + scope + ":subject:" + canonicalSubject(subjectID) + ":version"
 }
 
 func subjectPermKey(scope, subjectID string, gen int64) string {
-	return "rbac:" + scope + ":subject:" + subjectID + ":perm:v" + strconv.FormatInt(gen, 10)
+	return "rbac:" + scope + ":subject:" + canonicalSubject(subjectID) + ":perm:v" + strconv.FormatInt(gen, 10)
 }
 
-// generationKey 合并 epoch 与主体版本号为单个生成键。
-// counter 使用低 32 位（现实中不可能触达），epoch 占高位；
-// 任一递增都会改变生成键，使旧 perm key 不可达。
-func generationKey(epoch, subjectVersion int64) int64 {
-	return epoch<<32 | subjectVersion
+// generationKey 合并"授权域 epoch + 全局 epoch"与主体版本号为单个生成键。
+// subjectVersion 使用低 32 位（现实中不可能触达），epoch 和占高位；
+// 三个计数器都单调不减，任一递增都会严格增大生成键，使旧 perm key 不可达。
+//
+// 全局 epoch 参与合成是"权限表全局、授权域按租户"的必然结果：单租户域
+// epoch 无法表达跨租户的权限禁用（外部评审第八轮 P0）。
+func generationKey(epoch, globalEpoch, subjectVersion int64) int64 {
+	return (epoch+globalEpoch)<<32 | subjectVersion
+}
+
+// counterValues 是一次授权域计数器读取结果。
+type counterValues struct {
+	epoch          int64
+	globalEpoch    int64
+	subjectVersion int64
+}
+
+// readCounters 读取 epoch / 全局 epoch / 主体版本三个计数器副本。
+// 实现缓存支持批量读时合并为一次往返（cache.IntBatchReader）。
+// ok=false 表示有键缺失（调用方回退数据库权威值）；err 非 nil 表示缓存故障。
+func (s *AuthorizationService) readCounters(ctx context.Context, scope, subject string) (cv counterValues, ok bool, err error) {
+	keys := [3]string{epochKey(scope), globalEpochKey(), subjectVersionKey(scope, subject)}
+	if batch, canBatch := s.cch.(cache.IntBatchReader); canBatch {
+		vals, found, berr := batch.GetInts(ctx, keys[:])
+		switch {
+		case berr == nil && len(vals) == len(keys) && len(found) == len(keys):
+			if !found[0] || !found[1] || !found[2] {
+				return counterValues{}, false, nil
+			}
+			return counterValues{epoch: vals[0], globalEpoch: vals[1], subjectVersion: vals[2]}, true, nil
+		default:
+			// 批量读失败（典型：Redis Cluster 中三个键落在不同 slot，
+			// MGET 返回 CROSSSLOT）→ 退回逐键读取；逐键失败才视为缓存故障。
+		}
+	}
+	for i, key := range keys {
+		v, found, gerr := s.cch.GetInt(ctx, key)
+		if gerr != nil {
+			return counterValues{}, false, gerr
+		}
+		if !found {
+			return counterValues{}, false, nil
+		}
+		switch i {
+		case 0:
+			cv.epoch = v
+		case 1:
+			cv.globalEpoch = v
+		case 2:
+			cv.subjectVersion = v
+		}
+	}
+	return cv, true, nil
 }
 
 // load 装载主体的有效授权状态。
@@ -185,7 +293,7 @@ func (s *AuthorizationService) loadOnce(ctx context.Context, ac AuthorizationCon
 	// Simple 模式（NoopCache）：无缓存即无生成键语义——直接回源数据库，
 	// 不走计数器协议（否则每次鉴权额外 +4 次权威计数器查询，Simple 模式
 	// 的性能契约是"仅原有聚合查询"）。
-	if _, simple := s.cch.(cache.NoopCache); simple {
+	if isNoopCache(s.cch) {
 		set, isSuper, err := s.loadFromDB(ctx, ac)
 		if err != nil {
 			return loaded{}, false, false, err
@@ -200,12 +308,11 @@ func (s *AuthorizationService) loadOnce(ctx context.Context, ac AuthorizationCon
 	//     生成键碰撞"），随后照常走缓存/回源；
 	//   - 任何时刻生成键均取自权威值或其忠实副本：权威值只增不减，
 	//     旧生成键下的陈旧条目天然不可达。
-	epoch, epochOK, eErr := s.cch.GetInt(ctx, epochKey(scope))
-	version, versionOK, vErr := s.cch.GetInt(ctx, subjectVersionKey(scope, subject))
-	if eErr != nil || vErr != nil || !epochOK || !versionOK {
-		var err error
-		epoch, version, err = s.recoverCountersFromDB(ctx, scope, subject, eErr, vErr)
-		if err != nil {
+	cv, countersOK, cErr := s.readCounters(ctx, scope, subject)
+	if cErr != nil || !countersOK {
+		var rerr error
+		cv, rerr = s.recoverCountersFromDB(ctx, scope, subject, cErr)
+		if rerr != nil {
 			// 数据库也不可用：回源鉴权数据（不读缓存），fail-closed 语义由
 			// 聚合查询错误承载。
 			set, isSuper, dbErr := s.loadFromDB(ctx, ac)
@@ -216,19 +323,31 @@ func (s *AuthorizationService) loadOnce(ctx context.Context, ac AuthorizationCon
 		}
 	}
 
-	refGen := generationKey(epoch, version)
+	refGen := generationKey(cv.epoch, cv.globalEpoch, cv.subjectVersion)
 	if cached, ok, err := s.cch.Get(ctx, subjectPermKey(scope, subject, refGen)); err == nil && ok {
 		return parseCached(cached), true, false, nil
 	}
 	// 未命中 / 故障 → singleflight 合并回源（§6.8）。
-	v, err, _ := s.sf.Do(scope+"/"+subject, func() (any, error) {
-		return s.aggregateAndCache(ctx, ac, refGen)
+	//
+	// 共享回源使用 WithoutCancel：剥离首个调用者的取消信号（保留 ctx values），
+	// 否则该请求断开会让所有等待者一起失败；调用方自身的取消仍由下面的
+	// select 处理，不会阻塞已断开的请求。
+	ch := s.sf.DoChan(scope+"/"+canonicalSubject(subject), func() (any, error) {
+		return s.aggregateAndCache(context.WithoutCancel(ctx), ac, refGen)
 	})
-	if err != nil {
-		return loaded{}, false, false, err
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			return loaded{}, false, false, res.Err
+		}
+		result, ok := res.Val.(aggregateResult)
+		if !ok {
+			return loaded{}, false, false, fmt.Errorf("rbac: unexpected singleflight result type %T", res.Val)
+		}
+		return loaded{permissions: result.set, isSuper: result.isSuper}, false, result.unstable, nil
+	case <-ctx.Done():
+		return loaded{}, false, false, ctx.Err()
 	}
-	result := v.(aggregateResult)
-	return loaded{permissions: result.set, isSuper: result.isSuper}, false, result.unstable, nil
 }
 
 type aggregateResult struct {
@@ -294,8 +413,9 @@ func (s *AuthorizationService) aggregateAndCache(ctx context.Context, ac Authori
 	if err != nil || !ok {
 		// 副本不可读：以 DB 权威值兜底比较。
 		dbEpoch, e1 := s.counters.Get(ctx, dbEpochKey(scope))
+		dbGlobal, e3 := s.counters.Get(ctx, repository.GlobalEpochKey)
 		dbVersion, e2 := s.counters.Get(ctx, dbSubjectVersionKey(scope, subject))
-		if e1 != nil || e2 != nil || generationKey(dbEpoch, dbVersion) != refGen {
+		if e1 != nil || e2 != nil || e3 != nil || generationKey(dbEpoch, dbGlobal, dbVersion) != refGen {
 			return aggregateResult{set: set}, nil
 		}
 	} else if gen2 != refGen {
@@ -313,44 +433,45 @@ func (s *AuthorizationService) aggregateAndCache(ctx context.Context, ac Authori
 	return aggregateResult{set: set}, nil
 }
 
-// recoverCountersFromDB 从数据库读取权威 epoch/版本并回填缓存副本。
-// 返回值即权威生成键的两个分量。回填失败（Redis 写失败）不致命：
-// 生成键仍以权威值参与本次判断，仅下次读仍需回退。
-func (s *AuthorizationService) recoverCountersFromDB(ctx context.Context, scope, subject string, eErr, vErr error) (epoch, version int64, err error) {
-	epoch, err = s.counters.Get(ctx, dbEpochKey(scope))
+// recoverCountersFromDB 从数据库读取权威 epoch / 全局 epoch / 主体版本并
+// 回填缓存副本。回填失败（Redis 写失败）不致命：生成键仍以权威值参与本次
+// 判断，仅下次读仍需回退。
+func (s *AuthorizationService) recoverCountersFromDB(ctx context.Context, scope, subject string, _ error) (counterValues, error) {
+	epoch, err := s.counters.Get(ctx, dbEpochKey(scope))
 	if err != nil {
-		return 0, 0, fmt.Errorf("rbac: recover epoch from db: %w", err)
+		return counterValues{}, fmt.Errorf("rbac: recover epoch from db: %w", err)
 	}
-	version, err = s.counters.Get(ctx, dbSubjectVersionKey(scope, subject))
+	global, err := s.counters.Get(ctx, repository.GlobalEpochKey)
 	if err != nil {
-		return 0, 0, fmt.Errorf("rbac: recover subject version from db: %w", err)
+		return counterValues{}, fmt.Errorf("rbac: recover global epoch from db: %w", err)
+	}
+	version, err := s.counters.Get(ctx, dbSubjectVersionKey(scope, subject))
+	if err != nil {
+		return counterValues{}, fmt.Errorf("rbac: recover subject version from db: %w", err)
 	}
 	// SetIntMax 单调回填（不先删）：Lua 脚本原子处理损坏值
 	// （tonumber(cur) 解析失败即视为不可信，原子替换为权威值），
 	// 消除"删除与回填之间的并发同步"竞态窗口（§6.2，外部评审第六轮）。
 	_ = s.cch.SetIntMax(ctx, epochKey(scope), epoch)
+	_ = s.cch.SetIntMax(ctx, globalEpochKey(), global)
 	_ = s.cch.SetIntMax(ctx, subjectVersionKey(scope, subject), version)
-	return epoch, version, nil
+	return counterValues{epoch: epoch, globalEpoch: global, subjectVersion: version}, nil
 }
 
 // readCachedGeneration 读副本生成键；ok=false 表示副本缺失/不可读。
 func (s *AuthorizationService) readCachedGeneration(ctx context.Context, scope, subject string) (int64, bool, error) {
-	epoch, epochOK, err := s.cch.GetInt(ctx, epochKey(scope))
-	if err != nil || !epochOK {
+	cv, ok, err := s.readCounters(ctx, scope, subject)
+	if err != nil || !ok {
 		return 0, false, err
 	}
-	version, versionOK, err := s.cch.GetInt(ctx, subjectVersionKey(scope, subject))
-	if err != nil || !versionOK {
-		return 0, false, err
-	}
-	return generationKey(epoch, version), true, nil
+	return generationKey(cv.epoch, cv.globalEpoch, cv.subjectVersion), true, nil
 }
 
 // DB 权威计数器键（rbac_counters.k）：与 Redis 键后缀同构、去前缀。
 func dbEpochKey(scope string) string { return scope + ":epoch" }
 
 func dbSubjectVersionKey(scope, subject string) string {
-	return scope + ":subject:" + subject + ":version"
+	return scope + ":subject:" + canonicalSubject(subject) + ":version"
 }
 
 // loadFromDB 直接回源数据库（不读不写缓存），返回集合与超管判定。
@@ -507,10 +628,11 @@ func (s *AuthorizationService) IsSuperAdministrator(ctx context.Context, ac Auth
 // 授权域取自 ctx 租户槽位（服务层写路径已注入 operator 的授权域；
 // 缺槽位时回落 default 域）。缓存 key 与读取路径的 ac.Scope() 保持同域。
 
-// scopeOf 从 ctx 推导授权域（§6.1 scope 槽位）。
+// scopeOf 从 ctx 推导授权域（§6.1 scope 槽位），与 AuthorizationContext.Scope
+// 一致地规范化租户大小写。
 func scopeOf(ctx context.Context) string {
 	if tenant, ok := TenantFromContext(ctx); ok && tenant != "" {
-		return tenant
+		return strings.ToLower(tenant)
 	}
 	return DefaultScope
 }
@@ -548,6 +670,24 @@ func (s *AuthorizationService) SyncSubjectVersions(ctx context.Context, subjectI
 		if err := s.SyncSubjectVersion(ctx, SubjectID(id)); err != nil {
 			return fmt.Errorf("rbac: invalidate subject %s: %w", id, err)
 		}
+	}
+	return nil
+}
+
+// SyncGlobalEpoch 同步全局（跨租户）epoch 副本。适用：权限表（全局定义）的
+// 状态变更与权限同步——单租户域 epoch 无法让其它租户的旧生成键失效。
+func (s *AuthorizationService) SyncGlobalEpoch(ctx context.Context) error {
+	atomic.AddInt64(&s.inv.attempts, 1)
+	global, err := s.counters.Get(ctx, repository.GlobalEpochKey)
+	if err != nil {
+		atomic.AddInt64(&s.inv.failures, 1)
+		_ = s.cch.Delete(ctx, globalEpochKey())
+		return err
+	}
+	if err := s.cch.SetIntMax(ctx, globalEpochKey(), global); err != nil {
+		atomic.AddInt64(&s.inv.failures, 1)
+		_ = s.cch.Delete(ctx, globalEpochKey())
+		return err
 	}
 	return nil
 }

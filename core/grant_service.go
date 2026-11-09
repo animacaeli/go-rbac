@@ -38,6 +38,9 @@ func NewGrantService(deps ServiceDeps) *GrantService { return &GrantService{deps
 // 再插入新授权（§2.5 主防线；生成列唯一约束兜底并发）。
 // 提交成功后递增该用户版本号（§6.3）。
 func (s *GrantService) Grant(ctx context.Context, operator AuthorizationContext, subjectID, permissionCode string, expiresAt *time.Time, reason string) error {
+	if err := s.deps.requireOperatorScope(operator); err != nil {
+		return err
+	}
 	ctx = ContextWithTenant(ctx, operator.TenantID)
 
 	if err := validateSubject(subjectID); err != nil {
@@ -81,6 +84,9 @@ func (s *GrantService) Grant(ctx context.Context, operator AuthorizationContext,
 // Revoke 撤销用户当前活跃的额外授权（保留记录，§2.5）。
 // 无活跃授权时返回 ErrGrantNotFound。
 func (s *GrantService) Revoke(ctx context.Context, operator AuthorizationContext, subjectID, permissionCode string) error {
+	if err := s.deps.requireOperatorScope(operator); err != nil {
+		return err
+	}
 	ctx = ContextWithTenant(ctx, operator.TenantID)
 
 	if err := validateSubject(subjectID); err != nil {

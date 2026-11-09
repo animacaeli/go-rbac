@@ -3,7 +3,9 @@ package tenant
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/animacaeli/go-rbac/core"
@@ -53,12 +55,33 @@ func (r *Repos) writer(ctx context.Context) (*gorm.DB, string, error) {
 
 func nowUTC() time.Time { return time.Now().UTC() }
 
-// scopeKey 归一计数器键前缀：空租户（平台域）→ default。
+// tenantHardLimit 与 base 仓储一致：列表类查询的硬上限。
+const tenantHardLimit = 1000
+
+// translateFirst 只把 gorm.ErrRecordNotFound 翻译为仓储 NotFound；其它错误
+// （连接失败、超时、ctx 取消）原样返回，避免基础设施故障被伪装成 404。
+func translateFirst(err error, format string, args ...any) error {
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("%w: "+format, append([]any{repository.ErrRecordNotFound}, args...)...)
+	}
+	return err
+}
+
+// scopeKey 归一计数器键前缀：空租户（平台域）→ default，租户/主体统一小写
+// （与库表大小写不敏感排序规则、core 的缓存键保持一致）。
 func scopeKey(tenant, subject string) string {
 	if tenant == "" {
 		tenant = "default"
 	}
-	return tenant + ":subject:" + subject + ":version"
+	return strings.ToLower(tenant) + ":subject:" + strings.ToLower(subject) + ":version"
+}
+
+// epochKeyFor 归一授权域 epoch 键（与 core.scopeOf / repository.TenantScope 一致）。
+func epochKeyFor(tenant string) string {
+	if tenant == "" {
+		tenant = "default"
+	}
+	return strings.ToLower(tenant) + ":epoch"
 }
 
 // runWithDeadlockRetry：共享实现（internal/repository.DeadlockRetry）。
@@ -101,7 +124,7 @@ func (x roleRepo) FindByID(ctx context.Context, id uint64) (*model.Role, error) 
 	}
 	var role model.Role
 	if err := db.Table("rbac_roles").Where("id = ? AND tenant_id = ?", id, t).First(&role).Error; err != nil {
-		return nil, fmt.Errorf("%w: role id=%d tenant=%s", repository.ErrRecordNotFound, id, t)
+		return nil, translateFirst(err, "role id=%d tenant=%s", id, t)
 	}
 	return &role, nil
 }
@@ -113,7 +136,7 @@ func (x roleRepo) FindByCode(ctx context.Context, code string) (*model.Role, err
 	}
 	var role model.Role
 	if err := db.Table("rbac_roles").Where("code = ? AND tenant_id = ?", code, t).First(&role).Error; err != nil {
-		return nil, fmt.Errorf("%w: role code=%s tenant=%s", repository.ErrRecordNotFound, code, t)
+		return nil, translateFirst(err, "role code=%s tenant=%s", code, t)
 	}
 	return &role, nil
 }
@@ -123,9 +146,23 @@ func (x roleRepo) UpdateProfile(ctx context.Context, id uint64, name, descriptio
 	if err != nil {
 		return err
 	}
-	return db.Model(&model.Role{}).
+	res := db.Model(&model.Role{}).
 		Where("id = ? AND tenant_id = ?", id, t).
-		Updates(map[string]any{"name": name, "description": description}).Error
+		Updates(map[string]any{"name": name, "description": description})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected > 0 {
+		return nil
+	}
+	var n int64
+	if err := db.Table("rbac_roles").Where("id = ? AND tenant_id = ?", id, t).Count(&n).Error; err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("%w: role id=%d tenant=%s", repository.ErrRecordNotFound, id, t)
+	}
+	return nil
 }
 
 func (x roleRepo) SetStatus(ctx context.Context, id uint64, status uint8) error {
@@ -133,9 +170,28 @@ func (x roleRepo) SetStatus(ctx context.Context, id uint64, status uint8) error 
 	if err != nil {
 		return err
 	}
-	return db.Model(&model.Role{}).
-		Where("id = ? AND tenant_id = ?", id, t).
-		Update("status", status).Error
+	// 角色禁用/启用 → 授权域 epoch 同事务递增（§6.3）。缺此递增时
+	// SyncEpoch 只会把未变化的权威值同步回 Redis，被禁用角色的旧权限会
+	// 继续从缓存放行到 TTL 结束（外部评审第八轮 P0）。
+	return db.Transaction(func(tx *gorm.DB) error {
+		res := tx.Model(&model.Role{}).
+			Where("id = ? AND tenant_id = ?", id, t).
+			Update("status", status)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected > 0 {
+			return gormrepo.BumpCounterTx(tx, epochKeyFor(t))
+		}
+		var n int64
+		if err := tx.Table("rbac_roles").Where("id = ? AND tenant_id = ?", id, t).Count(&n).Error; err != nil {
+			return err
+		}
+		if n == 0 {
+			return fmt.Errorf("%w: role id=%d tenant=%s", repository.ErrRecordNotFound, id, t)
+		}
+		return nil
+	})
 }
 
 func (x roleRepo) DeleteWithAssociations(ctx context.Context, id uint64) error {
@@ -144,12 +200,25 @@ func (x roleRepo) DeleteWithAssociations(ctx context.Context, id uint64) error {
 		return err
 	}
 	return db.Transaction(func(tx *gorm.DB) error {
+		var used int64
+		if err := tx.Table("rbac_user_roles").
+			Where("role_id = ? AND tenant_id = ?", id, t).
+			Count(&used).Error; err != nil {
+			return err
+		}
+		if used > 0 {
+			return fmt.Errorf("%w: %d subject(s), role id=%d tenant=%s", repository.ErrRoleInUse, used, id, t)
+		}
 		if err := tx.Table("rbac_user_roles").
 			Where("role_id = ? AND tenant_id = ?", id, t).
 			Delete(nil).Error; err != nil {
 			return err
 		}
 		if err := tx.Where("role_id = ?", id).Delete(&model.RolePermission{}).Error; err != nil {
+			return err
+		}
+		// datascope 是可选模块：表不存在时跳过，存在则清理孤儿数据范围行。
+		if err := tx.Exec("DELETE FROM rbac_role_data_scopes WHERE role_id = ?", id).Error; err != nil && !repository.IsMissingTable(err) {
 			return err
 		}
 		res := tx.Table("rbac_roles").Where("id = ? AND tenant_id = ?", id, t).Delete(nil)
@@ -159,7 +228,8 @@ func (x roleRepo) DeleteWithAssociations(ctx context.Context, id uint64) error {
 		if res.RowsAffected == 0 {
 			return fmt.Errorf("%w: role id=%d tenant=%s", repository.ErrRecordNotFound, id, t)
 		}
-		return nil
+		// 角色删除 → 授权域 epoch 同事务递增（§6.3）。
+		return gormrepo.BumpCounterTx(tx, epochKeyFor(t))
 	})
 }
 
@@ -218,19 +288,18 @@ func (x userRoleRepo) roleTenantOf(db *gorm.DB, roleID uint64, expect string) er
 		Scan(&row).Error; err != nil {
 		return err
 	}
-	if row.TenantID == "" && expect != "" {
-		// Scan 零值无法区分"无匹配行"与"平台域角色"：以新会话计数确认。
-		var exists int64
-		if err := db.Session(&gorm.Session{NewDB: true}).
-			Table("rbac_roles").
-			Where("id = ?", roleID).
-			Count(&exists).Error; err != nil {
-			return err
-		}
-		if exists == 0 {
-			return fmt.Errorf("%w: role id=%d", repository.ErrRecordNotFound, roleID)
-		}
-		// 存在且 tenant_id=''：平台域角色——按跨域规则在下方拒绝（除非本域即平台域）。
+	// Scan 零值无法区分"无匹配行"与"平台域角色（tenant_id=''）"：
+	// 必须无条件复核存在性，否则平台域上下文可以绑定不存在的角色，
+	// 留下悬空的 rbac_user_roles 行。
+	var exists int64
+	if err := db.Session(&gorm.Session{NewDB: true}).
+		Table("rbac_roles").
+		Where("id = ?", roleID).
+		Count(&exists).Error; err != nil {
+		return err
+	}
+	if exists == 0 {
+		return fmt.Errorf("%w: role id=%d", repository.ErrRecordNotFound, roleID)
 	}
 	if row.TenantID != expect {
 		return fmt.Errorf("rbac/modules/tenant: cross-tenant role reference rejected: role %d belongs to %q, scope is %q", roleID, row.TenantID, expect)
@@ -258,6 +327,83 @@ func (x userRoleRepo) Assign(ctx context.Context, subjectID string, roleID uint6
 		}
 		if res.RowsAffected > 0 {
 			return gormrepo.BumpCounterTx(tx, scopeKey(t, subjectID))
+		}
+		return nil
+	})
+}
+
+// AssignMany 在单个事务内为一个主体分配多个角色（§2.9 跨租户校验 + §6.3 版本递增）。
+func (x userRoleRepo) AssignMany(ctx context.Context, subjectID string, roleIDs []uint64) error {
+	if len(roleIDs) == 0 {
+		return nil
+	}
+	db, t, err := x.r.writer(ctx)
+	if err != nil {
+		return err
+	}
+	seen := make(map[uint64]struct{}, len(roleIDs))
+	for _, id := range roleIDs {
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		if err := x.roleTenantOf(db, id, t); err != nil {
+			return err
+		}
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		inserted := false
+		for _, id := range roleIDs {
+			res := tx.Exec(
+				"INSERT IGNORE INTO rbac_user_roles (tenant_id, subject_id, role_id, created_at) VALUES (?, ?, ?, ?)",
+				t, subjectID, id, nowUTC(),
+			)
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected > 0 {
+				inserted = true
+			}
+		}
+		if inserted {
+			return gormrepo.BumpCounterTx(tx, scopeKey(t, subjectID))
+		}
+		return nil
+	})
+}
+
+// AssignRoleToSubjects 在单个事务内把一个角色分配给多个主体，并为每个新建
+// 成功的主体递增版本。
+func (x userRoleRepo) AssignRoleToSubjects(ctx context.Context, roleID uint64, subjectIDs []string) error {
+	if len(subjectIDs) == 0 {
+		return nil
+	}
+	db, t, err := x.r.writer(ctx)
+	if err != nil {
+		return err
+	}
+	if err := x.roleTenantOf(db, roleID, t); err != nil {
+		return err
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		seen := make(map[string]struct{}, len(subjectIDs))
+		for _, sid := range subjectIDs {
+			if _, dup := seen[sid]; dup {
+				continue
+			}
+			seen[sid] = struct{}{}
+			res := tx.Exec(
+				"INSERT IGNORE INTO rbac_user_roles (tenant_id, subject_id, role_id, created_at) VALUES (?, ?, ?, ?)",
+				t, sid, roleID, nowUTC(),
+			)
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected > 0 {
+				if err := gormrepo.BumpCounterTx(tx, scopeKey(t, sid)); err != nil {
+					return err
+				}
+			}
 		}
 		return nil
 	})
@@ -291,6 +437,7 @@ func (x userRoleRepo) ListBySubject(ctx context.Context, subjectID string) ([]mo
 	if err := db.Table("rbac_user_roles").
 		Where("subject_id = ? AND tenant_id = ?", subjectID, t).
 		Order("id ASC").
+		Limit(tenantHardLimit).
 		Scan(&urs).Error; err != nil {
 		return nil, err
 	}
@@ -307,6 +454,7 @@ func (x userRoleRepo) ListRolesBySubject(ctx context.Context, subjectID string) 
 		Joins("JOIN rbac_user_roles ur ON ur.role_id = r.id AND ur.tenant_id = ? AND r.tenant_id = ur.tenant_id", t).
 		Where("ur.subject_id = ?", subjectID).
 		Order("r.id ASC").
+		Limit(tenantHardLimit).
 		Scan(&roles).Error; err != nil {
 		return nil, err
 	}
@@ -321,6 +469,7 @@ func (x userRoleRepo) SubjectIDsOfRole(ctx context.Context, roleID uint64) ([]st
 	var ids []string
 	if err := db.Table("rbac_user_roles").
 		Where("role_id = ? AND tenant_id = ?", roleID, t).
+		Limit(tenantHardLimit).
 		Pluck("subject_id", &ids).Error; err != nil {
 		return nil, err
 	}
@@ -395,7 +544,7 @@ func (x grantRepo) FindActive(ctx context.Context, subjectID string, permissionI
 	if err := db.Table("rbac_user_grants").
 		Where("tenant_id = ? AND subject_id = ? AND permission_id = ? AND revoked_at IS NULL", t, subjectID, permissionID).
 		First(&g).Error; err != nil {
-		return nil, fmt.Errorf("%w: active grant tenant=%s subject=%s permission_id=%d", repository.ErrRecordNotFound, t, subjectID, permissionID)
+		return nil, translateFirst(err, "active grant tenant=%s subject=%s permission_id=%d", t, subjectID, permissionID)
 	}
 	return &g, nil
 }
@@ -409,6 +558,7 @@ func (x grantRepo) ListBySubject(ctx context.Context, subjectID string) ([]model
 	if err := db.Table("rbac_user_grants").
 		Where("tenant_id = ? AND subject_id = ?", t, subjectID).
 		Order("id DESC").
+		Limit(tenantHardLimit).
 		Scan(&gs).Error; err != nil {
 		return nil, err
 	}
@@ -424,6 +574,7 @@ func (x grantRepo) ListActiveBySubject(ctx context.Context, subjectID string, no
 	if err := db.Table("rbac_user_grants").
 		Where("tenant_id = ? AND subject_id = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)", t, subjectID, now).
 		Order("id DESC").
+		Limit(tenantHardLimit).
 		Scan(&gs).Error; err != nil {
 		return nil, err
 	}

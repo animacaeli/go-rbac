@@ -27,9 +27,9 @@ func NewPermissionService(deps ServiceDeps) *PermissionService {
 
 // SetStatus 设置权限状态（启用/手动禁用）。
 //
-// §6.3 失效矩阵：权限禁用 → INCR 全局 epoch——一次性使所有旧生成键不可达，
-// 代价是全员冷启动一次。启用同样递增 epoch（保守失效，确保从"禁用中"缓存
-// 恢复的读者拿到新状态）。内置 rbac:* 权限允许禁用（运营决策），
+// §6.3 失效矩阵：rbac_permissions 是全局定义表，权限禁用/启用递增**全局**
+// epoch——跨全部租户域一次性使旧生成键不可达（单租户 epoch 只能让本域失效，
+// 其它租户会继续从缓存放行已禁用权限）。内置 rbac:* 权限允许禁用（运营决策），
 // 禁用后相关管理接口将拒绝持权约束检查中依赖它的操作。
 func (s *PermissionService) SetStatus(ctx context.Context, operator AuthorizationContext, code string, status uint8) error {
 	ctx = ContextWithTenant(ctx, operator.TenantID)
@@ -50,7 +50,7 @@ func (s *PermissionService) SetStatus(ctx context.Context, operator Authorizatio
 	if err := s.deps.Permissions.SetStatus(ctx, perm.ID, status); err != nil {
 		return err
 	}
-	if err := s.deps.invalidateEpoch(ctx); err != nil {
+	if err := s.deps.invalidateGlobalEpoch(ctx); err != nil {
 		return err
 	}
 	return s.deps.record(ctx, NewEvent(EventPermissionStatusSet, operator, code, map[string]string{

@@ -134,3 +134,25 @@ func TestNew_OptionValidation(t *testing.T) {
 	_, err = rbac.New(rbac.WithDB(&gorm.DB{}), rbac.WithCacheTTL(-time.Second))
 	require.ErrorIs(t, err, rbac.ErrInvalidOption)
 }
+
+// enableTenantModule 模拟"手工开启租户策略"的模块：Register 只调用
+// EnableTenantScope，不替换仓储。
+type enableTenantModule struct{ stubModule }
+
+func (m enableTenantModule) Register(app *rbac.App) error {
+	app.EnableTenantScope()
+	return nil
+}
+
+// 启用租户策略后，管理服务必须立即要求 operator 携带租户（重建服务生效）。
+func TestAssembly_EnableTenantScope_PropagatesToServices(t *testing.T) {
+	app, err := rbac.New(
+		rbac.WithDB(&gorm.DB{}),
+		rbac.WithModules(enableTenantModule{stubModule{name: "tenant-like"}}),
+	)
+	require.NoError(t, err)
+	require.True(t, app.TenancyEnabled())
+
+	_, err = app.Roles().Create(context.Background(), core.AuthorizationContext{SubjectID: "op"}, "c", "n", "")
+	require.ErrorIs(t, err, core.ErrTenantRequired, "空租户 operator 必须被管理服务拒绝")
+}

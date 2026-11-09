@@ -22,6 +22,11 @@ var (
 	// fail closed，不得回退到 default 域（§2.9）。
 	ErrTenantRequired = errors.New("rbac: tenant id required (multi-tenant enabled, missing means fail closed)")
 
+	// ErrInvalidTenantID 表示租户标识超长、含非法字符或占用了保留名
+	// （"default" 是平台域 scope，"!global" 是全局计数器 scope）。非法字符
+	// 会破坏缓存/计数器键结构，必须 fail closed。
+	ErrInvalidTenantID = errors.New("rbac: invalid tenant id")
+
 	// ErrNoPermissionDeclared 表示权限码参数为空（fail closed，视为调用方编程错误）。
 	ErrNoPermissionDeclared = errors.New("rbac: no permission declared")
 )

@@ -12,6 +12,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	mysqlDriver "github.com/go-sql-driver/mysql"
@@ -37,10 +38,11 @@ func TenantFromContext(ctx context.Context) (string, bool) {
 }
 
 // TenantScope 返回计数器键使用的授权域前缀：ctx 携带非空租户即租户域，
-// 否则 default 域。
+// 否则 default 域。租户标识统一小写——库表排序规则大小写不敏感，计数器键
+// 必须与查询侧一致，否则同一租户的两种拼写会写入不同的计数器行/缓存域。
 func TenantScope(ctx context.Context) string {
 	if t, ok := TenantFromContext(ctx); ok && t != "" {
-		return t
+		return strings.ToLower(t)
 	}
 	return "default"
 }
@@ -48,19 +50,41 @@ func TenantScope(ctx context.Context) string {
 // ErrRecordNotFound 表示目标记录不存在（由各实现统一翻译）。
 var ErrRecordNotFound = errors.New("rbac: record not found")
 
+// ErrRoleInUse 表示删除角色时该角色仍被分配（事务内复核，消除 TOCTOU）。
+var ErrRoleInUse = errors.New("rbac: role is assigned to subjects")
+
+// GlobalScope 是全局授权域的保留 scope 名：rbac_permissions 为全局定义表，
+// 权限禁用/同步必须使**全部**租户域的生成键失效。'!' 不在租户标识合法
+// 字符集内（modules/tenant.TenantOf），因此不会与真实租户冲突。
+const GlobalScope = "!global"
+
+// GlobalEpochKey 是全局 epoch 的权威计数器键（rbac_counters.k）。
+const GlobalEpochKey = GlobalScope + ":epoch"
+
+// EpochKey 返回授权域的权威 epoch 键（空租户 = default 域）。
+func EpochKey(scope string) string {
+	if scope == "" {
+		return "default:epoch"
+	}
+	return scope + ":epoch"
+}
+
 // ErrDuplicateEntry 表示唯一键冲突（并发下的"先查后插"竞态兜底）。
 // 服务层据此映射为领域哨兵错误（如 core.ErrRoleCodeExists）。
 var ErrDuplicateEntry = errors.New("rbac: duplicate entry")
 
-// DeadlockRetry 执行事务体，遇 MySQL 死锁（1213，REPEATABLE READ 间隙锁）
-// 时退避重试。供 gormrepo 与 tenant 模块的幂等事务共用（内部工具，无 API 承诺）。
+// DeadlockRetry 执行事务体，遇 MySQL 死锁（1213）或锁等待超时（1205）时
+// 退避重试。供 gormrepo 与 tenant 模块的幂等事务共用（内部工具，无 API 承诺）。
+//
+// 退避为线性递增（10ms、20ms…，封顶 80ms），总等待约 360ms：CI 中多个测试
+// 包并发压同一实例时，偶发的间隙锁冲突不应直接冒泡成管理接口错误。
 func DeadlockRetry(fn func() error) error {
 	var err error
 	for attempt := 0; attempt < deadlockRetryAttempts; attempt++ {
 		if err = fn(); err == nil {
 			return nil
 		}
-		if !isDeadlock(err) {
+		if !isRetryableTxnError(err) {
 			return err
 		}
 		time.Sleep(deadlockRetryBackoff * time.Duration(attempt+1))
@@ -69,14 +93,15 @@ func DeadlockRetry(fn func() error) error {
 }
 
 const (
-	deadlockRetryAttempts = 5
-	deadlockRetryBackoff  = 5 * time.Millisecond
+	deadlockRetryAttempts = 8
+	deadlockRetryBackoff  = 10 * time.Millisecond
 )
 
-// isDeadlock / isDuplicateEntry：MySQL 错误码判定（driver 类型断言）。
-func isDeadlock(err error) bool {
+// isRetryableTxnError / isDuplicateEntry：MySQL 错误码判定（driver 类型断言）。
+// 1213 = 死锁；1205 = innodb_lock_wait_timeout（重负载下的锁等待）。
+func isRetryableTxnError(err error) bool {
 	var me *mysqlDriver.MySQLError
-	return errors.As(err, &me) && me.Number == 1213
+	return errors.As(err, &me) && (me.Number == 1213 || me.Number == 1205)
 }
 
 func isDuplicateEntry(err error) bool {
@@ -94,6 +119,13 @@ func TranslateDuplicate(err error) error {
 
 // IsDuplicate 报告 err 链上是否为唯一键冲突。
 func IsDuplicate(err error) bool { return errors.Is(err, ErrDuplicateEntry) }
+
+// IsMissingTable 报告 err 是否为 MySQL 1146（表不存在）。
+// 用于扩展模块表（如 rbac_role_data_scopes）在未启用模块时的可选清理。
+func IsMissingTable(err error) bool {
+	var me *mysqlDriver.MySQLError
+	return errors.As(err, &me) && me.Number == 1146
+}
 
 // IsNotFound 报告 err 链上是否为"记录不存在"。
 func IsNotFound(err error) bool { return errors.Is(err, ErrRecordNotFound) }
@@ -114,8 +146,9 @@ type RoleRepo interface {
 	// UpdateProfile 仅更新展示元数据（name/description），code 与 status 不可经此修改。
 	UpdateProfile(ctx context.Context, id uint64, name, description string) error
 	SetStatus(ctx context.Context, id uint64, status uint8) error
-	// DeleteWithAssociations 在同一事务内删除角色及其关联行（§5.3）。
-	// 调用方必须先完成"是否正在被使用"检查。
+	// DeleteWithAssociations 在同一事务内复核"角色未被分配"（CountUsers）并
+	// 删除角色及其关联行（§5.3）。仍被分配时返回 ErrRoleInUse——复核与删除
+	// 同事务，消除服务层先查后删的 TOCTOU。
 	DeleteWithAssociations(ctx context.Context, id uint64) error
 	List(ctx context.Context, f RoleFilter) ([]model.Role, error)
 	// CountUsers 统计角色关联用户数（删除前检查，§2.4）。
@@ -137,8 +170,14 @@ type PermissionRepo interface {
 type UserRoleRepo interface {
 	// Assign 幂等分配角色（已存在则无操作）。
 	Assign(ctx context.Context, subjectID string, roleID uint64) error
+	// AssignMany 在单个事务内为一个主体分配多个角色（全成或全败）；
+	// 任一新建立即递增该主体版本一次。
+	AssignMany(ctx context.Context, subjectID string, roleIDs []uint64) error
 	// Revoke 回收角色，幂等（不存在则无操作）。
 	Revoke(ctx context.Context, subjectID string, roleID uint64) error
+	// AssignRoleToSubjects 在单个事务内把一个角色分配给多个主体（全成或全败）；
+	// 为每个新建立的主体递增版本。
+	AssignRoleToSubjects(ctx context.Context, roleID uint64, subjectIDs []string) error
 	ListBySubject(ctx context.Context, subjectID string) ([]model.UserRole, error)
 	// ListRolesBySubject 返回主体的角色（含被禁用角色，由服务层/聚合查询过滤）。
 	ListRolesBySubject(ctx context.Context, subjectID string) ([]model.Role, error)
@@ -186,14 +225,11 @@ type AuthorizationRepo interface {
 }
 
 // CountersRepo 是数据库权威版本号访问（§6.2，外部审核 P0-1 第一阶段）。
-// epoch 与主体版本在授权变更的同一事务内递增；Redis 计数器只是本表值的
-// 缓存副本（丢失/损坏时经 Get 回填，SetInt 写回缓存层）。
+// epoch 与主体版本在授权变更的同一事务内递增（写入方为各变更仓储）；
+// Redis 计数器只是本表值的缓存副本（丢失/损坏时经 Get 回填，SetIntMax 写回缓存层）。
 type CountersRepo interface {
 	// Get 返回计数器当前值（缺失 = 0）。读路径缓存回退时使用。
 	Get(ctx context.Context, key string) (int64, error)
-	// Bump 在独立事务内递增（用于服务层兜底；正常路径应由变更事务内的
-	// BumpTx 完成同事务递增）。
-	Bump(ctx context.Context, key string) error
 }
 
 // Repos 聚合全部数据访问实现，由 rbac.New 组装。

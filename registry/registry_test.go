@@ -158,3 +158,29 @@ func TestBuiltinPermissions_AllValidAndUnique(t *testing.T) {
 		assert.Contains(t, seen, code)
 	}
 }
+
+// 批量注册是原子的：批内任一非法定义都不得留下已注册的部分。
+func TestRegister_BatchFailureIsAtomic(t *testing.T) {
+	reg := registry.NewRegistry()
+
+	err := reg.Register(
+		registry.New("user:list", "用户列表", "用户"),
+		registry.New("invalid code", "非法", "用户"),
+	)
+
+	require.Error(t, err)
+	assert.False(t, reg.Has("user:list"), "失败的批量注册不得留下部分定义")
+}
+
+// 冲突的重复定义不注册新条目（幂等相同定义除外）。
+func TestRegister_ConflictingDefinitionRejected(t *testing.T) {
+	reg := registry.NewRegistry()
+	require.NoError(t, reg.Register(registry.New("user:list", "用户列表", "用户")))
+
+	err := reg.Register(registry.New("user:list", "另一个名字", "用户"))
+
+	require.ErrorIs(t, err, registry.ErrDuplicateRegistration)
+	def, ok := reg.Get("user:list")
+	require.True(t, ok)
+	assert.Equal(t, "用户列表", def.Name, "原定义不得被覆盖")
+}

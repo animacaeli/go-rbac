@@ -14,6 +14,10 @@ var _ PermissionCache = NoopCache{}
 // NewNoopCache 返回一个 NoopCache。
 func NewNoopCache() NoopCache { return NoopCache{} }
 
+// IsNoop 标记本实现为"无缓存"（Core 据此短路计数器协议，避免每次鉴权
+// 额外产生权威计数器查询）。包装 NoopCache 的实现可通过转发本方法保持该语义。
+func (NoopCache) IsNoop() bool { return true }
+
 // Get 永远未命中。
 func (NoopCache) Get(_ context.Context, _ string) ([]string, bool, error) {
 	return nil, false, nil

@@ -6,8 +6,10 @@
 //   - 全库无 deleted_at：管理对象用 status，关联关系物理删除
 //   - 表前缀固定 rbac_，v1 无 tenant_id
 //
-// 生产 DDL 由 migrations/ 下的版本化 SQL 提供，本包 GORM tag 主要服务于
-// 开发期 AutoMigrate 与运行时字段映射，二者必须保持一致。
+// 生产 DDL 由 migrations/ 下的版本化 SQL 提供，且**只能**由它提供：生成列
+// （rbac_user_grants.active_flag）与包含生成列的部分唯一约束无法用 GORM tag
+// 表达，AutoMigrate 生成的表会缺少并发兜底约束。本包 tag 仅用于运行时字段
+// 映射与查询构造；擅自对生产库执行 AutoMigrate 会得到与迁移脚本不一致的表。
 package model
 
 import "time"

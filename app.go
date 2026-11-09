@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/animacaeli/go-rbac/cache"
@@ -93,6 +94,7 @@ func (a *App) rebuildServices() {
 		Authorizer:      authorizer,
 		Events:          a.events,
 		GrantorMustHold: a.cfg.grantorMustHold,
+		TenancyRequired: a.tenantScope,
 	}
 	a.roles = core.NewRoleService(deps)
 	a.userRoles = core.NewUserRoleService(deps)
@@ -135,10 +137,20 @@ func (a *App) Permissions() *core.PermissionService { return a.permissions }
 
 // EnableTenantScope 启用多租户校验策略：AuthorizationContext.TenantID 从
 // "必须为空"变为"必须提供"（缺失即 fail closed，§2.9）。由 tenant 模块在
-// Register 期调用；亦可由业务项目在组装后、服务使用前手动调用。
+// Register 期调用。
+//
+// 注意：单独调用本方法**不会**替换为租户隔离仓储——租户过滤由 tenant 模块的
+// Repos 包装器完成。手工开启而不注册 tenant 模块会导致"校验租户存在、查询却
+// 不按租户过滤"的假隔离，务必使用 rbac.WithModules(tenant.New())。
+//
+// 本方法会重建授权与管理服务：调用前已取得的 Authorizer / 服务指针会过期，
+// 调用后需重新从 App 获取。正常装配（tenant 模块 Register 期调用）不涉及外部引用。
 func (a *App) EnableTenantScope() {
 	a.tenantScope = true
 	a.authorizer.SetTenantScopeRequired(true)
+	// 重建管理服务，使其 ServiceDeps.TenancyRequired 立即生效
+	// （手工调用本方法时也能获得一致的 operator 校验）。
+	a.rebuildServices()
 }
 
 // ReplaceRepositories 以租户隔离仓储替换内部仓储并重建服务。
@@ -175,27 +187,40 @@ func (a *App) Migrate(ctx context.Context) error {
 
 // SyncPermissions 将注册中心同步至数据库（§2.3），幂等可重复执行：
 // registry.Diff 计算差量计划，仓储在单事务内应用。
-// 同步后递增全局 epoch：废弃/恢复启用直接影响全体读者（§6.3 保守失效）。
+//
+// 同步成功即递增**全局** epoch：权限表是全局定义，废弃/恢复启用直接影响
+// 全部租户域的读者（§6.3）。审计事件按 Strict 策略传播失败；多租户部署下
+// 调用方可先经 core.ContextWithTenant 注入授权域，事件将记录该租户。
 func (a *App) SyncPermissions(ctx context.Context) (registry.SyncResult, error) {
 	existing, err := a.repos.Permissions.ListAll(ctx)
 	if err != nil {
 		return registry.SyncResult{}, fmt.Errorf("rbac: sync load permissions: %w", err)
 	}
 	result, plan := registry.Diff(a.cfg.reg, existing)
+	if len(result.Conflicts) > 0 {
+		return result, fmt.Errorf("%w: %s; fix the database rows before syncing",
+			registry.ErrCodeConflict, strings.Join(result.Conflicts, "; "))
+	}
 	if plan.Changed() {
 		if err := a.repos.Permissions.ApplySync(ctx, plan); err != nil {
 			return result, fmt.Errorf("rbac: sync apply: %w", err)
 		}
-		if err := a.authorizer.SyncEpoch(ctx); err != nil {
-			return result, fmt.Errorf("%w: %v", core.ErrInvalidationFailedAfterCommit, err)
+		if err := a.authorizer.SyncGlobalEpoch(ctx); err != nil {
+			return result, fmt.Errorf("%w: %w", core.ErrInvalidationFailedAfterCommit, err)
 		}
-		_ = a.events.Record(ctx, core.NewEvent(core.EventPermissionsSynced,
-			core.AuthorizationContext{}, "registry", map[string]string{
+		operator := core.AuthorizationContext{}
+		if tenant, ok := core.TenantFromContext(ctx); ok {
+			operator.TenantID = tenant
+		}
+		if err := a.events.Record(ctx, core.NewEvent(core.EventPermissionsSynced,
+			operator, "registry", map[string]string{
 				"created":     strconv.Itoa(result.Created),
 				"updated":     strconv.Itoa(result.Updated),
 				"reactivated": strconv.Itoa(result.Reactivated),
 				"deprecated":  strconv.Itoa(result.Deprecated),
-			}))
+			})); err != nil {
+			return result, fmt.Errorf("%w: %w", core.ErrAuditFailedAfterCommit, err)
+		}
 	}
 	return result, nil
 }
@@ -241,16 +266,44 @@ func (a *App) SeedSuperAdmin(ctx context.Context, subjectID string) error {
 			Status:      model.RoleStatusEnabled,
 		}
 		if err := a.repos.Roles.Create(ctx, role); err != nil {
-			return fmt.Errorf("rbac: seed super admin role: %w", err)
+			// 并发种子：另一实例已创建同名角色 → 回读（幂等）。
+			if !repository.IsDuplicate(err) {
+				return fmt.Errorf("rbac: seed super admin role: %w", err)
+			}
+			role, err = a.repos.Roles.FindByCode(ctx, model.BuiltinSuperAdminRoleCode)
+			if err != nil {
+				return fmt.Errorf("rbac: seed super admin role: %w", err)
+			}
+			if !role.IsBuiltin {
+				return fmt.Errorf("%w: role %q exists but is not builtin; refusing to seed", core.ErrBuiltinRoleProtected, role.Code)
+			}
 		}
 	} else if err != nil {
 		return err
+	}
+	// 防止与同名非内置角色混淆：只有 is_builtin 角色才是超管载体。
+	// （RoleService.Create 已拒绝创建保留 code，此处防御历史脏数据。）
+	if !role.IsBuiltin {
+		return fmt.Errorf("%w: role %q exists but is not builtin; refusing to seed", core.ErrBuiltinRoleProtected, role.Code)
 	}
 	if err := a.repos.UserRoles.Assign(ctx, subjectID, role.ID); err != nil {
 		return fmt.Errorf("rbac: seed super admin subject: %w", err)
 	}
 	if err := a.authorizer.SyncSubjectVersion(ctx, core.SubjectID(subjectID)); err != nil {
-		return fmt.Errorf("%w: %v", core.ErrInvalidationFailedAfterCommit, err)
+		return fmt.Errorf("%w: %w", core.ErrInvalidationFailedAfterCommit, err)
 	}
 	return nil
 }
+
+// SyncSubjectVersion 将主体版本的权威值同步到缓存副本（无数据变更，仅同步）。
+// 供扩展模块在自行完成同事务版本递增后调用；业务代码通常不需要。
+func (a *App) SyncSubjectVersion(ctx context.Context, subjectID string) error {
+	if err := a.authorizer.SyncSubjectVersion(ctx, core.SubjectID(subjectID)); err != nil {
+		return fmt.Errorf("%w: %w", core.ErrInvalidationFailedAfterCommit, err)
+	}
+	return nil
+}
+
+// TenancyEnabled 报告是否已启用多租户校验策略（tenant 模块装配后为 true）。
+// 扩展模块据此决定是否对租户归属表追加 tenant_id 过滤。
+func (a *App) TenancyEnabled() bool { return a.tenantScope }

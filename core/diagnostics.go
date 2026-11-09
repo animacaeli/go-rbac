@@ -27,9 +27,13 @@ type CacheDiagnostics struct {
 	// SubjectID 被诊断主体（按需提供）。
 	SubjectID string `json:"subject_id,omitempty"`
 
-	// 全局 epoch 计数器状态。
+	// 授权域 epoch 计数器状态。
 	EpochExists bool  `json:"epoch_exists"`
 	EpochValue  int64 `json:"epoch_value"`
+
+	// 全局（跨租户）epoch 计数器状态：权限表为全局定义，权限禁用/同步递增它。
+	GlobalEpochExists bool  `json:"global_epoch_exists"`
+	GlobalEpochValue  int64 `json:"global_epoch_value"`
 
 	// 主体版本计数器状态（SubjectID 为空时不探测）。
 	SubjectVersionExists bool  `json:"subject_version_exists"`
@@ -74,13 +78,20 @@ func (s *AuthorizationService) DiagnoseCache(ctx context.Context, ac Authorizati
 		InvalidationFailures: atomic.LoadInt64(&s.inv.failures),
 	}
 
+	var epoch, global, version int64
+	var ok bool
 	epoch, ok, err := s.cch.GetInt(ctx, epochKey(d.Scope))
 	if err != nil {
 		return d, fmt.Errorf("rbac: diagnose epoch: %w", err)
 	}
 	d.EpochExists, d.EpochValue = ok, epoch
 
-	var version int64
+	global, ok, err = s.cch.GetInt(ctx, globalEpochKey())
+	if err != nil {
+		return d, fmt.Errorf("rbac: diagnose global epoch: %w", err)
+	}
+	d.GlobalEpochExists, d.GlobalEpochValue = ok, global
+
 	if ac.SubjectID != "" {
 		version, ok, err = s.cch.GetInt(ctx, subjectVersionKey(d.Scope, d.SubjectID))
 		if err != nil {
@@ -89,7 +100,7 @@ func (s *AuthorizationService) DiagnoseCache(ctx context.Context, ac Authorizati
 		d.SubjectVersionExists, d.SubjectVersionValue = ok, version
 	}
 
-	d.Generation = generationKey(epoch, version)
+	d.Generation = generationKey(epoch, global, version)
 	if ac.SubjectID != "" {
 		_, exists, err := s.cch.Get(ctx, subjectPermKey(d.Scope, d.SubjectID, d.Generation))
 		if err != nil {

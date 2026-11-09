@@ -124,8 +124,8 @@ func (s *PermissionServiceSuite) TestSetStatus_Disable_IncrementsEpoch() {
 	enabled := model.Permission{ID: 100, Code: "order:export", Status: model.PermissionStatusEnabled}
 	s.perms.On("FindByCode", mock.Anything, "order:export").Return(&enabled, nil)
 	s.perms.On("SetStatus", mock.Anything, uint64(100), model.PermissionStatusDisabled).Return(nil)
-	// §6.3 失效矩阵：权限禁用 → INCR 全局 epoch。
-	s.cchSyncExpect("rbac:default:epoch", "default:epoch", int64(1))
+	// §6.3 失效矩阵：权限表是全局定义 → 递增跨租户的全局 epoch。
+	s.cchSyncExpect("rbac:!global:epoch", "!global:epoch", int64(1))
 
 	// Act
 	err := s.permSvc.SetStatus(s.ctx, operator, "order:export", model.PermissionStatusDisabled)

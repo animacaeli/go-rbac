@@ -55,30 +55,48 @@ func NewRegistry() *Registry {
 	return &Registry{defs: make(map[string]PermissionDef)}
 }
 
-// Register 批量注册权限。逐条校验格式与元数据；同一 code 的完全相同定义
-// 重复注册视为幂等成功，不同定义则返回 ErrDuplicateRegistration。
+// Register 批量注册权限。原子语义：先整体校验（格式 / 元数据 / 批内冲突 /
+// 与已注册定义的冲突），全部通过后才写入——任一失败不会留下部分定义。
+// 同一 code 的完全相同定义重复注册视为幂等成功，不同定义返回 ErrDuplicateRegistration。
 func (r *Registry) Register(defs ...PermissionDef) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	pending := make(map[string]PermissionDef, len(defs))
 	for _, def := range defs {
-		if err := ValidateCode(def.Code); err != nil {
+		if err := validateDef(def); err != nil {
 			return err
 		}
-		if strings.TrimSpace(def.Name) == "" || len(def.Name) > model.NameMaxLength {
-			return fmt.Errorf("%w: name required (1-%d chars), got %q",
-				ErrInvalidPermissionDef, model.NameMaxLength, def.Name)
+		if prev, dup := pending[def.Code]; dup && prev != def {
+			return fmt.Errorf("%w: %s appears twice with different definitions in one batch", ErrDuplicateRegistration, def.Code)
 		}
-		if strings.TrimSpace(def.Module) == "" || len(def.Module) > model.RoleCodeMaxLength {
-			return fmt.Errorf("%w: module required (1-%d chars), got %q",
-				ErrInvalidPermissionDef, model.RoleCodeMaxLength, def.Module)
+		pending[def.Code] = def
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for code, def := range pending {
+		if prev, exists := r.defs[code]; exists && prev != def {
+			return fmt.Errorf("%w: %s already registered with a different definition", ErrDuplicateRegistration, code)
 		}
-		if len(def.Description) > model.DescMaxLength {
-			return fmt.Errorf("%w: description too long (max %d chars)", ErrInvalidPermissionDef, model.DescMaxLength)
-		}
-		if prev, exists := r.defs[def.Code]; exists && prev != def {
-			return fmt.Errorf("%w: %s already registered with a different definition", ErrDuplicateRegistration, def.Code)
-		}
-		r.defs[def.Code] = def
+	}
+	for code, def := range pending {
+		r.defs[code] = def
+	}
+	return nil
+}
+
+// validateDef 校验单条定义的格式与展示元数据。
+func validateDef(def PermissionDef) error {
+	if err := ValidateCode(def.Code); err != nil {
+		return err
+	}
+	if strings.TrimSpace(def.Name) == "" || len(def.Name) > model.NameMaxLength {
+		return fmt.Errorf("%w: name required (1-%d chars), got %q",
+			ErrInvalidPermissionDef, model.NameMaxLength, def.Name)
+	}
+	if strings.TrimSpace(def.Module) == "" || len(def.Module) > model.RoleCodeMaxLength {
+		return fmt.Errorf("%w: module required (1-%d chars), got %q",
+			ErrInvalidPermissionDef, model.RoleCodeMaxLength, def.Module)
+	}
+	if len(def.Description) > model.DescMaxLength {
+		return fmt.Errorf("%w: description too long (max %d chars)", ErrInvalidPermissionDef, model.DescMaxLength)
 	}
 	return nil
 }

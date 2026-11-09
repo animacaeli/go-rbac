@@ -102,3 +102,17 @@ func TestDiff_TableDriven(t *testing.T) {
 		})
 	}
 }
+
+// 大小写冲突：库表排序规则大小写不敏感，唯一键会命中旧行，而精确匹配认为
+// 该 code 不存在——必须显式报告而不是静默"插入失败 + 废弃"。
+func TestDiff_CaseConflict_Reported(t *testing.T) {
+	reg := registry.NewRegistry()
+	require.NoError(t, reg.Register(registry.New("order:read", "查看订单", "订单")))
+
+	result, _ := registry.Diff(reg, []model.Permission{
+		{ID: 1, Code: "Order:Read", Name: "查看订单", Module: "订单", Status: model.PermissionStatusEnabled},
+	})
+
+	require.Len(t, result.Conflicts, 1)
+	assert.Contains(t, result.Conflicts[0], "Order:Read")
+}

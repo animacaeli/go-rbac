@@ -1019,6 +1019,132 @@ func (_c *MockUserRoleRepo_Assign_Call) RunAndReturn(run func(ctx context.Contex
 	return _c
 }
 
+// AssignMany provides a mock function for the type MockUserRoleRepo
+func (_mock *MockUserRoleRepo) AssignMany(ctx context.Context, subjectID string, roleIDs []uint64) error {
+	ret := _mock.Called(ctx, subjectID, roleIDs)
+
+	if len(ret) == 0 {
+		panic("no return value specified for AssignMany")
+	}
+
+	var r0 error
+	if returnFunc, ok := ret.Get(0).(func(context.Context, string, []uint64) error); ok {
+		r0 = returnFunc(ctx, subjectID, roleIDs)
+	} else {
+		r0 = ret.Error(0)
+	}
+	return r0
+}
+
+// MockUserRoleRepo_AssignMany_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'AssignMany'
+type MockUserRoleRepo_AssignMany_Call struct {
+	*mock.Call
+}
+
+// AssignMany is a helper method to define mock.On call
+//   - ctx context.Context
+//   - subjectID string
+//   - roleIDs []uint64
+func (_e *MockUserRoleRepo_Expecter) AssignMany(ctx any, subjectID any, roleIDs any) *MockUserRoleRepo_AssignMany_Call {
+	return &MockUserRoleRepo_AssignMany_Call{Call: _e.mock.On("AssignMany", ctx, subjectID, roleIDs)}
+}
+
+func (_c *MockUserRoleRepo_AssignMany_Call) Run(run func(ctx context.Context, subjectID string, roleIDs []uint64)) *MockUserRoleRepo_AssignMany_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 context.Context
+		if args[0] != nil {
+			arg0 = args[0].(context.Context)
+		}
+		var arg1 string
+		if args[1] != nil {
+			arg1 = args[1].(string)
+		}
+		var arg2 []uint64
+		if args[2] != nil {
+			arg2 = args[2].([]uint64)
+		}
+		run(
+			arg0,
+			arg1,
+			arg2,
+		)
+	})
+	return _c
+}
+
+func (_c *MockUserRoleRepo_AssignMany_Call) Return(err error) *MockUserRoleRepo_AssignMany_Call {
+	_c.Call.Return(err)
+	return _c
+}
+
+func (_c *MockUserRoleRepo_AssignMany_Call) RunAndReturn(run func(ctx context.Context, subjectID string, roleIDs []uint64) error) *MockUserRoleRepo_AssignMany_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// AssignRoleToSubjects provides a mock function for the type MockUserRoleRepo
+func (_mock *MockUserRoleRepo) AssignRoleToSubjects(ctx context.Context, roleID uint64, subjectIDs []string) error {
+	ret := _mock.Called(ctx, roleID, subjectIDs)
+
+	if len(ret) == 0 {
+		panic("no return value specified for AssignRoleToSubjects")
+	}
+
+	var r0 error
+	if returnFunc, ok := ret.Get(0).(func(context.Context, uint64, []string) error); ok {
+		r0 = returnFunc(ctx, roleID, subjectIDs)
+	} else {
+		r0 = ret.Error(0)
+	}
+	return r0
+}
+
+// MockUserRoleRepo_AssignRoleToSubjects_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'AssignRoleToSubjects'
+type MockUserRoleRepo_AssignRoleToSubjects_Call struct {
+	*mock.Call
+}
+
+// AssignRoleToSubjects is a helper method to define mock.On call
+//   - ctx context.Context
+//   - roleID uint64
+//   - subjectIDs []string
+func (_e *MockUserRoleRepo_Expecter) AssignRoleToSubjects(ctx any, roleID any, subjectIDs any) *MockUserRoleRepo_AssignRoleToSubjects_Call {
+	return &MockUserRoleRepo_AssignRoleToSubjects_Call{Call: _e.mock.On("AssignRoleToSubjects", ctx, roleID, subjectIDs)}
+}
+
+func (_c *MockUserRoleRepo_AssignRoleToSubjects_Call) Run(run func(ctx context.Context, roleID uint64, subjectIDs []string)) *MockUserRoleRepo_AssignRoleToSubjects_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 context.Context
+		if args[0] != nil {
+			arg0 = args[0].(context.Context)
+		}
+		var arg1 uint64
+		if args[1] != nil {
+			arg1 = args[1].(uint64)
+		}
+		var arg2 []string
+		if args[2] != nil {
+			arg2 = args[2].([]string)
+		}
+		run(
+			arg0,
+			arg1,
+			arg2,
+		)
+	})
+	return _c
+}
+
+func (_c *MockUserRoleRepo_AssignRoleToSubjects_Call) Return(err error) *MockUserRoleRepo_AssignRoleToSubjects_Call {
+	_c.Call.Return(err)
+	return _c
+}
+
+func (_c *MockUserRoleRepo_AssignRoleToSubjects_Call) RunAndReturn(run func(ctx context.Context, roleID uint64, subjectIDs []string) error) *MockUserRoleRepo_AssignRoleToSubjects_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // ListBySubject provides a mock function for the type MockUserRoleRepo
 func (_mock *MockUserRoleRepo) ListBySubject(ctx context.Context, subjectID string) ([]model.UserRole, error) {
 	ret := _mock.Called(ctx, subjectID)
@@ -2340,63 +2466,6 @@ type MockCountersRepo_Expecter struct {
 
 func (_m *MockCountersRepo) EXPECT() *MockCountersRepo_Expecter {
 	return &MockCountersRepo_Expecter{mock: &_m.Mock}
-}
-
-// Bump provides a mock function for the type MockCountersRepo
-func (_mock *MockCountersRepo) Bump(ctx context.Context, key string) error {
-	ret := _mock.Called(ctx, key)
-
-	if len(ret) == 0 {
-		panic("no return value specified for Bump")
-	}
-
-	var r0 error
-	if returnFunc, ok := ret.Get(0).(func(context.Context, string) error); ok {
-		r0 = returnFunc(ctx, key)
-	} else {
-		r0 = ret.Error(0)
-	}
-	return r0
-}
-
-// MockCountersRepo_Bump_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'Bump'
-type MockCountersRepo_Bump_Call struct {
-	*mock.Call
-}
-
-// Bump is a helper method to define mock.On call
-//   - ctx context.Context
-//   - key string
-func (_e *MockCountersRepo_Expecter) Bump(ctx any, key any) *MockCountersRepo_Bump_Call {
-	return &MockCountersRepo_Bump_Call{Call: _e.mock.On("Bump", ctx, key)}
-}
-
-func (_c *MockCountersRepo_Bump_Call) Run(run func(ctx context.Context, key string)) *MockCountersRepo_Bump_Call {
-	_c.Call.Run(func(args mock.Arguments) {
-		var arg0 context.Context
-		if args[0] != nil {
-			arg0 = args[0].(context.Context)
-		}
-		var arg1 string
-		if args[1] != nil {
-			arg1 = args[1].(string)
-		}
-		run(
-			arg0,
-			arg1,
-		)
-	})
-	return _c
-}
-
-func (_c *MockCountersRepo_Bump_Call) Return(err error) *MockCountersRepo_Bump_Call {
-	_c.Call.Return(err)
-	return _c
-}
-
-func (_c *MockCountersRepo_Bump_Call) RunAndReturn(run func(ctx context.Context, key string) error) *MockCountersRepo_Bump_Call {
-	_c.Call.Return(run)
-	return _c
 }
 
 // Get provides a mock function for the type MockCountersRepo
