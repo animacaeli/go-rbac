@@ -67,13 +67,14 @@ func translateFirst(err error, format string, args ...any) error {
 	return err
 }
 
-// scopeKey 归一计数器键前缀：空租户（平台域）→ default，租户/主体统一小写
-// （与库表大小写不敏感排序规则、core 的缓存键保持一致）。
+// scopeKey 归一计数器键前缀：空租户（平台域）→ default；租户标识统一小写
+// （租户是受限 ASCII slug，库表 ci 语义与缓存域一致），主体标识保持原样
+// （迁移 0004 后按二进制比较）。
 func scopeKey(tenant, subject string) string {
 	if tenant == "" {
 		tenant = "default"
 	}
-	return strings.ToLower(tenant) + ":subject:" + strings.ToLower(subject) + ":version"
+	return strings.ToLower(tenant) + ":subject:" + subject + ":version"
 }
 
 // epochKeyFor 归一授权域 epoch 键（与 core.scopeOf / repository.TenantScope 一致）。

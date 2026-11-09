@@ -29,6 +29,11 @@ var (
 
 	// ErrNoPermissionDeclared 表示权限码参数为空（fail closed，视为调用方编程错误）。
 	ErrNoPermissionDeclared = errors.New("rbac: no permission declared")
+
+	// ErrCounterOverflow 表示权威计数器超出生成键的数值边界
+	// （主体版本必须 < 2^32；epoch + 全局 epoch 必须 <= 2^31-1）。
+	// 命中时 fail closed：拒绝鉴权而不是产生可能碰撞的生成键。
+	ErrCounterOverflow = errors.New("rbac: counter exceeds generation key bounds")
 )
 
 // 管理服务错误。

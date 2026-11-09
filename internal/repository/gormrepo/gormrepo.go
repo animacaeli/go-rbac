@@ -11,7 +11,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/animacaeli/go-rbac/internal/repository"
@@ -21,10 +20,10 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-// subjectVersionKey 返回主体版本计数器的权威键。主体统一小写：库表排序规则
-// 大小写不敏感，缓存键（core.canonicalSubject）也按小写规范化，三者必须一致。
+// subjectVersionKey 返回主体版本计数器的权威键。subject_id 按二进制比较
+// （迁移 0004），不做任何大小写/重音折叠，与缓存键一致。
 func subjectVersionKey(ctx context.Context, subjectID string) string {
-	return repository.TenantScope(ctx) + ":subject:" + strings.ToLower(subjectID) + ":version"
+	return repository.TenantScope(ctx) + ":subject:" + subjectID + ":version"
 }
 
 // resultHardLimit 是列表类查询的硬上限：防止单主体/单角色的历史数据无界

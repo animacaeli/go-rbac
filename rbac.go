@@ -12,7 +12,7 @@
 //	guard := ginadapter.New(app.Authorizer(), resolver)
 //	api.GET("/users", guard.Require("user:list"), handler)
 //
-// 设计文档：docs/go-rbac-design.md（v0.3.0-design 定稿）。
+// 设计文档：docs/go-rbac-design.md（v0.4.0-design 定稿）。
 package rbac
 
 import (

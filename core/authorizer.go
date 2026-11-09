@@ -165,22 +165,15 @@ func globalEpochKey() string {
 	return "rbac:" + repository.GlobalScope + ":epoch"
 }
 
-// canonicalSubject 是缓存/计数器键中的主体规范化形式。
-//
-// 库表排序规则（utf8mb4_0900_ai_ci）下 subject_id 不区分大小写，同一身份
-// 的不同拼写命中同一行数据与同一个权威计数器；缓存键必须同样规范化，否则
-// 两种拼写各持一份版本副本，"只同步了其中一种拼写"会让另一种的旧缓存
-// 一直存活到 TTL（陈旧权限放行）。
-func canonicalSubject(subjectID string) string {
-	return strings.ToLower(subjectID)
-}
-
+// subject_id 是外部不透明标识：库表列（迁移 0004）与缓存/计数器键都按
+// 二进制比较，大小写与重音敏感。不要在此处做大小写折叠——那会与数据库的
+// 二进制语义不一致，导致撤销只命中其中一种写法（第八轮复审 P1-03）。
 func subjectVersionKey(scope, subjectID string) string {
-	return "rbac:" + scope + ":subject:" + canonicalSubject(subjectID) + ":version"
+	return "rbac:" + scope + ":subject:" + subjectID + ":version"
 }
 
 func subjectPermKey(scope, subjectID string, gen int64) string {
-	return "rbac:" + scope + ":subject:" + canonicalSubject(subjectID) + ":perm:v" + strconv.FormatInt(gen, 10)
+	return "rbac:" + scope + ":subject:" + subjectID + ":perm:v" + strconv.FormatInt(gen, 10)
 }
 
 // generationKey 合并"授权域 epoch + 全局 epoch"与主体版本号为单个生成键。
@@ -200,6 +193,29 @@ type counterValues struct {
 	subjectVersion int64
 }
 
+// 生成键的数值边界：gen = (epoch+global)<<32 | subjectVersion。
+//   - subjectVersion 占低 32 位（必须 <= 2^32-1）；
+//   - epoch+global 占高位（左移 32 后必须不超过 int64）。
+//
+// 计数器在现实中不可能触达这些量级，但一致性协议以"单调且不碰撞"为不变量，
+// 因此把边界显式化：越界时 fail closed，而不是静默截断/溢出后命中旧键。
+const (
+	maxSubjectVersion = int64(1<<32 - 1)
+	maxEpochSum       = int64(1<<31 - 1) // MaxInt64 >> 32
+)
+
+// validateCounters 校验计数器是否仍在生成键可表达的范围内。
+func validateCounters(cv counterValues) error {
+	if cv.subjectVersion < 0 || cv.subjectVersion > maxSubjectVersion {
+		return fmt.Errorf("%w: subject version %d (max %d)", ErrCounterOverflow, cv.subjectVersion, maxSubjectVersion)
+	}
+	if cv.epoch < 0 || cv.globalEpoch < 0 || cv.epoch+cv.globalEpoch > maxEpochSum {
+		return fmt.Errorf("%w: epoch %d + global epoch %d (max %d)",
+			ErrCounterOverflow, cv.epoch, cv.globalEpoch, maxEpochSum)
+	}
+	return nil
+}
+
 // readCounters 读取 epoch / 全局 epoch / 主体版本三个计数器副本。
 // 实现缓存支持批量读时合并为一次往返（cache.IntBatchReader）。
 // ok=false 表示有键缺失（调用方回退数据库权威值）；err 非 nil 表示缓存故障。
@@ -212,7 +228,11 @@ func (s *AuthorizationService) readCounters(ctx context.Context, scope, subject 
 			if !found[0] || !found[1] || !found[2] {
 				return counterValues{}, false, nil
 			}
-			return counterValues{epoch: vals[0], globalEpoch: vals[1], subjectVersion: vals[2]}, true, nil
+			cv := counterValues{epoch: vals[0], globalEpoch: vals[1], subjectVersion: vals[2]}
+			if err := validateCounters(cv); err != nil {
+				return counterValues{}, false, err
+			}
+			return cv, true, nil
 		default:
 			// 批量读失败（典型：Redis Cluster 中三个键落在不同 slot，
 			// MGET 返回 CROSSSLOT）→ 退回逐键读取；逐键失败才视为缓存故障。
@@ -234,6 +254,9 @@ func (s *AuthorizationService) readCounters(ctx context.Context, scope, subject 
 		case 2:
 			cv.subjectVersion = v
 		}
+	}
+	if err := validateCounters(cv); err != nil {
+		return counterValues{}, false, err
 	}
 	return cv, true, nil
 }
@@ -332,7 +355,7 @@ func (s *AuthorizationService) loadOnce(ctx context.Context, ac AuthorizationCon
 	// 共享回源使用 WithoutCancel：剥离首个调用者的取消信号（保留 ctx values），
 	// 否则该请求断开会让所有等待者一起失败；调用方自身的取消仍由下面的
 	// select 处理，不会阻塞已断开的请求。
-	ch := s.sf.DoChan(scope+"/"+canonicalSubject(subject), func() (any, error) {
+	ch := s.sf.DoChan(scope+"/"+subject, func() (any, error) {
 		return s.aggregateAndCache(context.WithoutCancel(ctx), ac, refGen)
 	})
 	select {
@@ -415,7 +438,13 @@ func (s *AuthorizationService) aggregateAndCache(ctx context.Context, ac Authori
 		dbEpoch, e1 := s.counters.Get(ctx, dbEpochKey(scope))
 		dbGlobal, e3 := s.counters.Get(ctx, repository.GlobalEpochKey)
 		dbVersion, e2 := s.counters.Get(ctx, dbSubjectVersionKey(scope, subject))
-		if e1 != nil || e2 != nil || e3 != nil || generationKey(dbEpoch, dbGlobal, dbVersion) != refGen {
+		if e1 != nil || e2 != nil || e3 != nil {
+			return aggregateResult{set: set}, nil
+		}
+		if err := validateCounters(counterValues{epoch: dbEpoch, globalEpoch: dbGlobal, subjectVersion: dbVersion}); err != nil {
+			return aggregateResult{set: set}, nil
+		}
+		if generationKey(dbEpoch, dbGlobal, dbVersion) != refGen {
 			return aggregateResult{set: set}, nil
 		}
 	} else if gen2 != refGen {
@@ -452,10 +481,14 @@ func (s *AuthorizationService) recoverCountersFromDB(ctx context.Context, scope,
 	// SetIntMax 单调回填（不先删）：Lua 脚本原子处理损坏值
 	// （tonumber(cur) 解析失败即视为不可信，原子替换为权威值），
 	// 消除"删除与回填之间的并发同步"竞态窗口（§6.2，外部评审第六轮）。
+	cv := counterValues{epoch: epoch, globalEpoch: global, subjectVersion: version}
+	if verr := validateCounters(cv); verr != nil {
+		return counterValues{}, verr
+	}
 	_ = s.cch.SetIntMax(ctx, epochKey(scope), epoch)
 	_ = s.cch.SetIntMax(ctx, globalEpochKey(), global)
 	_ = s.cch.SetIntMax(ctx, subjectVersionKey(scope, subject), version)
-	return counterValues{epoch: epoch, globalEpoch: global, subjectVersion: version}, nil
+	return cv, nil
 }
 
 // readCachedGeneration 读副本生成键；ok=false 表示副本缺失/不可读。
@@ -471,7 +504,7 @@ func (s *AuthorizationService) readCachedGeneration(ctx context.Context, scope, 
 func dbEpochKey(scope string) string { return scope + ":epoch" }
 
 func dbSubjectVersionKey(scope, subject string) string {
-	return scope + ":subject:" + canonicalSubject(subject) + ":version"
+	return scope + ":subject:" + subject + ":version"
 }
 
 // loadFromDB 直接回源数据库（不读不写缓存），返回集合与超管判定。

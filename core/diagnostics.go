@@ -100,6 +100,9 @@ func (s *AuthorizationService) DiagnoseCache(ctx context.Context, ac Authorizati
 		d.SubjectVersionExists, d.SubjectVersionValue = ok, version
 	}
 
+	if err := validateCounters(counterValues{epoch: epoch, globalEpoch: global, subjectVersion: version}); err != nil {
+		return d, err
+	}
 	d.Generation = generationKey(epoch, global, version)
 	if ac.SubjectID != "" {
 		_, exists, err := s.cch.Get(ctx, subjectPermKey(d.Scope, d.SubjectID, d.Generation))

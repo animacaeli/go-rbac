@@ -119,14 +119,36 @@ func (c *Cache) GetInts(ctx context.Context, keys []string) ([]int64, []bool, er
 
 // setIntMaxScript 原子单调写：当前值缺失 / 不可解析（损坏自愈）/ 小于
 // 新值时才写入；旧值永不覆盖新值。恢复×同步乱序并发下副本只会前进。
+//
+// 比较使用**十进制字符串**而非 tonumber：Lua 数字是双精度浮点，超过 2^53
+// 后不能保证整数精确比较，而本协议的承重不变量是"单调前进"。字符串比较
+// 先去前导零，再按长度、再按字典序，对任意 int64 精确。
 var setIntMaxScript = redis.NewScript(`
 local cur = redis.call('GET', KEYS[1])
 if not cur then
   redis.call('SET', KEYS[1], ARGV[1])
   return 1
 end
-local curNum = tonumber(cur)
-if not curNum or curNum < tonumber(ARGV[1]) then
+if not string.match(cur, '^%d+$') then
+  redis.call('SET', KEYS[1], ARGV[1])
+  return 1
+end
+local function strip_zeros(s)
+  local i = 1
+  while i < #s and string.sub(s, i, i) == '0' do
+    i = i + 1
+  end
+  return string.sub(s, i)
+end
+local a = strip_zeros(cur)
+local b = strip_zeros(ARGV[1])
+local less
+if #a ~= #b then
+  less = #a < #b
+else
+  less = a < b
+end
+if less then
   redis.call('SET', KEYS[1], ARGV[1])
   return 1
 end
@@ -135,6 +157,9 @@ return 0
 
 // SetIntMax 单调提升整数键（DB 权威版本的同步与恢复原语，§6.2）。
 func (c *Cache) SetIntMax(ctx context.Context, key string, value int64) error {
+	if value < 0 {
+		return fmt.Errorf("rbac/cache/redis: setintmax %s: negative counter value %d", key, value)
+	}
 	if err := setIntMaxScript.Run(ctx, c.cli, []string{key}, strconv.FormatInt(value, 10)).Err(); err != nil {
 		return fmt.Errorf("rbac/cache/redis: setintmax %s: %w", key, err)
 	}

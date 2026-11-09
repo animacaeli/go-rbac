@@ -126,7 +126,11 @@ func Apply(ctx context.Context, db *gorm.DB, all []Migration) error {
 // acquireLock 获取迁移互斥锁（连接级）。超时返回错误而不是无限等待。
 func acquireLock(conn *gorm.DB) error {
 	var got sql.NullInt64
-	if err := conn.Raw("SELECT GET_LOCK("+migrationLockSQL+", ?)", migrationLockTimeout).Row().Scan(&got); err != nil {
+	row := conn.Raw("SELECT GET_LOCK("+migrationLockSQL+", ?)", migrationLockTimeout).Row()
+	if row == nil {
+		return fmt.Errorf("rbac/migrations: acquire lock: no result set")
+	}
+	if err := row.Scan(&got); err != nil {
 		return fmt.Errorf("rbac/migrations: acquire lock: %w", err)
 	}
 	if !got.Valid || got.Int64 != 1 {
@@ -136,9 +140,14 @@ func acquireLock(conn *gorm.DB) error {
 }
 
 // releaseLock 释放迁移锁。使用 WithoutCancel：请求 ctx 被取消也必须释放。
+//
+// 用 DO（无结果集）而非 SELECT + Row()：迁移失败时连接可能带有 Statement
+// 错误，Row() 会返回 nil 并在 defer 中 panic，掩盖真正的迁移错误。
+// NewDB 会话避免复用失败语句的状态；错误忽略（连接关闭时 MySQL 自动释放锁）。
 func releaseLock(ctx context.Context, conn *gorm.DB) {
-	// Row() 不污染 GORM 的 Statement 状态（Scan 到 struct 会把表名解析成 null_int64）。
-	_ = conn.WithContext(context.WithoutCancel(ctx)).Raw("SELECT RELEASE_LOCK(" + migrationLockSQL + ")").Row().Scan(new(sql.NullInt64))
+	releaseCtx := context.WithoutCancel(ctx)
+	_ = conn.Session(&gorm.Session{NewDB: true, Context: releaseCtx}).
+		Exec("DO RELEASE_LOCK(" + migrationLockSQL + ")").Error
 }
 
 func appliedVersions(conn *gorm.DB) (map[string]struct{}, error) {
