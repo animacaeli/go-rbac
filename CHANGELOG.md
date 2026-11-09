@@ -7,6 +7,41 @@
 
 ## [Unreleased]
 
+（无）
+
+## [0.5.0] - 2026-11-09
+
+汇总 v0.4.0 之后的第八至第十轮复审修复（含此前未发布的第三/五/六/七轮收尾）。
+核心变化：缓存一致性协议升级为「主体版本 + 授权域 epoch + 全局 epoch」，
+身份标识改为二进制比较，多租户隔离与失效链路全面补齐。
+
+**升级注意（pre-1.0 行为变更）**：
+
+- 执行 `app.Migrate`：新增 0003/0004（计数器键列宽与二进制、`subject_id`
+  二进制排序规则、授权到期索引）。
+- `subject_id` 大小写/重音敏感（不再被数据库 ci 规则合并）；升级后缓存与
+  计数器冷启动一次，业务侧建议统一身份大小写。
+- 启用 tenant 后管理写接口必须提供 `operator.TenantID`；单租户模式拒绝
+  非空租户。
+- 审计查询默认只能访问当前租户；跨租户/平台域需显式
+  `audit.NewQuery(m, audit.WithCrossTenantAccess())`。
+- `datascope.RemoveRoleScope` 参数顺序改为 `(ctx, roleID, resource)`；
+  `UserRoleRepo` 新增批量方法、移除 `CountersRepo.Bump`。
+- 计数器越界（主体版本 ≥ 2^32、epoch+全局 epoch > 2^31-1）返回
+  `ErrCounterOverflow`（fail closed）。
+
+### Security
+
+- Gin 拒绝路径未 `Abort`：自定义 401/403/503 处理器只写响应时，受保护的业务
+  handler 仍会执行（fail open）。
+- 多租户：角色禁用/删除缺 epoch 同事务递增；权限表（全局定义）失效只作用于
+  单租户，其它租户继续从缓存放行已禁用权限。
+- DataScope 未按租户隔离（可跨租户读取/改写数据范围）。
+- 审计查询可被显式 `Filter.Tenant` 越界到其它租户。
+- 菜单关联权限被禁用/废弃后退化为全员可见。
+
+（按轮次的详细修复见下。）
+
 ### Fixed（第十轮复审）
 
 - **计数器求和溢出（P2）**：`validateCounters` 原先先做 `epoch+globalEpoch`
@@ -49,7 +84,7 @@
   设计文档 Phase 3/4 任务与状态表不再把已实现功能标为待实现；补充
   `utf8mb4_0900_bin` 的 MySQL 兼容性说明。
 
-### API 调整（pre-1.0）
+### API 调整（pre-1.0，补充）
 
 - `audit.NewQuery` 新增可变选项 `audit.WithCrossTenantAccess()`；新增
   `audit.ErrTenantScopeViolation`。`Filter.Tenant` 默认只能等于 ctx 租户。
