@@ -16,12 +16,16 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/animacaeli/go-rbac/core"
 )
 
 // SubjectContextKey 是主体标识写入 request context 的键。
 type SubjectContextKey struct{}
+
+// tenantContextKey 是租户标识写入 request context 的键（仅注入租户解析器时存在）。
+type tenantContextKey struct{}
 
 // Guard 是 net/http 鉴权中间件构造器。
 type Guard struct {
@@ -31,6 +35,7 @@ type Guard struct {
 	unauthorized  func(w http.ResponseWriter, r *http.Request, err error)
 	forbidden     func(w http.ResponseWriter, r *http.Request)
 	unavailable   func(w http.ResponseWriter, r *http.Request, err error)
+	metrics       core.Metrics
 }
 
 // TenantResolver 由业务项目实现：从已完成认证的可信上下文解析租户标识
@@ -52,19 +57,40 @@ func WithTenantResolver(r TenantResolver) Option {
 	}
 }
 
-// WithUnauthorizedHandler 定制 401 响应。
+// WithUnauthorizedHandler 定制 401 响应。传入 nil 时保持默认实现。
 func WithUnauthorizedHandler(h func(w http.ResponseWriter, r *http.Request, err error)) Option {
-	return func(g *Guard) { g.unauthorized = h }
+	return func(g *Guard) {
+		if h != nil {
+			g.unauthorized = h
+		}
+	}
 }
 
-// WithForbiddenHandler 定制 403 响应。
+// WithForbiddenHandler 定制 403 响应。传入 nil 时保持默认实现。
 func WithForbiddenHandler(h func(w http.ResponseWriter, r *http.Request)) Option {
-	return func(g *Guard) { g.forbidden = h }
+	return func(g *Guard) {
+		if h != nil {
+			g.forbidden = h
+		}
+	}
 }
 
-// WithUnavailableHandler 定制鉴权服务异常响应（默认 503）。
+// WithUnavailableHandler 定制鉴权服务异常响应（默认 503）。传入 nil 时保持默认实现。
 func WithUnavailableHandler(h func(w http.ResponseWriter, r *http.Request, err error)) Option {
-	return func(g *Guard) { g.unavailable = h }
+	return func(g *Guard) {
+		if h != nil {
+			g.unavailable = h
+		}
+	}
+}
+
+// WithMetrics 注入观测实现（DenialsInc 记录 401/403/不可用拒绝计数）。
+func WithMetrics(m core.Metrics) Option {
+	return func(g *Guard) {
+		if m != nil {
+			g.metrics = m
+		}
+	}
 }
 
 // New 构造 Guard。
@@ -75,6 +101,7 @@ func New(auth core.Authorizer, resolver core.SubjectResolver, opts ...Option) *G
 		unauthorized: defaultUnauthorized,
 		forbidden:    defaultForbidden,
 		unavailable:  defaultUnavailable,
+		metrics:      core.NoopMetrics{},
 	}
 	for _, opt := range opts {
 		opt(g)
@@ -82,8 +109,12 @@ func New(auth core.Authorizer, resolver core.SubjectResolver, opts ...Option) *G
 	return g
 }
 
-// Require 返回要求单个权限码的中间件。
+// Require 返回要求单个权限码的中间件。空权限码在构造期 panic（必然 503 的
+// 调用方编程错误，应在启动期暴露）。
 func (g *Guard) Require(code string) func(http.Handler) http.Handler {
+	if strings.TrimSpace(code) == "" {
+		panic("httpadapter: permission code must not be empty")
+	}
 	return g.guard(func(ctx context.Context, ac core.AuthorizationContext) (bool, error) {
 		return g.authz.HasPermission(ctx, ac, code)
 	})
@@ -91,6 +122,7 @@ func (g *Guard) Require(code string) func(http.Handler) http.Handler {
 
 // RequireAny 要求任一权限码（OR）。
 func (g *Guard) RequireAny(codes ...string) func(http.Handler) http.Handler {
+	validateCodes(codes)
 	return g.guard(func(ctx context.Context, ac core.AuthorizationContext) (bool, error) {
 		if len(codes) == 1 {
 			return g.authz.HasPermission(ctx, ac, codes[0])
@@ -101,6 +133,7 @@ func (g *Guard) RequireAny(codes ...string) func(http.Handler) http.Handler {
 
 // RequireAll 要求全部权限码（AND）。
 func (g *Guard) RequireAll(codes ...string) func(http.Handler) http.Handler {
+	validateCodes(codes)
 	return g.guard(func(ctx context.Context, ac core.AuthorizationContext) (bool, error) {
 		if len(codes) == 1 {
 			return g.authz.HasPermission(ctx, ac, codes[0])
@@ -116,6 +149,7 @@ func (g *Guard) guard(eval func(ctx context.Context, ac core.AuthorizationContex
 			// 多租户部署下租户缺失按 fail closed 拒绝（§2.9）。
 			subjectID, err := g.resolver.Resolve(r.Context())
 			if err != nil {
+				g.metrics.DenialsInc("unauthenticated")
 				g.unauthorized(w, r, err)
 				return
 			}
@@ -123,29 +157,50 @@ func (g *Guard) guard(eval func(ctx context.Context, ac core.AuthorizationContex
 			if g.tenantResolve != nil {
 				tenantID, err := g.tenantResolve.ResolveTenant(r.Context())
 				if err != nil {
+					g.metrics.DenialsInc("forbidden")
 					g.forbidden(w, r)
 					return
 				}
 				ac.TenantID = tenantID
 			}
 			ctx := context.WithValue(r.Context(), SubjectContextKey{}, subjectID.String())
+			if g.tenantResolve != nil {
+				// 供下游（审计查询、数据范围）读取授权域。
+				ctx = context.WithValue(ctx, tenantContextKey{}, ac.TenantID)
+				ctx = core.ContextWithTenant(ctx, ac.TenantID)
+			}
 
 			ok, err := eval(ctx, ac)
 			if err != nil {
 				// 账号非活跃 = 确定拒绝（403）；其余异常 fail closed（503）。
 				if errors.Is(err, core.ErrSubjectInactive) {
+					g.metrics.DenialsInc("forbidden")
 					g.forbidden(w, r)
 					return
 				}
+				g.metrics.DenialsInc("unavailable")
 				g.unavailable(w, r, err)
 				return
 			}
 			if !ok {
+				g.metrics.DenialsInc("forbidden")
 				g.forbidden(w, r)
 				return
 			}
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
+	}
+}
+
+// validateCodes 在中间件构造期拒绝空权限码。
+func validateCodes(codes []string) {
+	if len(codes) == 0 {
+		panic("httpadapter: at least one permission code is required")
+	}
+	for _, code := range codes {
+		if strings.TrimSpace(code) == "" {
+			panic("httpadapter: permission code must not be empty")
+		}
 	}
 }
 
@@ -156,6 +211,12 @@ func SubjectFromContext(ctx context.Context) (core.SubjectID, bool) {
 		return "", false
 	}
 	return core.SubjectID(v), true
+}
+
+// TenantFromContext 读取 Guard 解析并写入的租户标识（仅注入租户解析器时存在）。
+func TenantFromContext(ctx context.Context) (string, bool) {
+	v, ok := ctx.Value(tenantContextKey{}).(string)
+	return v, ok
 }
 
 func writeJSON(w http.ResponseWriter, status int, body map[string]any) {

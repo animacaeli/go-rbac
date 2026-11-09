@@ -293,3 +293,64 @@ type fakeTenantResolver struct {
 func (f fakeTenantResolver) ResolveTenant(context.Context) (string, error) {
 	return f.tenant, f.err
 }
+
+// 回归：自定义 401/403 handler 只写响应、不调用 Abort 时，Guard 必须自行
+// Abort——否则 Gin 会继续执行受保护的业务 handler（fail open）。
+func (s *GuardSuite) TestCustomHandlerWithoutAbort_DoesNotRunProtectedHandler() {
+	// Arrange
+	custom := ginadapter.New(
+		s.authzMock,
+		s.resolverMock,
+		ginadapter.WithForbiddenHandler(func(c *gin.Context) {
+			c.Status(http.StatusForbidden) // 刻意不 Abort
+		}),
+	)
+	s.resolverMock.On("Resolve", mock.Anything).Return(core.SubjectID("10001"), nil)
+	s.authzMock.On("HasPermission", mock.Anything, mock.AnythingOfType("core.AuthorizationContext"), "user:list").
+		Return(false, nil)
+	executed := false
+	s.router.GET("/p", custom.Require("user:list"), func(c *gin.Context) {
+		executed = true
+		c.String(http.StatusOK, "secret")
+	})
+
+	// Act
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/p", nil))
+
+	// Assert
+	s.Require().Equal(http.StatusForbidden, w.Code)
+	s.False(executed, "protected handler must not run after a guard denial")
+}
+
+// 回归：租户解析结果写入 request context 与 gin.Context，供下游组件使用。
+func (s *GuardSuite) TestTenantResolver_PropagatesTenant() {
+	// Arrange
+	tenantResolver := tenantStub{tenant: "acme"}
+	custom := ginadapter.New(s.authzMock, s.resolverMock, ginadapter.WithTenantResolver(tenantResolver))
+	s.resolverMock.On("Resolve", mock.Anything).Return(core.SubjectID("10001"), nil)
+	s.authzMock.On("HasPermission", mock.Anything, mock.MatchedBy(func(ac core.AuthorizationContext) bool {
+		return ac.TenantID == "acme"
+	}), "user:list").Return(true, nil)
+	var gotTenant string
+	var gotCtxTenant string
+	s.router.GET("/t", custom.Require("user:list"), func(c *gin.Context) {
+		gotTenant, _ = ginadapter.GetTenantID(c)
+		t, _ := core.TenantFromContext(c.Request.Context())
+		gotCtxTenant = t
+		c.Status(http.StatusOK)
+	})
+
+	// Act
+	w := httptest.NewRecorder()
+	s.router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/t", nil))
+
+	// Assert
+	s.Require().Equal(http.StatusOK, w.Code)
+	s.Equal("acme", gotTenant)
+	s.Equal("acme", gotCtxTenant)
+}
+
+type tenantStub struct{ tenant string }
+
+func (t tenantStub) ResolveTenant(context.Context) (string, error) { return t.tenant, nil }

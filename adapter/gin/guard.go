@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/animacaeli/go-rbac/core"
@@ -25,6 +26,9 @@ import (
 
 // SubjectContextKey 是主体标识写入 gin.Context 的键。
 const SubjectContextKey = "rbac.subject_id"
+
+// TenantContextKey 是租户标识写入 gin.Context 的键（仅注入租户解析器时存在）。
+const TenantContextKey = "rbac.tenant_id"
 
 // Guard 是 Gin 鉴权中间件构造器。
 type Guard struct {
@@ -51,18 +55,34 @@ type TenantResolver = interface {
 type Option func(*Guard)
 
 // WithUnauthorizedHandler 定制 401 响应（§2.6 错误响应定制）。
+// 处理器无需自行调用 c.Abort()：Guard 在调用前已 Abort，保证业务处理链不会继续执行。
+// 传入 nil 时保持默认实现。
 func WithUnauthorizedHandler(h func(c *gin.Context, err error)) Option {
-	return func(g *Guard) { g.unauthorized = h }
+	return func(g *Guard) {
+		if h != nil {
+			g.unauthorized = h
+		}
+	}
 }
 
-// WithForbiddenHandler 定制 403 响应。
+// WithForbiddenHandler 定制 403 响应。处理器无需自行 Abort（Guard 已 Abort）。
+// 传入 nil 时保持默认实现。
 func WithForbiddenHandler(h func(c *gin.Context)) Option {
-	return func(g *Guard) { g.forbidden = h }
+	return func(g *Guard) {
+		if h != nil {
+			g.forbidden = h
+		}
+	}
 }
 
-// WithUnavailableHandler 定制鉴权服务异常响应（默认 503）。
+// WithUnavailableHandler 定制鉴权服务异常响应（默认 503）。处理器无需自行 Abort。
+// 传入 nil 时保持默认实现。
 func WithUnavailableHandler(h func(c *gin.Context, err error)) Option {
-	return func(g *Guard) { g.unavailable = h }
+	return func(g *Guard) {
+		if h != nil {
+			g.unavailable = h
+		}
+	}
 }
 
 // WithTenantResolver 注入租户解析器（多租户部署）：每个受保护请求先解析
@@ -117,9 +137,7 @@ func (g *Guard) RequireAll(codes ...string) gin.HandlerFunc {
 }
 
 func (g *Guard) guard(codes ...string) gin.HandlerFunc {
-	if len(codes) == 0 {
-		panic("ginadapter: at least one permission code is required")
-	}
+	validatecodes(codes)
 	g.declare(codes)
 	return func(c *gin.Context) {
 		ac, fail := g.resolve(c)
@@ -140,9 +158,7 @@ func (g *Guard) guard(codes ...string) gin.HandlerFunc {
 }
 
 func (g *Guard) guardAll(codes ...string) gin.HandlerFunc {
-	if len(codes) == 0 {
-		panic("ginadapter: at least one permission code is required")
-	}
+	validatecodes(codes)
 	g.declare(codes)
 	return func(c *gin.Context) {
 		ac, fail := g.resolve(c)
@@ -163,23 +179,35 @@ func (g *Guard) guardAll(codes ...string) gin.HandlerFunc {
 
 // resolve 执行身份与租户解析：身份失败即 401（绝不得视为匿名授权通过，
 // §2.6）；多租户部署下租户缺失按 fail closed 拒绝（§2.9）。
+//
+// 拒绝路径必须 Abort：Gin 的 Next() 循环只在 Abort 后停止——仅写响应而不
+// Abort 会让受保护的业务处理器继续执行（fail open）。Abort 由 Guard 负责，
+// 自定义响应处理器无需（也不能依赖是否）自行 Abort。
 func (g *Guard) resolve(c *gin.Context) (core.AuthorizationContext, bool) {
 	subjectID, err := g.resolver.Resolve(c.Request.Context())
 	if err != nil {
 		g.metrics.DenialsInc("unauthenticated")
+		c.Abort()
 		g.unauthorized(c, err)
 		return core.AuthorizationContext{}, true
 	}
-	c.Set(SubjectContextKey, subjectID.String())
 	ac := core.AuthorizationContext{SubjectID: subjectID}
 	if g.tenantResolve != nil {
 		tenantID, err := g.tenantResolve.ResolveTenant(c.Request.Context())
 		if err != nil {
 			g.metrics.DenialsInc("forbidden")
+			c.Abort()
 			g.forbidden(c)
 			return core.AuthorizationContext{}, true
 		}
 		ac.TenantID = tenantID
+	}
+	// 仅在授权链继续时才向业务侧暴露身份/租户：被拒请求不得观察到主体上下文。
+	c.Set(SubjectContextKey, subjectID.String())
+	if g.tenantResolve != nil {
+		c.Set(TenantContextKey, ac.TenantID)
+		// 同时写入 request context：审计查询、数据范围等下游组件经 ctx 读取租户。
+		c.Request = c.Request.WithContext(core.ContextWithTenant(c.Request.Context(), ac.TenantID))
 	}
 	return ac, false
 }
@@ -189,19 +217,34 @@ func (g *Guard) finish(c *gin.Context, ok bool, err error) {
 	if err != nil {
 		if errors.Is(err, core.ErrSubjectInactive) {
 			g.metrics.DenialsInc("forbidden")
+			c.Abort()
 			g.forbidden(c)
 			return
 		}
 		g.metrics.DenialsInc("unavailable")
+		c.Abort()
 		g.unavailable(c, err)
 		return
 	}
 	if !ok {
 		g.metrics.DenialsInc("forbidden")
+		c.Abort()
 		g.forbidden(c)
 		return
 	}
 	c.Next()
+}
+
+// validatecodes 在路由注册期拒绝空权限码（运行时必然 503，属调用方编程错误）。
+func validatecodes(codes []string) {
+	if len(codes) == 0 {
+		panic("ginadapter: at least one permission code is required")
+	}
+	for _, code := range codes {
+		if strings.TrimSpace(code) == "" {
+			panic("ginadapter: permission code must not be empty")
+		}
+	}
 }
 
 // DeclaredCodes 返回 Guard 已声明的全部权限码（排序去重），

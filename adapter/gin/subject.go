@@ -18,3 +18,17 @@ func GetSubjectID(c *gin.Context) (core.SubjectID, bool) {
 	}
 	return core.SubjectID(s), true
 }
+
+// GetTenantID 从 gin.Context 读取 Guard 解析并写入的租户标识（仅注入
+// WithTenantResolver 时存在）。授权通过的业务处理函数可用它做租户级过滤。
+func GetTenantID(c *gin.Context) (string, bool) {
+	v, ok := c.Get(TenantContextKey)
+	if !ok {
+		return "", false
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", false
+	}
+	return s, true
+}

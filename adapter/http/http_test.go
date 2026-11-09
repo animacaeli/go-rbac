@@ -1,6 +1,7 @@
 package httpadapter_test
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -153,4 +154,62 @@ func TestGuard_RequireAnyAndAll(t *testing.T) {
 	wAll := httptest.NewRecorder()
 	guard.RequireAll("a:b", "c:d")(ok).ServeHTTP(wAll, httptest.NewRequest("GET", "/", nil))
 	assert.Equal(t, http.StatusForbidden, wAll.Code)
+}
+
+type httpTenantStub struct{ tenant string }
+
+func (t httpTenantStub) ResolveTenant(context.Context) (string, error) { return t.tenant, nil }
+
+// 租户解析结果写入 request context（审计/数据范围等下游组件依赖）。
+func TestGuard_TenantPropagatedToContext(t *testing.T) {
+	authz := coremocks.NewMockAuthorizer(t)
+	resolver := coremocks.NewMockSubjectResolver(t)
+	resolver.On("Resolve", mock.Anything).Return(core.SubjectID("10001"), nil)
+	authz.On("HasPermission", mock.Anything, mock.AnythingOfType("core.AuthorizationContext"), "user:list").
+		Return(true, nil)
+	guard := httpadapter.New(authz, resolver, httpadapter.WithTenantResolver(httpTenantStub{tenant: "acme"}))
+
+	var gotTenant, gotCtxTenant string
+	handler := guard.Require("user:list")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotTenant, _ = httpadapter.TenantFromContext(r.Context())
+		gotCtxTenant, _ = core.TenantFromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/users", nil))
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "acme", gotTenant)
+	assert.Equal(t, "acme", gotCtxTenant)
+}
+
+// nil 定制处理器不得导致拒绝时 panic，应回退默认实现。
+func TestGuard_NilHandlersFallBackToDefaults(t *testing.T) {
+	authz := coremocks.NewMockAuthorizer(t)
+	resolver := coremocks.NewMockSubjectResolver(t)
+	resolver.On("Resolve", mock.Anything).Return(core.SubjectID("10001"), nil)
+	authz.On("HasPermission", mock.Anything, mock.AnythingOfType("core.AuthorizationContext"), "user:list").
+		Return(false, nil)
+	guard := httpadapter.New(authz, resolver,
+		httpadapter.WithForbiddenHandler(nil),
+		httpadapter.WithUnauthorizedHandler(nil),
+		httpadapter.WithUnavailableHandler(nil),
+	)
+	handler := guard.Require("user:list")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("protected handler must not run")
+	}))
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/users", nil))
+
+	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+// 空权限码在构造期暴露（运行时只会得到 503）。
+func TestGuard_RequireEmptyCodePanics(t *testing.T) {
+	guard := httpadapter.New(coremocks.NewMockAuthorizer(t), coremocks.NewMockSubjectResolver(t))
+	assert.Panics(t, func() { guard.Require("") })
+	assert.Panics(t, func() { guard.RequireAny() })
+	assert.Panics(t, func() { guard.RequireAll("a:b", "") })
 }
