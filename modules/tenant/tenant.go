@@ -120,8 +120,11 @@ func (m *Module) SeedSuperAdminInTenant(ctx context.Context, tenantID, subjectID
 	if m.app == nil || m.repos == nil {
 		return fmt.Errorf("rbac/modules/tenant: module not registered")
 	}
-	if tenantID == "" || len(tenantID) > TenantIDMaxLength {
-		return fmt.Errorf("rbac/modules/tenant: invalid tenant id %q", tenantID)
+	// 完整校验（长度/字符集/保留名）必须在任何数据库操作之前完成：
+	// default 与 !global 是平台域/全局计数器域的保留 scope，非法字符会
+	// 破坏缓存与计数器键结构。
+	if err := TenantOf(tenantID); err != nil {
+		return err
 	}
 	if subjectID == "" || len(subjectID) > model.SubjectIDMaxLength {
 		return fmt.Errorf("%w: %q", core.ErrInvalidSubjectID, subjectID)
