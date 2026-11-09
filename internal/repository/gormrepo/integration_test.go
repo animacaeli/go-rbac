@@ -113,7 +113,7 @@ func (s *IntegrationSuite) resetSchema() {
 		"schema_migrations",
 		"rbac_audit_logs", "rbac_menu_permissions", "rbac_menus", "rbac_role_data_scopes",
 		"rbac_user_grants", "rbac_role_permissions", "rbac_user_roles",
-		"rbac_permissions", "rbac_roles",
+		"rbac_permissions", "rbac_roles", "rbac_counters",
 	}
 	for _, t := range tables {
 		require.NoError(s.T(), s.db.Exec("DROP TABLE IF EXISTS "+t).Error)
@@ -128,9 +128,9 @@ func (s *IntegrationSuite) TestMigrate_IdempotentRerun() {
 	s.Require().NoError(err)
 	var count int64
 	s.Require().NoError(s.db.Table("schema_migrations").Count(&count).Error)
-	// Core 0001/0002 + audit/menu/datascope 各 0001（template 无迁移）；
+	// Core 0001/0002/0003 + audit/menu/datascope 各 0001（template 无迁移）；
 	// 同一版本只记录一次。
-	s.Equal(int64(5), count, "重跑不产生新的版本记录")
+	s.Equal(int64(6), count, "重跑不产生新的版本记录")
 }
 
 func (s *IntegrationSuite) TestSyncPermissions_IdempotentRerun() {
@@ -325,18 +325,20 @@ func (s *IntegrationSuite) TestAuditModule_RecordsAuthorizationChanges() {
 	s.Require().NoError(s.app.Grants().Grant(ctx, admin, "50001", "order:export", nil, "审计演示"))
 	s.Require().NoError(s.app.Grants().Revoke(ctx, admin, "50001", "order:export"))
 
-	// Assert：§2.10 事件全链路落库；可按操作人/目标查询。
+	// Assert：§2.10 事件全链路落库；按目标查询（套件内其它用例也会写审计，
+	// 因此不能用全表计数断言）。
 	q := audit.NewQuery(s.audit)
-	byOperator, err := q.List(ctx, audit.Filter{Operator: "root-admin"})
+	byRole, err := q.List(ctx, audit.Filter{Subject: "audited_role"})
 	s.Require().NoError(err)
-	s.Require().Len(byOperator, 4, "create + assign + grant + revoke")
+	s.Require().Len(byRole, 1, "role.created 以角色 code 为目标")
 
 	bySubject, err := q.List(ctx, audit.Filter{Subject: "50001"})
 	s.Require().NoError(err)
 	s.Require().Len(bySubject, 3, "assign + grant + revoke 均以被操作对象为目标")
 
+	logs := append(byRole, bySubject...)
 	types := map[string]bool{}
-	for _, log := range byOperator {
+	for _, log := range logs {
 		types[log.EventType] = true
 	}
 	for _, want := range []string{
@@ -486,4 +488,107 @@ func (s *IntegrationSuite) TestDataScopeModule_WidestMergeAndDefaults() {
 	scope, err = s.ds.ResolveDataScope(ctx, user, "order")
 	s.Require().NoError(err)
 	s.Equal(datascope.ScopeSelf, scope)
+}
+
+// ---- 第八轮审核回归 ----
+
+// 菜单可见性 fail closed：关联权限被禁用/废弃后，受控菜单不得退化为全员可见。
+func (s *IntegrationSuite) TestMenuModule_DisabledPermissionFailsClosed() {
+	ctx := s.ctx
+	admin := core.AuthorizationContext{SubjectID: "root-admin"}
+	nobody := core.AuthorizationContext{SubjectID: "81001"}
+
+	s.Require().NoError(s.menuM.Declare(ctx, menu.Item{
+		Code: "gated", Name: "受控页面", Type: menu.TypePage, Path: "/gated",
+		Permissions: []string{"order:export"},
+	}))
+
+	tree, err := s.menuM.ResolveVisibleMenus(ctx, nobody)
+	s.Require().NoError(err)
+	s.NotContains(flattenMenu(tree), "gated", "无权限用户不可见受控菜单")
+
+	// 禁用关联权限（等价于 SyncPermissions 把下线权限标记为废弃）。
+	s.Require().NoError(s.app.Permissions().SetStatus(ctx, admin, "order:export", model.PermissionStatusDisabled))
+	s.T().Cleanup(func() {
+		_ = s.app.Permissions().SetStatus(ctx, admin, "order:export", model.PermissionStatusEnabled)
+	})
+
+	tree, err = s.menuM.ResolveVisibleMenus(ctx, nobody)
+	s.Require().NoError(err)
+	s.NotContains(flattenMenu(tree), "gated", "关联权限全部禁用时必须 fail closed，不得退化为公开菜单")
+}
+
+// 审计查询按租户隔离：ctx 携带租户槽位时只返回该租户记录。
+func (s *IntegrationSuite) TestAuditQuery_TenantScoped() {
+	ctx := s.ctx
+	now := time.Now().UTC()
+	for _, tenant := range []string{"acme", "beta"} {
+		s.Require().NoError(s.db.Create(&audit.AuditLog{
+			EventType: "role.created", OperatorID: "op", TenantID: tenant,
+			Target: "x", Detail: "{}", CreatedAt: now,
+		}).Error)
+	}
+	q := audit.NewQuery(s.audit)
+	logs, err := q.List(core.ContextWithTenant(ctx, "acme"), audit.Filter{})
+	s.Require().NoError(err)
+	s.Require().NotEmpty(logs)
+	for _, l := range logs {
+		s.Equal("acme", l.TenantID, "跨租户审计记录不得返回")
+	}
+
+	// 显式授权域（含平台域空串）优先于 ctx。
+	beta := "beta"
+	logs, err = q.List(ctx, audit.Filter{Tenant: &beta})
+	s.Require().NoError(err)
+	s.Require().NotEmpty(logs)
+	for _, l := range logs {
+		s.Equal("beta", l.TenantID)
+	}
+}
+
+// 批量分配：单事务落库，且同一主体只递增一次版本号。
+func (s *IntegrationSuite) TestAssignMany_SingleTransactionSingleBump() {
+	ctx := s.ctx
+	admin := core.AuthorizationContext{SubjectID: "root-admin"}
+	subjectID := "83001"
+
+	r1, err := s.app.Roles().Create(ctx, admin, "batch_r1", "R1", "")
+	s.Require().NoError(err)
+	r2, err := s.app.Roles().Create(ctx, admin, "batch_r2", "R2", "")
+	s.Require().NoError(err)
+
+	s.Require().NoError(s.app.UserRoles().AssignBatch(ctx, admin, subjectID, []uint64{r1.ID, r2.ID}))
+	roles, err := s.app.UserRoles().ListRoles(ctx, subjectID)
+	s.Require().NoError(err)
+	s.Len(roles, 2, "批量分配必须原子落库")
+
+	version := func() int64 {
+		var v int64
+		s.Require().NoError(s.db.Table("rbac_counters").
+			Select("v").Where("k = ?", "default:subject:"+subjectID+":version").Scan(&v).Error)
+		return v
+	}
+	first := version()
+	s.Equal(int64(1), first, "一次批量分配只递增一次版本")
+
+	// 幂等重放：已存在的关联不产生新行、也不递增版本。
+	s.Require().NoError(s.app.UserRoles().AssignBatch(ctx, admin, subjectID, []uint64{r1.ID, r2.ID}))
+	s.Equal(first, version(), "幂等重放不得递增版本")
+}
+
+// 角色删除的"未被使用"复核在事务内完成，仍被分配时返回 ErrRoleInUse 而不是删掉绑定。
+func (s *IntegrationSuite) TestRoleDelete_InUseRejectedInTransaction() {
+	ctx := s.ctx
+	admin := core.AuthorizationContext{SubjectID: "root-admin"}
+	role, err := s.app.Roles().Create(ctx, admin, "inuse_role", "I", "")
+	s.Require().NoError(err)
+	s.Require().NoError(s.app.UserRoles().Assign(ctx, admin, "84001", role.ID))
+
+	err = s.app.Roles().Delete(ctx, admin, role.ID)
+	s.Require().ErrorIs(err, rbac.ErrRoleInUse)
+
+	// 绑定仍然存在。
+	roles, err := s.app.UserRoles().ListRoles(ctx, "84001")
+	s.Require().NoError(err)
+	s.Len(roles, 1)
 }

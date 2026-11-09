@@ -6,14 +6,20 @@ package tenant_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/animacaeli/go-rbac"
 	rediscache "github.com/animacaeli/go-rbac/cache/redis"
 	"github.com/animacaeli/go-rbac/core"
+	"github.com/animacaeli/go-rbac/internal/repository"
+	"github.com/animacaeli/go-rbac/model"
+	"github.com/animacaeli/go-rbac/modules/audit"
+	"github.com/animacaeli/go-rbac/modules/datascope"
 	"github.com/animacaeli/go-rbac/modules/tenant"
 	"github.com/animacaeli/go-rbac/registry"
 	"github.com/redis/go-redis/v9"
@@ -49,6 +55,16 @@ func (s *MigrationContractSuite) SetupSuite() {
 		require.NoError(s.T(), db.Exec("DROP TABLE IF EXISTS "+t).Error)
 	}
 	s.db = db
+}
+
+// SetupTest 每个用例都从空库开始："升级路径"与"全新路径"互不污染。
+func (s *MigrationContractSuite) SetupTest() {
+	for _, t := range []string{
+		"schema_migrations", "rbac_user_grants", "rbac_role_permissions",
+		"rbac_user_roles", "rbac_permissions", "rbac_roles", "rbac_counters",
+	} {
+		require.NoError(s.T(), s.db.Exec("DROP TABLE IF EXISTS "+t).Error)
+	}
 }
 
 func (s *MigrationContractSuite) openDB(name string) *gorm.DB {
@@ -163,8 +179,58 @@ func (s *MigrationContractSuite) TestContract_FreshPath_CoreThenTenantInOnePlan(
 	require.NoError(s.T(), s.db.Raw(
 		"SELECT version FROM schema_migrations ORDER BY module, version",
 	).Scan(&versions).Error)
-	// Core 0001/0002 + tenant 0001。
-	s.Equal([]string{"0001", "0002", "0001"}, versions)
+	// Core 0001/0002/0003 + tenant 0001。
+	s.Equal([]string{"0001", "0002", "0003", "0001"}, versions)
+}
+
+// 部分失败恢复：DDL 已隐式提交、版本行未写入（进程崩溃窗口）时，重跑必须成功。
+func (s *MigrationContractSuite) TestContract_TenantMigration_ReentrantAfterVersionRowLoss() {
+	app := s.newApp(true)
+	require.NoError(s.T(), app.Migrate(s.ctx))
+
+	// 构造病态中间态：新旧唯一键同时存在（旧实现的 DROP+ADD 若被拆开执行
+	// 就可能留下这种状态），重跑必须清理旧键。
+	require.NoError(s.T(), s.db.Exec(
+		"ALTER TABLE rbac_roles ADD UNIQUE KEY uk_code (code)").Error)
+
+	// 模拟"全部 DDL 已提交、tenant/0001 版本行未落库"的崩溃窗口。
+	require.NoError(s.T(), s.db.Exec(
+		"DELETE FROM schema_migrations WHERE module = 'tenant' AND version = '0001'").Error)
+
+	// 旧实现会在 ADD COLUMN 上撞 1060 duplicate column，永久卡死。
+	require.NoError(s.T(), app.Migrate(s.ctx), "部分失败后重跑必须成功（幂等 DDL）")
+
+	var n int64
+	require.NoError(s.T(), s.db.Table("schema_migrations").
+		Where("module = 'tenant' AND version = '0001'").Count(&n).Error)
+	s.Equal(int64(1), n, "版本行应重新写入")
+
+	// 旧唯一键必须被清理（否则同 code 跨租户仍被拒绝）。
+	var oldKey int64
+	require.NoError(s.T(), s.db.Raw(
+		"SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 'rbac_roles' AND index_name = 'uk_code'",
+	).Scan(&oldKey).Error)
+	s.Zero(oldKey, "遗留的 uk_code 必须被清理")
+
+	// 唯一键仍为租户维度：同 code 跨租户可行、同租户内唯一。
+	require.NoError(s.T(), s.db.Exec(
+		"INSERT INTO rbac_roles (tenant_id, code, name, status, created_at, updated_at) VALUES ('acme', 'replay', 'A', 1, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))").Error)
+	require.NoError(s.T(), s.db.Exec(
+		"INSERT INTO rbac_roles (tenant_id, code, name, status, created_at, updated_at) VALUES ('beta', 'replay', 'B', 1, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))").Error)
+}
+
+// 并发迁移：GET_LOCK 串行化，两个实例同时启动都应成功。
+func (s *MigrationContractSuite) TestContract_ConcurrentMigrate_Serialized() {
+	app1 := s.newApp(true)
+	app2 := s.newApp(true)
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); errs[0] = app1.Migrate(s.ctx) }()
+	go func() { defer wg.Done(); errs[1] = app2.Migrate(s.ctx) }()
+	wg.Wait()
+	require.NoError(s.T(), errs[0], "并发迁移实例 1")
+	require.NoError(s.T(), errs[1], "并发迁移实例 2")
 }
 
 // IsolationSuite 双租户隔离验证（§2.9 承担项）。
@@ -175,6 +241,8 @@ type IsolationSuite struct {
 	mr      *miniredis.Miniredis
 	app     *rbac.App
 	tenantM *tenant.Module
+	ds      *datascope.Module
+	auditM  *audit.Module
 }
 
 func TestIsolationSuite(t *testing.T) {
@@ -188,8 +256,8 @@ func (s *IsolationSuite) SetupSuite() {
 	s.ctx = context.Background()
 	db := s.openDB("go_rbac_tenant_iso")
 	for _, t := range []string{
-		"schema_migrations", "rbac_user_grants", "rbac_role_permissions",
-		"rbac_user_roles", "rbac_permissions", "rbac_roles",
+		"schema_migrations", "rbac_audit_logs", "rbac_role_data_scopes", "rbac_user_grants",
+		"rbac_role_permissions", "rbac_user_roles", "rbac_permissions", "rbac_roles", "rbac_counters",
 	} {
 		require.NoError(s.T(), db.Exec("DROP TABLE IF EXISTS "+t).Error)
 	}
@@ -202,11 +270,13 @@ func (s *IsolationSuite) SetupSuite() {
 		registry.New("order:export", "导出订单", "订单管理"),
 	))
 	s.tenantM = tenant.New()
+	s.ds = datascope.New()
+	s.auditM = audit.New()
 	app, err := rbac.New(
 		rbac.WithDB(db),
 		rbac.WithPermissionRegistry(reg),
 		rbac.WithCache(rediscache.New(redis.NewClient(&redis.Options{Addr: mr.Addr()}))),
-		rbac.WithModules(s.tenantM), // tenant 建议首位（迁移顺序）
+		rbac.WithModules(s.tenantM, s.ds, s.auditM), // tenant 建议首位（迁移顺序）
 	)
 	require.NoError(s.T(), err)
 	s.app = app
@@ -425,4 +495,120 @@ func (s *IsolationSuite) TestTenantAuthorityCounters_BumpPerScope() {
 	s.Require().NoError(s.db.Table("rbac_counters").
 		Select("v").Where("k = ?", "acme:epoch").Limit(1).Scan(&e).Error)
 	s.GreaterOrEqual(e, int64(1), "租户域角色级变更必须递增 acme:epoch")
+}
+
+// 角色禁用必须立即失效本租户缓存（§6.3：角色级变更 → 授权域 epoch 同事务递增）。
+// 旧实现的 tenant 仓储漏了 epoch 递增，禁用角色后旧权限仍从缓存放行至 TTL。
+func (s *IsolationSuite) TestRoleDisabled_InvalidatesTenantCache() {
+	acmeCtx := s.tenantCtx("acme")
+	acmeAdmin := s.ac("acme", "acme-admin")
+	role, err := s.app.Roles().Create(acmeCtx, acmeAdmin, "r_disable", "待禁用", "")
+	s.Require().NoError(err)
+	s.Require().NoError(s.app.Roles().SetPermissions(acmeCtx, acmeAdmin, role.ID, []string{"user:list"}))
+	s.Require().NoError(s.app.UserRoles().Assign(acmeCtx, acmeAdmin, "u_disable", role.ID))
+
+	ac := s.ac("acme", "u_disable")
+	ok, err := s.app.Authorizer().HasPermission(s.ctx, ac, "user:list")
+	s.Require().NoError(err)
+	s.Require().True(ok, "预热缓存")
+
+	s.Require().NoError(s.app.Roles().SetStatus(acmeCtx, acmeAdmin, role.ID, model.RoleStatusDisabled))
+
+	ok, err = s.app.Authorizer().HasPermission(s.ctx, ac, "user:list")
+	s.Require().NoError(err)
+	s.False(ok, "禁用角色后旧权限必须立即失效")
+}
+
+// 权限表是全局定义：任一租户禁用权限，必须让所有租户域的缓存一起失效。
+func (s *IsolationSuite) TestGlobalPermissionDisabled_InvalidatesAllTenants() {
+	acmeCtx, betaCtx := s.tenantCtx("acme"), s.tenantCtx("beta")
+	acmeAdmin, betaAdmin := s.ac("acme", "acme-admin"), s.ac("beta", "beta-admin")
+
+	acmeRole, err := s.app.Roles().Create(acmeCtx, acmeAdmin, "r_gp_acme", "A", "")
+	s.Require().NoError(err)
+	s.Require().NoError(s.app.Roles().SetPermissions(acmeCtx, acmeAdmin, acmeRole.ID, []string{"order:export"}))
+	s.Require().NoError(s.app.UserRoles().Assign(acmeCtx, acmeAdmin, "u_gp_acme", acmeRole.ID))
+
+	betaRole, err := s.app.Roles().Create(betaCtx, betaAdmin, "r_gp_beta", "B", "")
+	s.Require().NoError(err)
+	s.Require().NoError(s.app.Roles().SetPermissions(betaCtx, betaAdmin, betaRole.ID, []string{"order:export"}))
+	s.Require().NoError(s.app.UserRoles().Assign(betaCtx, betaAdmin, "u_gp_beta", betaRole.ID))
+
+	acmeAC := s.ac("acme", "u_gp_acme")
+	betaAC := s.ac("beta", "u_gp_beta")
+	ok, err := s.app.Authorizer().HasPermission(s.ctx, acmeAC, "order:export")
+	s.Require().NoError(err)
+	s.Require().True(ok)
+	ok, err = s.app.Authorizer().HasPermission(s.ctx, betaAC, "order:export")
+	s.Require().NoError(err)
+	s.Require().True(ok, "预热 beta 缓存")
+
+	s.T().Cleanup(func() {
+		_ = s.app.Permissions().SetStatus(acmeCtx, acmeAdmin, "order:export", model.PermissionStatusEnabled)
+	})
+	s.Require().NoError(s.app.Permissions().SetStatus(acmeCtx, acmeAdmin, "order:export", model.PermissionStatusDisabled))
+
+	ok, err = s.app.Authorizer().HasPermission(s.ctx, acmeAC, "order:export")
+	s.Require().NoError(err)
+	s.False(ok, "acme：权限已禁用")
+	ok, err = s.app.Authorizer().HasPermission(s.ctx, betaAC, "order:export")
+	s.Require().NoError(err)
+	s.False(ok, "beta：全局权限禁用必须跨租户失效（旧实现会继续放行）")
+}
+
+// 数据范围按租户隔离：同一 subject_id 在两个租户持有不同角色时，
+// 不得把 A 租户配置的宽范围泄漏给 B 租户。
+func (s *IsolationSuite) TestDataScope_IsolatedPerTenant() {
+	acmeCtx, betaCtx := s.tenantCtx("acme"), s.tenantCtx("beta")
+	acmeAdmin, betaAdmin := s.ac("acme", "acme-admin"), s.ac("beta", "beta-admin")
+
+	acmeRole, err := s.app.Roles().Create(acmeCtx, acmeAdmin, "ds_acme", "A", "")
+	s.Require().NoError(err)
+	s.Require().NoError(s.app.UserRoles().Assign(acmeCtx, acmeAdmin, "shared-user", acmeRole.ID))
+	s.Require().NoError(s.ds.SetRoleScope(acmeCtx, acmeAdmin, acmeRole.ID, "order", datascope.ScopeAll))
+
+	betaRole, err := s.app.Roles().Create(betaCtx, betaAdmin, "ds_beta", "B", "")
+	s.Require().NoError(err)
+	s.Require().NoError(s.app.UserRoles().Assign(betaCtx, betaAdmin, "shared-user", betaRole.ID))
+
+	acmeScope, err := s.ds.ResolveDataScope(s.ctx, s.ac("acme", "shared-user"), "order")
+	s.Require().NoError(err)
+	s.Equal(datascope.ScopeAll, acmeScope)
+
+	betaScope, err := s.ds.ResolveDataScope(s.ctx, s.ac("beta", "shared-user"), "order")
+	s.Require().NoError(err)
+	s.Equal(datascope.ScopeSelf, betaScope, "acme 的 ScopeAll 不得泄漏到 beta")
+
+	// 跨租户改写被结构性拒绝（角色 ID 全局唯一，必须按租户过滤）。
+	err = s.ds.SetRoleScope(betaCtx, betaAdmin, acmeRole.ID, "order", datascope.ScopeSelf)
+	s.Require().Error(err)
+	s.True(errors.Is(err, repository.ErrRecordNotFound), "beta 不得改写 acme 角色的数据范围: %v", err)
+}
+
+// 启用多租户后，管理服务的 operator.TenantID 必填：空租户会静默写入平台域。
+func (s *IsolationSuite) TestManagement_EmptyOperatorTenantFailsClosed() {
+	noTenant := core.AuthorizationContext{SubjectID: "acme-admin"}
+
+	_, err := s.app.Roles().Create(s.ctx, noTenant, "r_platform_leak", "P", "")
+	s.ErrorIs(err, core.ErrTenantRequired)
+
+	err = s.app.Grants().Grant(s.ctx, noTenant, "someone", "order:export", nil, "")
+	s.ErrorIs(err, core.ErrTenantRequired)
+
+	// 平台域不得出现该角色（证明检查发生在落库之前）。
+	var n int64
+	s.Require().NoError(s.db.Table("rbac_roles").
+		Where("tenant_id = ? AND code = ?", "", "r_platform_leak").Count(&n).Error)
+	s.Zero(n, "空租户 operator 不得在平台域创建角色")
+}
+
+// 多租户下审计查询必须显式指定授权域（fail closed），不得退化为全租户查询。
+func (s *IsolationSuite) TestAuditQuery_RequiresTenantContext() {
+	q := audit.NewQuery(s.auditM)
+
+	_, err := q.List(s.ctx, audit.Filter{})
+	s.ErrorIs(err, core.ErrTenantRequired)
+
+	_, err = q.List(s.tenantCtx("acme"), audit.Filter{})
+	s.NoError(err)
 }
