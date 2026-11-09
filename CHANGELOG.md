@@ -7,6 +7,41 @@
 
 ## [Unreleased]
 
+### Fixed（第九轮复审）
+
+- **审计查询租户边界（P1-01）**：默认查询器只允许当前请求上下文的租户；
+  `Filter.Tenant` 越界（含平台域空串）返回 `audit.ErrTenantScopeViolation`。
+  跨租户/平台域查询必须显式使用 `audit.NewQuery(m, audit.WithCrossTenantAccess())`，
+  挂在已完成平台级授权的管理端点。库不再信任调用方随意传入的租户参数。
+- **租户超管种子校验（P1-02）**：`SeedSuperAdminInTenant` 在任何数据库操作前
+  调用 `TenantOf`（长度/字符集/保留名 `default`、`!global`），非法标识不再
+  进入写库流程。
+- **身份标识二进制比较（P1-03，含迁移 0003/0004）**：`subject_id` 不再继承
+  `utf8mb4_0900_ai_ci` 的等价关系（忽略大小写/重音），改为
+  `utf8mb4_0900_bin`；`rbac_counters.k` 同步改为二进制（迁移 0003 在加宽
+  列宽时一并保持二进制，避免迁移重跑时回退到 ai_ci 撞主键）。缓存/计数器键
+  不再做主体大小写折叠——身份是外部不透明标识，避免"数据库认为相等、
+  Redis 键不同"导致的撤销不完整。**行为变更**：大小写/重音不同的 subject
+  现在是不同主体；升级后缓存与计数器冷启动一次。
+- **生成键数值边界（P2-01）**：主体版本必须 < 2^32、epoch+全局 epoch
+  <= 2^31-1；越界返回 `ErrCounterOverflow`（fail closed），不产生截断/溢出
+  后的潜在碰撞。Redis `SetIntMax` 的 Lua 改为十进制字符串精确比较（原
+  `tonumber` 在 2^53 以上失真），并拒绝负数写入；新增 2^53/int64 边界测试。
+- **`audit.NewQuery(nil)`（P2-02）**：先判空再访问 `m.db`，未注册/空模块
+  返回可在 `List` 阶段报错的 Query，而不是构造期 panic。
+- **文档版本漂移（P2-03）**：README 与根包注释统一引用 v0.4.0-design；
+  设计文档 Phase 3/4 任务与状态表不再把已实现功能标为待实现；补充
+  `utf8mb4_0900_bin` 的 MySQL 兼容性说明。
+
+### API 调整（pre-1.0）
+
+- `audit.NewQuery` 新增可变选项 `audit.WithCrossTenantAccess()`；新增
+  `audit.ErrTenantScopeViolation`。`Filter.Tenant` 默认只能等于 ctx 租户。
+- 根包新增 `ErrCounterOverflow` 别名。
+- 迁移 0003/0004（`rbac_counters.k` 列宽与二进制；`rbac_user_roles.subject_id` /
+  `rbac_user_grants.subject_id` 改为 `utf8mb4_0900_bin`）。
+
+
 ### Fixed（第八轮外部审核）
 
 安全/一致性（均已用真实 MySQL + Redis 复现并补回归测试）：

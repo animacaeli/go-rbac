@@ -34,7 +34,10 @@ CI 矩阵见 `.github/workflows/ci.yml` 的 `integration` job
 ## 对使用者的部署要求
 
 - 字符集/排序规则无需配置：全部表 DDL 显式指定 `utf8mb4 / utf8mb4_0900_ai_ci`，
-  与服务器默认值无关
+  与服务器默认值无关；身份列（`rbac_user_roles.subject_id`、
+  `rbac_user_grants.subject_id`）在迁移 0004、`rbac_counters.k` 在迁移 0003
+  改为 `utf8mb4_0900_bin`（身份按二进制比较），依赖 MySQL 8.0 的 0900
+  排序规则家族
 - 时间语义：`DATETIME(3)` + 应用层 UTC，DSN 必须
   `parseTime=true&loc=UTC`（§5.1）
 - 读写分离部署：**权限回填路径必须读主库**（§6.4；§9.2 以配置约束 +

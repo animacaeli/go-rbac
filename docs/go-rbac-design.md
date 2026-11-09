@@ -810,7 +810,7 @@ type Authorizer interface {
 - 用户身份无效。
 - 用户账号禁用（经 SubjectStatusChecker 集成时）。
 
-超级管理员语义（方向已定，细节待细化）：
+超级管理员语义（v1 已实现：内置受保护角色 + `SeedSuperAdmin` 唯一授予入口）：
 
 - `HasPermission` / `HasAny` / `HasAll` 对超级管理员恒真，但仍受账号状态与租户边界约束。
 - `GetPermissions` 对超级管理员返回空集合；前端应以 `IsSuperAdministrator` 单独判断，避免引入通配符语义。
@@ -1049,10 +1049,11 @@ rbac:{scope}:subject:{subject_id}:version   # 主体权限版本号副本（权�
 rbac:{scope}:subject:{subject_id}:perm:v{generation}
 ```
 
-单租户模式 `scope = default`；多租户模式 `scope = {tenant_id}`。租户标识与
-主体标识在键中统一小写（`strings.ToLower`）：库表排序规则大小写不敏感，
-缓存/计数器域必须与之一致，否则同一身份的不同拼写各持一份版本副本，会出现
-"只同步了一种拼写"导致的陈旧缓存。
+单租户模式 `scope = default`；多租户模式 `scope = {tenant_id}`。租户标识在
+键中统一小写（受限 ASCII slug，库表 ci 语义与缓存域一致）；主体标识按二进制
+比较（迁移 0004 将 `subject_id` 与计数器键改为 `utf8mb4_0900_bin`）——身份是
+外部不透明标识，缓存/计数器键与库表比较规则必须一致，否则不同拼写会共享
+或分裂版本副本，导致撤销失效不完整。
 `generation = (epoch + global_epoch)<<32 | subject_version`（三个计数器合并进
 单一生成键；三者均单调不减，任一递增都严格增大生成键）。
 
@@ -1060,9 +1061,10 @@ rbac:{scope}:subject:{subject_id}:perm:v{generation}
 `rbac_permissions` 是全局表，权限禁用/启用与权限同步必须让**全部**租户域的
 旧生成键不可达——单租户 epoch 无法表达跨租户失效（第八轮审核 P0）。
 
-**计数器列宽**（迁移 0003）：`rbac_counters.k` 为 `VARCHAR(255)`——主体版本键
-最长约 `64 + 9 + 128 + 8 = 209` 字符，191 会在长租户 + 长主体时触发 1406
-并回滚整个授权变更事务。：数据库表 `rbac_counters(k, v)`，键与 Redis 键同构：
+**计数器列宽**（迁移 0003）：`rbac_counters.k` 为 `VARCHAR(255)` 且
+`utf8mb4_0900_bin`——主体版本键最长约 `64 + 9 + 128 + 8 = 209` 字符，191 会在
+长租户 + 长主体时触发 1406 并回滚整个授权变更事务；二进制排序规则与
+`subject_id` 的身份比较语义一致（迁移 0004）。：数据库表 `rbac_counters(k, v)`，键与 Redis 键同构：
 `{scope}:epoch`、`!global:epoch`、`{scope}:subject:{subject_id}:version`。
 
 ## 6.2 版本号机制（数据库权威）
@@ -1210,7 +1212,7 @@ rbac:{scope}:subject:{subject_id}:perm:v{generation}
 
 ## 7.3 超级管理员
 
-超级管理员采用**独立、受保护的授权机制**（方向已定，细节待细化）：
+超级管理员采用**独立、受保护的授权机制**（v1 已实现；`SeedSuperAdmin` 是唯一授予入口，管理接口不可授予/撤销/删除/禁用）：
 
 - 载体：内置受保护角色（`rbac_roles.is_builtin = 1`，code 如 `super_admin`），仅能通过初始化种子或配置创建；管理接口不可授予、撤销、删除、禁用该角色。
 - 判定：`Authorizer.IsSuperAdministrator`；对 HasPermission 系列恒真。
@@ -1242,24 +1244,24 @@ rbac:{scope}:subject:{subject_id}:perm:v{generation}
 
 任务：
 
-- [ ] 项目初始化。
-- [ ] 基础数据库模型（§5 冻结稿）。
-- [ ] GORM Repository。
-- [ ] 版本化 SQL Migration + embed。
-- [ ] Permission Registry（含权限码格式校验）。
-- [ ] 权限同步机制。
-- [ ] 角色管理（含 is_builtin 保护）。
-- [ ] 用户角色关联。
-- [ ] 角色权限关联。
-- [ ] 用户额外授权（含生命周期事务语义）。
-- [ ] Authorization Service（含 IsSuperAdministrator）。
-- [ ] Gin Middleware（含错误响应定制）。
-- [ ] 用户身份解析接口 + 账号状态检查接口。
-- [ ] 启动期权限码交叉校验。
-- [ ] 内置 rbac:* 管理权限码。
-- [ ] Module Registry（注册/依赖检查/迁移收集）。
-- [ ] 无缓存实现（NoopCache）。
-- [ ] 单元测试和集成测试。
+- [x] 项目初始化。
+- [x] 基础数据库模型（§5 冻结稿）。
+- [x] GORM Repository。
+- [x] 版本化 SQL Migration + embed。
+- [x] Permission Registry（含权限码格式校验）。
+- [x] 权限同步机制。
+- [x] 角色管理（含 is_builtin 保护）。
+- [x] 用户角色关联。
+- [x] 角色权限关联。
+- [x] 用户额外授权（含生命周期事务语义）。
+- [x] Authorization Service（含 IsSuperAdministrator）。
+- [x] Gin Middleware（含错误响应定制）。
+- [x] 用户身份解析接口 + 账号状态检查接口。
+- [x] 启动期权限码交叉校验。
+- [x] 内置 rbac:* 管理权限码。
+- [x] Module Registry（注册/依赖检查/迁移收集）。
+- [x] 无缓存实现（NoopCache）。
+- [x] 单元测试和集成测试。
 
 验收标准：
 
@@ -1271,45 +1273,46 @@ rbac:{scope}:subject:{subject_id}:perm:v{generation}
 
 任务：
 
-- [ ] Redis Adapter。
-- [ ] 权限缓存（版本号 + epoch 两级失效）。
-- [ ] 批量失效与失效矩阵全覆盖测试。
-- [ ] 缓存击穿防护（singleflight）。
-- [ ] 临时授权过期处理。
-- [ ] 角色模板。
-- [ ] 权限批量操作。
-- [ ] 授权变更审计（Audit 模块，承接关联表历史）。
-- [ ] 观测埋点（Metrics 接口落地）。
-- [ ] 性能基线测试（§9.4）。
+- [x] Redis Adapter。
+- [x] 权限缓存（主体版本 + 授权域/全局 epoch 三级计数器）。
+- [x] 失效矩阵全覆盖测试（角色/权限/用户/计数器淘汰/并发/租户边界）。
+- [x] 缓存击穿防护（singleflight）。
+- [x] 临时授权过期处理。
+- [x] 角色模板。
+- [x] 权限批量操作。
+- [x] 授权变更审计（Audit 模块，承接关联表历史）。
+- [x] 观测埋点（Metrics 接口落地）。
+- [x] 性能基线测试（§9.4）。
 
 ## Phase 3：高级权限模块
 
-目标：支持更复杂的后台业务。
+目标：支持更复杂的后台业务。**状态：已实现**（CUSTOM 与 Outbox 的评估结论为
+延后，见 `docs/phase3-evaluation.md`）。
 
 任务：
 
-- [ ] Menu 模块。
-- [ ] Data Scope 模块（四种枚举范围，取最宽合并）。
-- [ ] Multi-Tenant 模块（**第一验收项 = §5.5 迁移契约测试**）。
-- [ ] CUSTOM 数据范围与组织架构扩展接口评估。
-- [ ] 更多框架适配器。
-- [ ] Outbox 补偿机制评估。
+- [x] Menu 模块。
+- [x] Data Scope 模块（四种枚举范围，取最宽合并）。
+- [x] Multi-Tenant 模块（**第一验收项 = §5.5 迁移契约测试**）。
+- [x] CUSTOM 数据范围与组织架构扩展接口评估（结论：延后，触发条件已记录）。
+- [x] 更多框架适配器（net/http；Gin 为首选）。
+- [x] Outbox 补偿机制评估（结论：P1 增强，不阻塞缓存一致性）。
 
 ## Phase 4：稳定性与生态
 
-目标：使其成为可以长期复用的基础组件。
+目标：使其成为可以长期复用的基础组件。**状态：已实现**。
 
 任务：
 
-- [ ] 完整 API 文档。
-- [ ] 接入示例。
-- [ ] 数据库兼容性测试（MySQL 8.0 基准，5.7 评估）。
-- [ ] 并发授权测试。
-- [ ] 缓存一致性测试（含主从延迟场景）。
-- [ ] 安全测试。
-- [ ] Go 版本兼容性测试。
-- [ ] pkg.go.dev 命名查重与定名。
-- [ ] 版本发布规范、CHANGELOG、CI 自动化测试。
+- [x] 完整 API 文档（godoc + README）。
+- [x] 接入示例（gin-basic / gin-redis / gin-tenant）。
+- [x] 数据库兼容性测试（MySQL 8.0/8.4；5.7 评估为不支持）。
+- [x] 并发授权测试。
+- [x] 缓存一致性测试（含主从延迟边界声明）。
+- [x] 安全测试（缓存失效矩阵 + Redis 故障矩阵）。
+- [x] Go 版本兼容性测试（CI 矩阵）。
+- [x] pkg.go.dev 命名查重与定名（保留 go-rbac）。
+- [x] 版本发布规范、CHANGELOG、CI 自动化测试。
 
 ---
 
@@ -1438,7 +1441,7 @@ api.GET(
 | ORM | GORM 默认实现 | 已确定 |
 | 用户 ID | SubjectID string，VARCHAR(128) | 已确定 |
 | Redis | 可选 Adapter | 已确定 |
-| 多租户 | v1 无 tenant_id + Scope 预留 + 迁移契约 | 已确定（模块细节待细化） |
+| 多租户 | tenant_id + 租户隔离仓储 + 缓存域隔离 + 迁移契约 | 已实现（tenant 模块） |
 | 数据权限 | 四种枚举范围取最宽合并；CUSTOM 延后 | 已确定（CUSTOM 于 datascope 模块阶段设计） |
 | 角色继承 | 第一版不做 | 已确定 |
 | 显式 Deny | 不支持 | 已确定 |
@@ -1448,22 +1451,24 @@ api.GET(
 | 菜单关联权限 | 可选关联 | 已确定 |
 | 数据库迁移 | 版本化 SQL + embed，业务项目控制执行 | 已确定 |
 | 表名自定义 | v1 固定 `rbac_` 前缀 | 已确定（可配置前缀列入后续版本评估） |
-| 超级管理员 | 内置受保护角色 + IsSuperAdministrator | 方向已定，细节待细化 |
-| 多租户身份域 | tenant_id 与 subject_id 组合 | 待细化（tenant 模块阶段） |
+| 超级管理员 | 内置受保护角色 + IsSuperAdministrator + SeedSuperAdmin | 已实现 |
+| 多租户身份域 | (tenant_id, subject_id)；跨租户角色引用拒绝 | 已实现 |
+| 身份标识比较 | subject_id 二进制（utf8mb4_0900_bin）；tenant_id 受限 ASCII + 小写域 | 已实现（迁移 0003/0004） |
 | 缓存回填数据源 | 主库 | 已确定 |
-| 缓存失效 | 版本号 + 全局 epoch 两级机制 | 已确定 |
+| 缓存失效 | 主体版本 + 授权域/全局 epoch 三级计数器 | 已实现 |
 | Outbox | v2+，可用性增强而非一致性 | 已确定 |
 | Casbin Adapter | 不纳入路线图 | 已确定 |
 | 授权者持权约束 | 默认开启，可配置关闭 | 已确定 |
 | Authorizer 签名 | 接受 AuthorizationContext | 已确定 |
 | Repository 接口可见性 | v1 保持内部，公开 API 面最小化 | 已确定 |
 
-仍在细化中的事项（不阻塞 v1 开发，按所属模块阶段收口）：
+已收口事项（v0.4.0 实现，细节以代码与 README 为准）：
 
-- 超级管理员的种子初始化与配置细节（§7.3）。
-- 多租户模块内部设计（用户多租户归属、平台角色表达、TenantResolver）。
-- CUSTOM 数据范围的存储与运算模型（datascope 模块）。
-- 菜单 AND 语义的触发条件（menu 模块）。
+- 超级管理员种子：`SeedSuperAdmin` 为唯一授予入口（§7.3）。
+- 多租户内部设计：`TenantResolver` + 租户隔离仓储 + 平台/租户超管边界；
+  平台域普通角色不跨租户生效（跨租户角色引用被拒绝）。
+- CUSTOM 数据范围：评估结论为延后（触发条件见 `docs/phase3-evaluation.md`）。
+- 菜单 AND 语义：v1 冻结 OR 语义，扩展触发条件见 `docs/phase3-evaluation.md`。
 
 ---
 

@@ -13,7 +13,7 @@
 - 授权变更审计（Audit 模块）、角色模板（Template 模块）、菜单（Menu 模块）、
   数据权限（DataScope 模块）、多租户隔离（Tenant 模块）按需启用
 - 适配器：Gin 与 net/http（标准库零依赖），核心不绑定任何框架
-- 设计文档：[docs/go-rbac-design.md](docs/go-rbac-design.md)（v0.3.0-design 定稿）
+- 设计文档：[docs/go-rbac-design.md](docs/go-rbac-design.md)（v0.4.0-design 定稿）
 
 ## 快速开始（Gin）
 
@@ -173,11 +173,15 @@ Redis 中的 epoch / 主体版本只是该权威值的**缓存副本**：
 `core.CountingMetrics` 注入采集。批量化读取（Redis `MGET`）由可选的
 `cache.IntBatchReader` 接口提供，未实现时自动退回逐键读取。
 
-大小写语义：MySQL 排序规则（utf8mb4_0900_ai_ci）下 `subject_id` 与 `tenant_id`
-不区分大小写。缓存 key 与权威计数器键**同样按小写规范化**（`canonicalSubject`
-/ `Scope()` / `repository.TenantScope`），保证同一身份/租户的不同拼写共享
-同一份版本与缓存条目——否则"只同步了其中一种拼写"会让另一种拼写的旧缓存
-存活到 TTL（陈旧权限放行）。权限码由注册中心校验拒绝大写，无此问题。
+身份标识语义（迁移 0004）：
+
+- `subject_id` 按**二进制**比较（`utf8mb4_0900_bin`），大小写/重音敏感。身份是
+  外部不透明标识，不继承数据库语言排序规则的等价关系；缓存键与权威计数器键
+  保持原样，与库表比较规则一致。不同拼写是不同主体（旧版 ci 语义下会被合并）。
+- `tenant_id` 是受限 ASCII slug（`[A-Za-z0-9_.-]`，保留名 `default`/`!global`），
+  库表 ci 语义与缓存/计数器域统一按小写规范化（`Scope()` /
+  `repository.TenantScope`）。
+- 权限码由注册中心校验，只允许小写，无大小写歧义。
 
 ## 可选模块
 
@@ -289,7 +293,7 @@ _ = tenantMod.SeedSuperAdminInTenant(ctx, "acme", "acme-admin")
 - MySQL 8.0+ / InnoDB / `utf8mb4_0900_ai_ci`；`DATETIME(3)` + 应用层 UTC
 - 五张核心表：`rbac_roles` / `rbac_permissions` / `rbac_user_roles` /
   `rbac_role_permissions` / `rbac_user_grants`（v1 冻结稿，见设计文档 §5.2）
-- 表前缀固定 `rbac_`；v1 无 tenant_id（多租户为 Phase 3 可选模块，核心已预留授权域）
+- 表前缀固定 `rbac_`；核心表初始无 tenant_id，启用 tenant 模块后由迁移 0001 加列并重建唯一键（§5.5），核心的授权域/缓存域自 Phase 1 起已按 scope 预留
 - `app.Migrate(ctx)` 执行 Core → 扩展模块注册顺序的版本化迁移；生产环境建议在发布流程统一执行
 - 迁移器在单连接上持有 MySQL `GET_LOCK`（多实例并发启动自动串行化），
   所有迁移 SQL 用 `information_schema` + 动态 DDL 实现可重入：部分失败后
@@ -331,8 +335,12 @@ request context，内部 Job 需自行 `core.ContextWithTenant`，缺失即 fail
 `is_builtin=1` 的超管载体角色：库中存在同名非内置角色时直接报错，不会
 静默把普通角色当成超管种子。
 
-审计查询（`audit.NewQuery(...).List`）在 ctx 携带租户槽位时强制按租户过滤；
-HTTP 适配器在解析租户后已把槽位写入 request context，下游可直接使用。
+审计查询（`audit.NewQuery(...).List`）的租户边界：默认只能查询当前请求上下文
+所属租户；`Filter.Tenant` 只能等于该租户，越界（含平台域 `""`）返回
+`audit.ErrTenantScopeViolation`。平台管理员跨租户查询必须显式构造
+`audit.NewQuery(m, audit.WithCrossTenantAccess())`，并挂在已完成平台级授权的
+管理端点上（库无法替调用方判断 operator 的平台权限）。HTTP 适配器在解析
+租户后已把槽位写入 request context，下游可直接使用。
 
 **发布门禁**：`cache/redis` 的失效矩阵套件（14 行场景：角色/权限/用户禁用、
 计数器淘汰与损坏、递增失败与恢复、临时授权到期、并发编辑、租户隔离、
