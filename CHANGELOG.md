@@ -7,6 +7,22 @@
 
 ## [Unreleased]
 
+### Fixed（第十轮复审）
+
+- **计数器求和溢出（P2）**：`validateCounters` 原先先做 `epoch+globalEpoch`
+  再比较上限，MaxInt64 附近会溢出为负数从而绕过检查。改为先校验负数与
+  单项上限，再用 `epoch > maxEpochSum-globalEpoch` 做安全求和；新增
+  MaxInt64+1 / maxEpochSum+0 / maxEpochSum+1 / MaxInt64+MaxInt64 用例。
+- **真实 Redis 集成覆盖（P2）**：新增 `RealRedisSuite`（`RBAC_TEST_REDIS_ADDR`
+  门控），在真实 Redis 7 上验证 `SetIntMax` Lua（2^53/int64 上限、损坏值
+  自愈、并发乱序收敛到最大值）、`GetInts` MGET（缺失/零值/损坏）与连接
+  故障语义（所有原语返回错误、不 panic）。tenant 隔离套件在提供地址时
+  改用真实 Redis（独立 DB 2，避免与 cache/redis 的 DB 0 并行互清），
+  未提供时保留 miniredis 本地回退。
+- **CI 门禁**：新增 "Real Redis primitives" 步骤，真实 Redis 套件被跳过时
+  构建失败，避免"启动了 Redis 服务却没有测试它"。
+
+
 ### Fixed（第九轮复审）
 
 - **审计查询租户边界（P1-01）**：默认查询器只允许当前请求上下文的租户；

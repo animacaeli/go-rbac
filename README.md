@@ -400,6 +400,10 @@ Git hooks（`make hooks` 安装）：
 CI（`.github/workflows/ci.yml`）：lint（golangci-lint）、单元测试矩阵
 （最低支持版 + stable，含竞态检测与覆盖率）、集成测试矩阵（MySQL 8.0 +
 8.4 LTS × Redis 7）、govulncheck 漏洞检测，push / PR 自动触发。
+集成 job 中的 Redis 是**真实 Redis 7**：缓存失效矩阵/一致性套件、tenant
+隔离套件（独立 DB 2）与 `RealRedisSuite`（Lua `SetIntMax`、MGET、故障语义）
+都会实际使用 `RBAC_TEST_REDIS_ADDR`；CI 另有显式步骤，真实 Redis 套件被
+跳过时直接失败。gormrepo 套件使用 NoopCache（Simple 模式），不需要 Redis。
 
 > 注：设计文档 §4.7 的内置权限码 `rbac:user:assign-role` 含连字符，与 §2.2/§2.3
 > 冻结的权限码字符集（小写字母/数字/下划线/冒号）冲突，实现规范化为
