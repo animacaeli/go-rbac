@@ -214,3 +214,42 @@ func (s *CacheSuite) TestGetInts_BatchSemantics() {
 	_, _, err = s.sut.GetInts(ctx, []string{"a", "bad"})
 	s.Require().Error(err, "损坏值必须报错，不得当作未命中")
 }
+
+// 单调写必须对任意 int64 精确：Lua tonumber 在 2^53 以上会失真，
+// 字符串比较才能保证"旧值永不回退"。
+func (s *CacheSuite) TestSetIntMax_ExactForLargeIntegers() {
+	ctx := s.ctx
+	const p53 = int64(1) << 53
+
+	s.Require().NoError(s.sut.SetIntMax(ctx, "big", p53))
+	s.Require().NoError(s.sut.SetIntMax(ctx, "big", p53-1))
+	v, ok, err := s.sut.GetInt(ctx, "big")
+	s.Require().NoError(err)
+	s.True(ok)
+	s.Equal(p53, v, "较小值不得覆盖")
+
+	s.Require().NoError(s.sut.SetIntMax(ctx, "big", p53+1))
+	v, _, _ = s.sut.GetInt(ctx, "big")
+	s.Equal(p53+1, v, "2^53 以上必须精确前进")
+
+	// int64 上限附近。
+	const maxInt64 = int64(^uint64(0) >> 1)
+	s.Require().NoError(s.sut.SetIntMax(ctx, "max", maxInt64))
+	s.Require().NoError(s.sut.SetIntMax(ctx, "max", maxInt64-1))
+	v, _, _ = s.sut.GetInt(ctx, "max")
+	s.Equal(maxInt64, v)
+
+	// 损坏值（非十进制 / 负数）视为不可信，原子替换。
+	s.Require().NoError(s.srv.Set("corrupt", "12x3"))
+	s.Require().NoError(s.sut.SetIntMax(ctx, "corrupt", 5))
+	v, _, _ = s.sut.GetInt(ctx, "corrupt")
+	s.Equal(int64(5), v)
+
+	s.Require().NoError(s.srv.Set("neg", "-7"))
+	s.Require().NoError(s.sut.SetIntMax(ctx, "neg", 1))
+	v, _, _ = s.sut.GetInt(ctx, "neg")
+	s.Equal(int64(1), v)
+
+	// 新值为负数属调用方错误。
+	s.Require().Error(s.sut.SetIntMax(ctx, "neg", -1))
+}

@@ -128,9 +128,9 @@ func (s *IntegrationSuite) TestMigrate_IdempotentRerun() {
 	s.Require().NoError(err)
 	var count int64
 	s.Require().NoError(s.db.Table("schema_migrations").Count(&count).Error)
-	// Core 0001/0002/0003 + audit/menu/datascope 各 0001（template 无迁移）；
+	// Core 0001–0004 + audit/menu/datascope 各 0001（template 无迁移）；
 	// 同一版本只记录一次。
-	s.Equal(int64(6), count, "重跑不产生新的版本记录")
+	s.Equal(int64(7), count, "重跑不产生新的版本记录")
 }
 
 func (s *IntegrationSuite) TestSyncPermissions_IdempotentRerun() {
@@ -536,9 +536,14 @@ func (s *IntegrationSuite) TestAuditQuery_TenantScoped() {
 		s.Equal("acme", l.TenantID, "跨租户审计记录不得返回")
 	}
 
-	// 显式授权域（含平台域空串）优先于 ctx。
+	// 默认查询器不允许显式越界（ctx 无租户 → 任何显式租户都越界）。
 	beta := "beta"
-	logs, err = q.List(ctx, audit.Filter{Tenant: &beta})
+	_, err = q.List(ctx, audit.Filter{Tenant: &beta})
+	s.Require().ErrorIs(err, audit.ErrTenantScopeViolation, "默认构造不得接受越界 Filter.Tenant")
+
+	// 平台级授权端点通过 WithCrossTenantAccess 显式放开。
+	crossTenant := audit.NewQuery(s.audit, audit.WithCrossTenantAccess())
+	logs, err = crossTenant.List(ctx, audit.Filter{Tenant: &beta})
 	s.Require().NoError(err)
 	s.Require().NotEmpty(logs)
 	for _, l := range logs {

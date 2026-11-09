@@ -179,8 +179,8 @@ func (s *MigrationContractSuite) TestContract_FreshPath_CoreThenTenantInOnePlan(
 	require.NoError(s.T(), s.db.Raw(
 		"SELECT version FROM schema_migrations ORDER BY module, version",
 	).Scan(&versions).Error)
-	// Core 0001/0002/0003 + tenant 0001。
-	s.Equal([]string{"0001", "0002", "0003", "0001"}, versions)
+	// Core 0001–0004 + tenant 0001。
+	s.Equal([]string{"0001", "0002", "0003", "0004", "0001"}, versions)
 }
 
 // 部分失败恢复：DDL 已隐式提交、版本行未写入（进程崩溃窗口）时，重跑必须成功。
@@ -611,4 +611,52 @@ func (s *IsolationSuite) TestAuditQuery_RequiresTenantContext() {
 
 	_, err = q.List(s.tenantCtx("acme"), audit.Filter{})
 	s.NoError(err)
+}
+
+// 审计查询的租户边界：默认只允许当前请求租户；跨租户与平台域查询必须
+// 使用 WithCrossTenantAccess（平台级授权端点专用构造）。
+func (s *IsolationSuite) TestAuditQuery_TenantBoundary() {
+	acmeCtx, betaCtx := s.tenantCtx("acme"), s.tenantCtx("beta")
+	acme, beta, platform := "acme", "beta", ""
+	q := audit.NewQuery(s.auditM)
+
+	// A 查 A：允许（显式指定同一租户亦允许）。
+	_, err := q.List(acmeCtx, audit.Filter{})
+	s.NoError(err)
+	_, err = q.List(acmeCtx, audit.Filter{Tenant: &acme})
+	s.NoError(err)
+
+	// A 查 B、B 查 A、租户查平台域：一律拒绝。
+	_, err = q.List(acmeCtx, audit.Filter{Tenant: &beta})
+	s.ErrorIs(err, audit.ErrTenantScopeViolation)
+	_, err = q.List(betaCtx, audit.Filter{Tenant: &acme})
+	s.ErrorIs(err, audit.ErrTenantScopeViolation)
+	_, err = q.List(acmeCtx, audit.Filter{Tenant: &platform})
+	s.ErrorIs(err, audit.ErrTenantScopeViolation)
+
+	// 平台级授权端点（显式构造）：允许跨租户与平台域查询。
+	adminQ := audit.NewQuery(s.auditM, audit.WithCrossTenantAccess())
+	_, err = adminQ.List(acmeCtx, audit.Filter{Tenant: &beta})
+	s.NoError(err)
+	_, err = adminQ.List(acmeCtx, audit.Filter{Tenant: &platform})
+	s.NoError(err)
+}
+
+// 租户超管种子必须在落库前完成完整租户标识校验。
+func (s *IsolationSuite) TestSeedSuperAdminInTenant_ValidatesTenantID() {
+	for _, bad := range []string{"", "default", "!global", "tenant/a", "tenant a"} {
+		err := s.tenantM.SeedSuperAdminInTenant(s.ctx, bad, "seed-subject")
+		s.Error(err, "非法租户标识必须拒绝: %q", bad)
+		s.ErrorIs(err, core.ErrInvalidTenantID, "错误应可识别: %q", bad)
+	}
+
+	// 非法标识不得留下任何角色行（default / !global / 非法字符）。
+	var n int64
+	s.Require().NoError(s.db.Table("rbac_roles").
+		Where("tenant_id IN ?", []string{"default", "!global", "tenant/a", "tenant a"}).Count(&n).Error)
+	s.Zero(n, "校验必须发生在任何数据库写入之前")
+
+	// 合法标识可用。
+	s.NoError(s.tenantM.SeedSuperAdminInTenant(s.ctx, "tenant_a", "seed-a"))
+	s.NoError(s.tenantM.SeedSuperAdminInTenant(s.ctx, "tenant-001", "seed-b"))
 }

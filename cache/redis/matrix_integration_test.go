@@ -376,21 +376,25 @@ func (s *MatrixSuite) TestRow13_MultiInstanceConcurrentRecovery() {
 	s.True(diag.EpochExists, "副本已从 DB 回填")
 }
 
-// 行 14：subject_id / tenant_id 大小写规范化——库表排序规则大小写不敏感，
-// 缓存/计数器键必须同样规范化，否则"只同步了一种拼写"会让另一种拼写的
-// 旧缓存存活到 TTL（陈旧权限放行）。
-func (s *MatrixSuite) TestRow14_SubjectCaseCanonicalized() {
+// 行 14：subject_id 是二进制身份（迁移 0004）——大小写/重音不同的标识是
+// 不同主体；缓存键、计数器键与库表比较规则一致，撤销只影响精确匹配的主体。
+func (s *MatrixSuite) TestRow14_SubjectIdentityIsBinary() {
 	s.subjectWithPerms("CaseUser", "r14", "user:list")
+
 	ok, err := s.app.Authorizer().HasPermission(s.ctx, s.ac("CaseUser"), "user:list")
 	s.Require().NoError(err)
-	s.Require().True(ok, "预热（大写拼写）")
+	s.Require().True(ok)
+
+	// 不同拼写是不同身份：不得共享授权。
+	ok, err = s.app.Authorizer().HasPermission(s.ctx, s.ac("caseuser"), "user:list")
+	s.Require().NoError(err)
+	s.False(ok, "大小写不同的标识不得共享权限")
 
 	role, err := s.app.Roles().FindByCode(s.ctx, "r14")
 	s.Require().NoError(err)
-	// 用小写拼写撤销：DB 命中同一行，缓存/计数器域也必须命中同一份。
-	s.Require().NoError(s.app.UserRoles().Revoke(s.ctx, gateAdmin, "caseuser", role.ID))
+	s.Require().NoError(s.app.UserRoles().Revoke(s.ctx, gateAdmin, "CaseUser", role.ID))
 
 	ok, err = s.app.Authorizer().HasPermission(s.ctx, s.ac("CaseUser"), "user:list")
 	s.Require().NoError(err)
-	s.False(ok, "大小写不同的同一 subject 必须共享失效结果")
+	s.False(ok, "精确身份的撤销必须立即生效")
 }
