@@ -359,7 +359,8 @@ func (s *AuthorizationService) loadOnce(ctx context.Context, ac AuthorizationCon
 	// 共享回源使用 WithoutCancel：剥离首个调用者的取消信号（保留 ctx values），
 	// 否则该请求断开会让所有等待者一起失败；调用方自身的取消仍由下面的
 	// select 处理，不会阻塞已断开的请求。
-	ch := s.sf.DoChan(scope+"/"+subject, func() (any, error) {
+	// 不同生成版本不能共享结果：撤权完成后的请求必须独立回源。
+	ch := s.sf.DoChan(subjectPermKey(scope, subject, refGen), func() (any, error) {
 		return s.aggregateAndCache(context.WithoutCancel(ctx), ac, refGen)
 	})
 	select {
@@ -435,7 +436,7 @@ func (s *AuthorizationService) aggregateAndCache(ctx context.Context, ac Authori
 	// 写回前复核生成键（§6.2 第 5 步 / §6.4 写前复核）：
 	// 副本可读则以副本比较；副本不可读则以 DB 权威值比较
 	// （权威值 ≥ 写入时生成键 → 允许写回旧键是安全的：读路径只会用
-	// 更高的生成键，写回的旧键天然不被命中——直接跳过写回更简单）。
+	// 更高的生成键）。发现版本变化时丢弃结果，通知调用方重新读取。
 	gen2, ok, err := s.readCachedGeneration(ctx, scope, subject)
 	if err != nil || !ok {
 		// 副本不可读：以 DB 权威值兜底比较。
@@ -449,15 +450,20 @@ func (s *AuthorizationService) aggregateAndCache(ctx context.Context, ac Authori
 			return aggregateResult{set: set}, nil
 		}
 		if generationKey(dbEpoch, dbGlobal, dbVersion) != refGen {
-			return aggregateResult{set: set}, nil
+			return aggregateResult{unstable: true}, nil
 		}
 	} else if gen2 != refGen {
-		return aggregateResult{set: set}, nil
+		return aggregateResult{unstable: true}, nil
 	}
 
 	ttl := s.ttl
 	if nearest != nil {
-		if bounded := nearest.Sub(now); bounded > 0 && bounded < ttl {
+		// 使用写回时刻，扣除聚合及版本复核耗时。
+		bounded := time.Until(*nearest)
+		if bounded <= 0 {
+			return aggregateResult{unstable: true}, nil
+		}
+		if bounded < ttl {
 			ttl = bounded
 		}
 	}
